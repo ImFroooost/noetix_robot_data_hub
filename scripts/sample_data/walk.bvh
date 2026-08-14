@@ -1,0 +1,81 @@
+HIERARCHY
+ROOT Hips
+{
+  OFFSET 0.0 0.0 0.0
+  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation
+  JOINT Chest
+  {
+    OFFSET 0.0 20.0 0.0
+    CHANNELS 3 Zrotation Xrotation Yrotation
+    JOINT Head
+    {
+      OFFSET 0.0 20.0 0.0
+      CHANNELS 3 Zrotation Xrotation Yrotation
+      End Site
+      {
+        OFFSET 0.0 10.0 0.0
+      }
+    }
+  }
+  JOINT LeftUpLeg
+  {
+    OFFSET 5.0 -10.0 0.0
+    CHANNELS 3 Zrotation Xrotation Yrotation
+    JOINT LeftLeg
+    {
+      OFFSET 0.0 -20.0 0.0
+      CHANNELS 3 Zrotation Xrotation Yrotation
+      End Site
+      {
+        OFFSET 0.0 -20.0 0.0
+      }
+    }
+  }
+  JOINT RightUpLeg
+  {
+    OFFSET -5.0 -10.0 0.0
+    CHANNELS 3 Zrotation Xrotation Yrotation
+    JOINT RightLeg
+    {
+      OFFSET 0.0 -20.0 0.0
+      CHANNELS 3 Zrotation Xrotation Yrotation
+      End Site
+      {
+        OFFSET 0.0 -20.0 0.0
+      }
+    }
+  }
+}
+MOTION
+Frames: 30
+Frame Time: 0.0333333
+0 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+2 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+4 100 0 0 0 0 0 0 0 0 0 0 10 0 0 0 0 0 -10 0 0 0 0 0
+6 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+8 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+10 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
+12 100 0 0 0 0 0 0 0 0 0 0 -10 0 0 0 0 0 10 0 0 0 0 0
+14 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
+16 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+18 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+20 100 0 0 0 0 0 0 0 0 0 0 10 0 0 0 0 0 -10 0 0 0 0 0
+22 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+24 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+26 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
+28 100 0 0 0 0 0 0 0 0 0 0 -10 0 0 0 0 0 10 0 0 0 0 0
+30 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
+32 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+34 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+36 100 0 0 0 0 0 0 0 0 0 0 10 0 0 0 0 0 -10 0 0 0 0 0
+38 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+40 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+42 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
+44 100 0 0 0 0 0 0 0 0 0 0 -10 0 0 0 0 0 10 0 0 0 0 0
+46 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
+48 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+50 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+52 100 0 0 0 0 0 0 0 0 0 0 10 0 0 0 0 0 -10 0 0 0 0 0
+54 100 0 0 0 0 0 0 0 0 0 0 5 0 0 0 0 0 -5 0 0 0 0 0
+56 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+58 100 0 0 0 0 0 0 0 0 0 0 -5 0 0 0 0 0 5 0 0 0 0 0
