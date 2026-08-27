@@ -122,7 +122,7 @@ export function TaxonomyManagePage() {
 
   const onDeleteScheme = async () => {
     if (!currentScheme || currentScheme.builtin) return;
-    const cascade = currentScheme.node_count > 0;
+    const cascade = (currentScheme.node_count || 0) > 0;
     const ok = confirm(
       cascade
         ? `确认删除分类标准「${currentScheme.name}」？\n将同时删除其下 ${currentScheme.node_count} 个节点及条目标签，不可恢复。`

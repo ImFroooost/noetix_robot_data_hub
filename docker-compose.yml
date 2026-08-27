@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-motion_pass}
       POSTGRES_DB: motion
     volumes:
-      - ./data/pgdata:/var/lib/postgresql/data
+      # NTFS/护照盘不能 chmod，Postgres 数据放 Docker 卷（系统盘）
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U motion"]
       interval: 5s
@@ -65,3 +66,6 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+volumes:
+  pgdata:

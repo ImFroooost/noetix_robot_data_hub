@@ -2,10 +2,18 @@ export type Role = "admin" | "editor" | "viewer";
 export type Quality = "high" | "medium" | "low";
 export type RobotStage = "retarget" | "polish" | "refine" | "real";
 export type TaxonomyScheme = string;
-export type VideoKind = "human" | "robot_motion";
+export type VideoKind =
+  | "human"
+  | "robot_motion"
+  | "robot_policy_sim"
+  | "robot_policy_real";
+// 数据评价："" 未评价 / pass 直接通过 / needs_fix 需要修改 / discard 建议丢弃
+export type ReviewValue = "" | "pass" | "needs_fix" | "discard";
 
 export interface PermissionItem {
   capability: string;
+  // ""=文件夹树；否则为分类标准 key，path_prefix 为该分类树节点路径
+  scheme?: string;
   path_prefix: string;
   recursive: boolean;
 }
@@ -72,6 +80,7 @@ export interface HumanFile {
   fps: number | null;
   frame_count: number | null;
   quality: Quality;
+  review?: ReviewValue | string;
   original_name: string;
   checksum: string | null;
   preview_path: string | null;
@@ -92,6 +101,7 @@ export interface RobotFile {
   fps: number | null;
   frame_count: number | null;
   quality: Quality;
+  review?: ReviewValue | string;
   original_name: string;
   checksum: string | null;
   preview_path: string | null;
@@ -108,12 +118,174 @@ export interface RealVideo {
   clip_id: number;
   kind: VideoKind | string;
   quality: Quality;
+  review?: ReviewValue | string;
   original_name: string;
   checksum: string | null;
   duration_sec: number | null;
   meta: Record<string, unknown>;
   created_at: string;
   can_download?: boolean;
+}
+
+export interface SharedText {
+  id: number;
+  clip_id: number;
+  format: string;
+  label?: string;
+  review?: ReviewValue | string;
+  original_name: string;
+  checksum: string | null;
+  meta: Record<string, unknown>;
+  created_at: string;
+  can_download?: boolean;
+}
+
+export interface ModelAsset {
+  id: number;
+  category: "human" | "robot" | string;
+  name: string;
+  format: string;
+  description: string;
+  original_name: string;
+  checksum: string | null;
+  meta: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface StorageFile {
+  id: string;
+  path: string;
+  name: string;
+  unit_name: string;
+  size: number;
+  modified_at: string;
+  ontology: "human" | "robot";
+  modality: string;
+  channel: string;
+  format: string;
+  batch: string;
+  uploader: StorageUploader | null;
+  fps?: number | null;
+  frame_count?: number | null;
+  duration_sec?: number | null;
+  width?: number | null;
+  height?: number | null;
+  joint_count?: number | null;
+  sample_rate?: number | null;
+  column_count?: number | null;
+  taxonomy_tag_ids?: Record<string, number>;
+  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  annotation?: StorageAnnotation;
+}
+
+export interface StorageAnnotation {
+  quality?: string;
+  note?: string;
+  status?: string;
+  robot_style?: string;
+  person_name?: string;
+  gender?: string;
+  height?: string;
+  [key: string]: unknown;
+}
+
+export interface StorageFileDetail extends StorageFile {
+  unit_taxonomy_tag_ids?: Record<string, number>;
+  unit_taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  unit_annotation?: StorageAnnotation;
+  batch_taxonomy_tag_ids?: Record<string, number>;
+  batch_taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  batch_annotation?: StorageAnnotation;
+}
+
+export interface StorageUploader {
+  id: number;
+  username: string;
+  uploaded_at?: string;
+  file_count?: number;
+}
+
+export interface StorageUnit {
+  key: string;
+  batch: string;
+  name: string;
+  file_count: number;
+  files: StorageFile[];
+  taxonomy_tag_ids: Record<string, number>;
+  taxonomy_tags: Record<string, TaxonomyTagBrief>;
+  annotation: StorageAnnotation;
+  meta: Record<string, unknown>;
+  uploaders: StorageUploader[];
+}
+
+export interface StorageBatch {
+  name: string;
+  unit_count: number;
+  file_count: number;
+  units: StorageUnit[];
+  meta: Record<string, unknown>;
+  uploaders: StorageUploader[];
+  taxonomy_tag_ids?: Record<string, number>;
+  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  annotation?: StorageAnnotation;
+}
+
+export interface StorageOverview {
+  updated_at: string;
+  modalities: string[];
+  ontologies: string[];
+  uploaders: StorageUploader[];
+  batches: StorageBatch[];
+  units: StorageUnit[];
+  files: StorageFile[];
+}
+
+export type StorageFolderUploadStatus =
+  | "uploaded"
+  | "replaced"
+  | "skip"
+  | "failed";
+
+export interface StorageFolderUploadItem {
+  name: string;
+  unit_name: string;
+  status: StorageFolderUploadStatus;
+  detail?: string;
+  file?: StorageFile;
+}
+
+export interface StorageFolderUploadResult {
+  batch: string;
+  total: number;
+  uploaded: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  items: StorageFolderUploadItem[];
+}
+
+export interface ModelInstanceFile {
+  id: string;
+  path: string;
+  name: string;
+  kind: string;
+  relative_path: string;
+  size: number;
+}
+
+export interface ModelInstance {
+  key: string;
+  ontology: "human" | "robot";
+  name: string;
+  kinds: string[];
+  files: ModelInstanceFile[];
+  meta: Record<string, unknown>;
+}
+
+export interface ModelRepositoryOverview {
+  updated_at: string;
+  instances: ModelInstance[];
+  kinds: Record<string, string[]>;
 }
 
 export interface Clip {
@@ -136,6 +308,12 @@ export interface Clip {
   brief?: string;
   detail_def?: string;
   action_version?: string;
+  routine_label?: string;
+  duel_label?: string;
+  compute_level?: string;
+  multimodal_overall?: string;
+  multimodal_segment?: string;
+  multimodal_atomic?: string;
   tags: string[];
   duration_sec: number | null;
   sort_order?: number;
@@ -147,6 +325,7 @@ export interface Clip {
   human_files: HumanFile[];
   robot_files: RobotFile[];
   real_videos?: RealVideo[];
+  shared_texts?: SharedText[];
   can_download?: boolean;
   can_edit?: boolean;
   can_annotate?: boolean;
@@ -173,6 +352,8 @@ export interface ClipListItem {
   human_formats: string[];
   robot_stages: string[];
   robot_models: string[];
+  shared_formats?: string[];
+  video_kinds?: string[];
   has_slice?: boolean;
   has_video?: boolean;
 }
@@ -258,8 +439,38 @@ export const PROCESS_STATUS_LABEL: Record<string, string> = {
 
 export const VIDEO_KIND_LABEL: Record<string, string> = {
   human: "真人视频",
-  robot_motion: "机器人视频",
+  robot_motion: "motion播放",
+  robot_policy_sim: "策略仿真",
+  robot_policy_real: "策略真机",
 };
+
+export const ROBOT_VIDEO_KINDS: VideoKind[] = [
+  "robot_motion",
+  "robot_policy_sim",
+  "robot_policy_real",
+];
+
+export const REVIEW_LABEL: Record<string, string> = {
+  "": "未评价",
+  pass: "直接通过",
+  needs_fix: "需要修改",
+  discard: "建议丢弃",
+};
+
+export const REVIEW_OPTIONS: { value: ReviewValue; label: string }[] = [
+  { value: "", label: "未评价" },
+  { value: "pass", label: "直接通过" },
+  { value: "needs_fix", label: "需要修改" },
+  { value: "discard", label: "建议丢弃" },
+];
+
+export const MODEL_CATEGORY_LABEL: Record<string, string> = {
+  human: "人体",
+  robot: "机器人",
+};
+
+export const HUMAN_MODEL_FORMATS = ["fbx", "bvh", "smpl", "blend"];
+export const ROBOT_MODEL_FORMATS = ["urdf", "xml", "fbx", "blend"];
 
 export const MODALITY_LABEL: Record<string, string> = {
   motion: "动作",
@@ -273,9 +484,9 @@ export const ONTOLOGY_LABEL: Record<string, string> = {
 };
 
 export const TAXONOMY_SCHEME_LABEL: Record<string, string> = {
-  atomic: "原子动作",
-  intent: "意图功能",
-  style: "风格化模式",
+  atomic: "原子or组合",
+  intent: "动作意图",
+  style: "动作风格",
 };
 
 export function taxonomySchemeLabel(

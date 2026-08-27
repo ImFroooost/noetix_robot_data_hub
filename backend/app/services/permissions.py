@@ -69,6 +69,7 @@ def list_user_permissions(db: Session, user: User) -> list[UserPermission]:
 
 
 def user_has_capability(db: Session, user: User, capability: Capability, folder_path: str) -> bool:
+    """Folder-tree scoped check (permissions with scheme=='')."""
     if is_admin(user):
         return True
     folder_path = normalize_path(folder_path)
@@ -77,11 +78,56 @@ def user_has_capability(db: Session, user: User, capability: Capability, folder_
         .filter(
             UserPermission.user_id == user.id,
             UserPermission.capability == capability,
+            UserPermission.scheme == "",
         )
         .all()
     )
     for p in perms:
         if path_matches(folder_path, p.path_prefix, p.recursive):
+            return True
+    return False
+
+
+def _clip_tag_paths(db: Session, clip: MotionClip) -> dict[str, str]:
+    """scheme key -> taxonomy node path for the clip's tags."""
+    from ..models import ClipTaxonomyTag, TaxonomyNode
+
+    rows = (
+        db.query(ClipTaxonomyTag.scheme, TaxonomyNode.path)
+        .join(TaxonomyNode, ClipTaxonomyTag.node_id == TaxonomyNode.id)
+        .filter(ClipTaxonomyTag.clip_id == clip.id)
+        .all()
+    )
+    return {scheme: path for scheme, path in rows}
+
+
+def user_has_clip_capability(
+    db: Session, user: User, capability: Capability, clip: MotionClip
+) -> bool:
+    """Clip-level check: folder-tree perms OR taxonomy-scheme perms."""
+    if is_admin(user):
+        return True
+    perms = (
+        db.query(UserPermission)
+        .filter(
+            UserPermission.user_id == user.id,
+            UserPermission.capability == capability,
+        )
+        .all()
+    )
+    if not perms:
+        return False
+    folder_path = folder_path_of_clip(db, clip)
+    tag_paths: dict[str, str] | None = None
+    for p in perms:
+        if not p.scheme:
+            if path_matches(folder_path, p.path_prefix, p.recursive):
+                return True
+            continue
+        if tag_paths is None:
+            tag_paths = _clip_tag_paths(db, clip)
+        tpath = tag_paths.get(p.scheme)
+        if tpath and path_matches(tpath, p.path_prefix, p.recursive):
             return True
     return False
 
@@ -106,13 +152,26 @@ def ensure_capability(db: Session, user: User, capability: Capability, folder_pa
 def ensure_clip_capability(
     db: Session, user: User, capability: Capability, clip: MotionClip
 ) -> str:
+    from fastapi import HTTPException, status
+
     path = folder_path_of_clip(db, clip)
-    ensure_capability(db, user, capability, path)
+    if not user_has_clip_capability(db, user, capability, clip):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"缺少权限：{capability.value} @ {path}",
+        )
+    if capability != Capability.browse and not user_has_clip_capability(
+        db, user, Capability.browse, clip
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"缺少浏览权限：{path}",
+        )
     return path
 
 
 def browse_path_prefixes(db: Session, user: User) -> list[str] | None:
-    """Return path prefixes for browse filter, or None if admin (no filter)."""
+    """Folder-tree browse prefixes, or None if admin (no filter)."""
     if is_admin(user):
         return None
     rows = (
@@ -120,18 +179,34 @@ def browse_path_prefixes(db: Session, user: User) -> list[str] | None:
         .filter(
             UserPermission.user_id == user.id,
             UserPermission.capability == Capability.browse,
+            UserPermission.scheme == "",
         )
         .all()
     )
     return [normalize_path(r.path_prefix) for r in rows]
 
 
+def _scheme_browse_perms(db: Session, user: User) -> list[UserPermission]:
+    return (
+        db.query(UserPermission)
+        .filter(
+            UserPermission.user_id == user.id,
+            UserPermission.capability == Capability.browse,
+            UserPermission.scheme != "",
+        )
+        .all()
+    )
+
+
 def apply_browse_filter(query, db: Session, user: User):
-    """Filter MotionClip query by browse path prefixes."""
+    """Filter MotionClip query by folder-tree and taxonomy-scheme browse perms."""
+    from ..models import ClipTaxonomyTag, TaxonomyNode
+
     prefixes = browse_path_prefixes(db, user)
     if prefixes is None:
         return query
-    if not prefixes:
+    scheme_perms = _scheme_browse_perms(db, user)
+    if not prefixes and not scheme_perms:
         return query.filter(False)
     # join folder; clips without folder treated as /未分类/
     query = query.outerjoin(Folder, MotionClip.folder_id == Folder.id)
@@ -143,6 +218,19 @@ def apply_browse_filter(query, db: Session, user: User):
         clauses.append(Folder.path.like(f"{pref}%"))
         if path_matches("/未分类/", pref, True):
             clauses.append(MotionClip.folder_id.is_(None))
+    for p in scheme_perms:
+        pref = normalize_path(p.path_prefix)
+        tagged = (
+            db.query(ClipTaxonomyTag.clip_id)
+            .join(TaxonomyNode, ClipTaxonomyTag.node_id == TaxonomyNode.id)
+            .filter(
+                ClipTaxonomyTag.scheme == p.scheme,
+                TaxonomyNode.path.like(f"{pref}%")
+                if pref != "/"
+                else TaxonomyNode.path.like("/%"),
+            )
+        )
+        clauses.append(MotionClip.id.in_(tagged))
     return query.filter(or_(*clauses))
 
 
@@ -171,6 +259,7 @@ def permission_summary(db: Session, user: User) -> dict:
             "permissions": [
                 {
                     "capability": c.value,
+                    "scheme": "",
                     "path_prefix": "/",
                     "recursive": True,
                 }
@@ -181,11 +270,14 @@ def permission_summary(db: Session, user: User) -> dict:
     caps: dict[str, list[str]] = {c.value: [] for c in ALL_CAPABILITIES}
     perms_out = []
     for r in rows:
-        caps[r.capability.value].append(normalize_path(r.path_prefix))
+        scheme = getattr(r, "scheme", "") or ""
+        pref = normalize_path(r.path_prefix)
+        caps[r.capability.value].append(f"{scheme}:{pref}" if scheme else pref)
         perms_out.append(
             {
                 "capability": r.capability.value,
-                "path_prefix": normalize_path(r.path_prefix),
+                "scheme": scheme,
+                "path_prefix": pref,
                 "recursive": r.recursive,
             }
         )
@@ -200,28 +292,30 @@ def set_user_permissions(
     """Replace all permissions. Auto-add browse for non-browse capabilities."""
     db.query(UserPermission).filter(UserPermission.user_id == user.id).delete()
     # normalize + auto browse
-    seen: set[tuple[str, str]] = set()
-    expanded: list[tuple[Capability, str, bool]] = []
+    seen: set[tuple[str, str, str]] = set()
+    expanded: list[tuple[Capability, str, str, bool]] = []
     for item in items:
         cap = item["capability"] if isinstance(item["capability"], Capability) else Capability(item["capability"])
+        scheme = (item.get("scheme") or "").strip()
         prefix = normalize_path(item.get("path_prefix") or "/")
         recursive = bool(item.get("recursive", True))
-        key = (cap.value, prefix)
+        key = (cap.value, scheme, prefix)
         if key in seen:
             continue
         seen.add(key)
-        expanded.append((cap, prefix, recursive))
+        expanded.append((cap, scheme, prefix, recursive))
         if cap != Capability.browse:
-            bkey = (Capability.browse.value, prefix)
+            bkey = (Capability.browse.value, scheme, prefix)
             if bkey not in seen:
                 seen.add(bkey)
-                expanded.append((Capability.browse, prefix, recursive))
+                expanded.append((Capability.browse, scheme, prefix, recursive))
 
     created = []
-    for cap, prefix, recursive in expanded:
+    for cap, scheme, prefix, recursive in expanded:
         row = UserPermission(
             user_id=user.id,
             capability=cap,
+            scheme=scheme,
             path_prefix=prefix,
             recursive=recursive,
         )

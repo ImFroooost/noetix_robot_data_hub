@@ -13,6 +13,8 @@ class ORMModel(BaseModel):
 # -------- Auth / Users --------
 class PermissionItem(BaseModel):
     capability: Capability
+    # ""=文件夹树；否则为分类标准 key，path_prefix 为该分类树下的节点路径
+    scheme: str = ""
     path_prefix: str = "/"
     recursive: bool = True
 
@@ -231,6 +233,10 @@ class ClipBatchIn(BaseModel):
     folder_id: int | None = None  # move 时必填
 
 
+# 数据评价：'' 未评价 / pass 直接通过 / needs_fix 需要修改 / discard 建议丢弃
+REVIEW_VALUES = {"", "pass", "needs_fix", "discard"}
+
+
 class HumanFileOut(ORMModel):
     id: int
     clip_id: int
@@ -239,6 +245,7 @@ class HumanFileOut(ORMModel):
     fps: float | None
     frame_count: int | None
     quality: QualityLevel
+    review: str = ""
     original_name: str
     checksum: str | None
     preview_path: str | None
@@ -259,6 +266,7 @@ class RobotFileOut(ORMModel):
     fps: float | None
     frame_count: int | None
     quality: QualityLevel
+    review: str = ""
     original_name: str
     checksum: str | None
     preview_path: str | None
@@ -270,11 +278,16 @@ class RobotFileOut(ORMModel):
     can_download: bool = False
 
 
+# 视频类型：human 真人视频 | robot_motion motion播放 | robot_policy_sim 策略仿真 | robot_policy_real 策略真机
+VIDEO_KINDS = {"human", "robot_motion", "robot_policy_sim", "robot_policy_real"}
+
+
 class RealVideoOut(ORMModel):
     id: int
     clip_id: int
-    kind: str = "human"  # human | robot_motion
+    kind: str = "human"
     quality: QualityLevel
+    review: str = ""
     original_name: str
     checksum: str | None
     duration_sec: float | None
@@ -286,7 +299,28 @@ class RealVideoOut(ORMModel):
 class RealVideoUpdate(BaseModel):
     kind: str | None = None
     quality: QualityLevel | None = None
+    review: str | None = None
+    original_name: str | None = Field(default=None, max_length=512)
     duration_sec: float | None = None
+
+
+class SharedTextOut(ORMModel):
+    id: int
+    clip_id: int
+    format: str
+    label: str = "v1"
+    review: str = ""
+    original_name: str
+    checksum: str | None
+    meta: dict[str, Any]
+    created_at: datetime
+    can_download: bool = False
+
+
+class SharedTextUpdate(BaseModel):
+    review: str | None = None
+    label: str | None = Field(default=None, max_length=64)
+    original_name: str | None = Field(default=None, max_length=512)
 
 
 class SliceInfoOut(BaseModel):
@@ -333,6 +367,7 @@ class ClipOut(ORMModel):
     human_files: list[HumanFileOut] = Field(default_factory=list)
     robot_files: list[RobotFileOut] = Field(default_factory=list)
     real_videos: list[RealVideoOut] = Field(default_factory=list)
+    shared_texts: list[SharedTextOut] = Field(default_factory=list)
     slice_info: SliceInfoOut = Field(default_factory=SliceInfoOut)
     can_download: bool = False
     can_edit: bool = False
@@ -366,6 +401,8 @@ class ClipListItem(ORMModel):
     human_formats: list[str] = Field(default_factory=list)
     robot_stages: list[str] = Field(default_factory=list)
     robot_models: list[str] = Field(default_factory=list)
+    shared_formats: list[str] = Field(default_factory=list)
+    video_kinds: list[str] = Field(default_factory=list)
     has_slice: bool = False
     has_video: bool = False
 
@@ -379,17 +416,21 @@ class SearchResult(BaseModel):
 
 class HumanFileUpdate(BaseModel):
     quality: QualityLevel | None = None
+    review: str | None = None
     fps: float | None = None
     frame_count: int | None = None
     label: str | None = Field(default=None, max_length=64)
+    original_name: str | None = Field(default=None, max_length=512)
 
 
 class RobotFileUpdate(BaseModel):
     quality: QualityLevel | None = None
+    review: str | None = None
     fps: float | None = None
     frame_count: int | None = None
     stage: RobotStage | None = None
     label: str | None = Field(default=None, max_length=64)
+    original_name: str | None = Field(default=None, max_length=512)
 
 
 # -------- Robot models --------
@@ -414,6 +455,30 @@ class RobotModelOut(ORMModel):
     joint_names: list[str]
     meta: dict[str, Any]
     created_at: datetime
+
+
+# -------- 3D model assets --------
+MODEL_ASSET_CATEGORIES = {"human", "robot"}
+HUMAN_MODEL_FORMATS = {"fbx", "bvh", "smpl", "blend", "blender"}
+ROBOT_MODEL_FORMATS = {"urdf", "xml", "fbx", "blend", "blender"}
+
+
+class ModelAssetOut(ORMModel):
+    id: int
+    category: str
+    name: str
+    format: str
+    description: str
+    original_name: str
+    checksum: str | None
+    meta: dict[str, Any]
+    created_at: datetime
+
+
+class ModelAssetUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=256)
+    description: str | None = None
+    original_name: str | None = Field(default=None, max_length=512)
 
 
 # -------- Batch import --------

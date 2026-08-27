@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
 import { api, getToken } from "../api";
 import { useAuth } from "../auth";
 import { BrowseTree } from "../components/BrowseTree";
@@ -216,7 +215,7 @@ export function SearchPage() {
       <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
         <h1 style={{ margin: 0 }}>数据浏览</h1>
         <p className="muted" style={{ margin: 0, width: "100%" }}>
-          按分类标准浏览条目与维度仓库上传包；分类在「分类管理」维护。
+          按分类标准浏览条目；分类在「分类管理」维护。
         </p>
         <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
           <button
@@ -456,57 +455,8 @@ export function SearchPage() {
                 </label>
               </div>
 
-              {!!hubPacks.length && (
-                <div className="stack" style={{ gap: 8 }}>
-                  <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
-                    <h3 style={{ margin: 0, fontSize: "1rem" }}>
-                      {browseMode === "folder" ? "维度仓库上传包" : "维度仓库（按分类）"}
-                    </h3>
-                    <Link to="/hub" style={{ fontSize: "0.85rem" }}>
-                      在维度仓库中管理 →
-                    </Link>
-                  </div>
-                  <div className="browse-result-list">
-                    {hubPacks.map((p) => (
-                      <Link
-                        key={p.key}
-                        to="/hub"
-                        className="browse-result-row"
-                        style={{ textDecoration: "none", color: "inherit" }}
-                      >
-                        <div className="browse-result-meta">
-                          <div className="browse-result-title">{p.source_name}</div>
-                          <div className="browse-result-sub muted">
-                            {MODALITY_LABEL[p.modality] || p.modality} /{" "}
-                            {ONTOLOGY_LABEL[p.ontology] || p.ontology}
-                            {" · "}
-                            {p.formats.join("/")}
-                            {" · "}
-                            {p.file_count} 文件
-                            {p.project ? ` · ${p.project}` : ""}
-                          </div>
-                          <div className="browse-result-tags">
-                            {Object.entries(p.action_def?.taxonomy || {}).map(([sch, brief]) => {
-                              const b = brief as { id?: number; code?: string; name?: string };
-                              if (!b?.name) return null;
-                              return (
-                                <span key={`${sch}-${b.id}`} className="tag-chip">
-                                  {taxonomySchemeLabel(sch, schemes)}:
-                                  {b.code ? `${b.code} ` : ""}
-                                  {b.name}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      </Link>
-                    ))}
-                  </div>
-                </div>
-              )}
-
               <h3 style={{ margin: "8px 0 0", fontSize: "1rem" }}>
-                {browseMode === "folder" ? "条目" : "旧库条目（MotionClip）"}
+                {browseMode === "folder" ? "条目" : "条目"}
               </h3>
               <div className="browse-result-list">
                 {listItems.map((item) => (
@@ -558,14 +508,9 @@ export function SearchPage() {
                     </div>
                   </div>
                 ))}
-                {!listItems.length && !hubPacks.length && (
+                {!listItems.length && (
                   <div className="muted" style={{ padding: "1.5rem 0.5rem" }}>
-                    当前分类下暂无数据。可切换分类节点，或到「上传 → 维度仓库」入库并打标。
-                  </div>
-                )}
-                {!listItems.length && !!hubPacks.length && (
-                  <div className="muted" style={{ padding: "0.5rem" }}>
-                    当前分类下无旧库条目；上方为维度仓库匹配结果。
+                    当前分类下暂无数据。可切换分类节点，或到「上传」入库并打标。
                   </div>
                 )}
               </div>

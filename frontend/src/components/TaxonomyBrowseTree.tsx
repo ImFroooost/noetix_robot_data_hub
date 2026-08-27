@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
 import { api, getToken } from "../api";
 import type { ClipListItem, RepoPack, TaxonomyNode } from "../types";
 
@@ -139,23 +138,19 @@ function NodeBranch({
             </div>
           )}
           {packs?.map((pack) => (
-            <Link
+            <div
               key={pack.key}
-              to="/hub"
               className="folder-row browse-clip-row"
               style={{
                 paddingLeft: 24 + depth * 14,
-                textDecoration: "none",
-                color: "inherit",
                 display: "flex",
               }}
-              onClick={(e) => e.stopPropagation()}
               title={`${pack.source_name} · ${pack.file_count} 文件`}
             >
               <span className="browse-clip-dot" style={{ background: "var(--accent, #3b82f6)" }} />
               <span className="folder-name">{pack.source_name}</span>
               <span className="muted folder-meta">{pack.file_count}文件</span>
-            </Link>
+            </div>
           ))}
           {clips?.map((clip) => (
             <div

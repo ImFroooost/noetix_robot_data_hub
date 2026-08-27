@@ -52,8 +52,10 @@ export async function filesFromDataTransfer(dt: DataTransfer): Promise<RelFile[]
   const items = Array.from(dt.items || []);
   const out: RelFile[] = [];
   for (const item of items) {
-    const entry = (item as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntryLike | null })
-      .webkitGetAsEntry?.();
+    const entry = (
+      (item as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntry | null })
+        .webkitGetAsEntry?.() || null
+    ) as unknown as FileSystemEntryLike | null;
     if (!entry) continue;
     if (entry.isFile) out.push(await readFileEntry(entry, ""));
     else if (entry.isDirectory) out.push(...(await readDirectoryEntry(entry, "")));

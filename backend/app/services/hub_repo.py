@@ -21,11 +21,10 @@ from typing import Any, BinaryIO
 
 from ..config import settings
 from .dimensions import (
-    MODALITIES,
-    ONTOLOGIES,
     load_dimension_schema,
     save_dimension_schema,
 )
+from .disk_repository import MODALITIES, ONTOLOGIES
 
 _SAFE_RE = re.compile(r"[^\w\u4e00-\u9fff\-_.]+", re.UNICODE)
 
@@ -39,11 +38,9 @@ def hub_root() -> Path:
 def ensure_hub_skeleton(root: Path | None = None) -> Path:
     root = Path(root or settings.hub_repo_root)
     (root / "index").mkdir(parents=True, exist_ok=True)
-    (root / "model" / "human").mkdir(parents=True, exist_ok=True)
-    (root / "model" / "robot").mkdir(parents=True, exist_ok=True)
-    for mod in MODALITIES:
-        for ont in ONTOLOGIES:
-            (root / "data" / mod / ont).mkdir(parents=True, exist_ok=True)
+    for ont in ONTOLOGIES:
+        (root / "3d_model" / ont).mkdir(parents=True, exist_ok=True)
+        (root / "data" / ont).mkdir(parents=True, exist_ok=True)
     # seed schema if missing
     load_dimension_schema(root)
     catalog_path(root)

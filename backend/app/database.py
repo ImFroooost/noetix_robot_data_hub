@@ -115,6 +115,10 @@ def _migrate_schema(conn):
         ("motion_clips", "multimodal_segment", "ALTER TABLE motion_clips ADD COLUMN multimodal_segment TEXT NOT NULL DEFAULT ''"),
         ("motion_clips", "multimodal_atomic", "ALTER TABLE motion_clips ADD COLUMN multimodal_atomic TEXT NOT NULL DEFAULT ''"),
         ("real_videos", "kind", "ALTER TABLE real_videos ADD COLUMN kind VARCHAR(32) NOT NULL DEFAULT 'human'"),
+        ("real_videos", "review", "ALTER TABLE real_videos ADD COLUMN review VARCHAR(32) NOT NULL DEFAULT ''"),
+        ("human_motion_files", "review", "ALTER TABLE human_motion_files ADD COLUMN review VARCHAR(32) NOT NULL DEFAULT ''"),
+        ("robot_motion_files", "review", "ALTER TABLE robot_motion_files ADD COLUMN review VARCHAR(32) NOT NULL DEFAULT ''"),
+        ("user_permissions", "scheme", "ALTER TABLE user_permissions ADD COLUMN scheme VARCHAR(64) NOT NULL DEFAULT ''"),
     ]
     # folders / user_permissions / real_videos / taxonomy_nodes created by create_all
     for table, col, stmt in alters:
@@ -212,6 +216,19 @@ def _migrate_schema(conn):
             "UNIQUE (clip_id, robot_model_id, stage, format, label)",
         )
 
+    # user_permissions: scheme-aware unique constraint
+    _exec_optional(
+        conn,
+        "ALTER TABLE user_permissions DROP CONSTRAINT IF EXISTS uq_user_perm_cap_path",
+    )
+    if not _constraint_exists(conn, "user_permissions", "uq_user_perm_cap_scheme_path"):
+        _exec_optional(
+            conn,
+            "ALTER TABLE user_permissions "
+            "ADD CONSTRAINT uq_user_perm_cap_scheme_path "
+            "UNIQUE (user_id, capability, scheme, path_prefix)",
+        )
+
 
 def _migrate_data(db):
     from .models import Capability, Folder, MotionClip, User, UserPermission, UserRole
@@ -226,6 +243,7 @@ def _migrate_data(db):
     from .services.taxonomy_schemes import (
         backfill_clip_taxonomy_tags,
         ensure_builtin_schemes,
+        ensure_default_custom_schemes,
     )
 
     unclassified = ensure_unclassified_folder(db)
@@ -289,6 +307,7 @@ def _migrate_data(db):
     from .services.taxonomy_seed import apply_folder_heuristic_to_clips, ensure_taxonomies
 
     ensure_builtin_schemes(db)
+    ensure_default_custom_schemes(db)
     ensure_taxonomies(db)
     apply_folder_heuristic_to_clips(db)
     backfill_clip_taxonomy_tags(db)

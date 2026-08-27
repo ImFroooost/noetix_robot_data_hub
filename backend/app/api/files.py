@@ -13,12 +13,23 @@ from ..models import (
     RealVideo,
     RobotModel,
     RobotMotionFile,
+    SharedTextFile,
     User,
 )
 from ..models.enums import QualityLevel, RobotStage
-from ..schemas import HumanFileOut, RealVideoOut, RobotFileOut, SliceInfoOut
+from ..schemas import (
+    VIDEO_KINDS,
+    HumanFileOut,
+    RealVideoOut,
+    RobotFileOut,
+    SharedTextOut,
+    SliceInfoOut,
+)
 from ..services.audit import write_audit
-from ..services.permissions import ensure_clip_capability, folder_path_of_clip, user_has_capability
+from ..services.permissions import (
+    ensure_clip_capability,
+    user_has_clip_capability,
+)
 from ..services.queue import enqueue_process_human, enqueue_process_robot
 from ..services.storage import absolute_path, data_root, save_upload_stream
 
@@ -100,9 +111,7 @@ async def upload_human_file(
     except Exception:
         pass
     out = HumanFileOut.model_validate(hf)
-    out.can_download = user_has_capability(
-        db, user, Capability.download, folder_path_of_clip(db, clip)
-    )
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
     return out
 
 
@@ -199,9 +208,7 @@ async def upload_robot_file(
         pass
     out = RobotFileOut.model_validate(rf)
     out.robot_model_name = model.name
-    out.can_download = user_has_capability(
-        db, user, Capability.download, folder_path_of_clip(db, clip)
-    )
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
     return out
 
 
@@ -241,12 +248,11 @@ async def upload_slice_json(
         detail={"name": clip.slice_json_name},
     )
     db.commit()
-    path = folder_path_of_clip(db, clip)
     return SliceInfoOut(
         has_file=True,
         original_name=clip.slice_json_name,
         checksum=checksum,
-        can_download=user_has_capability(db, user, Capability.download, path),
+        can_download=user_has_clip_capability(db, user, Capability.download, clip),
     )
 
 
@@ -303,8 +309,10 @@ async def upload_real_video(
         raise HTTPException(status_code=404, detail="条目不存在")
     ensure_clip_capability(db, user, Capability.upload, clip)
     video_kind = (kind or "human").strip().lower()
-    if video_kind not in {"human", "robot_motion"}:
-        raise HTTPException(status_code=400, detail="kind 须为 human 或 robot_motion")
+    if video_kind not in VIDEO_KINDS:
+        raise HTTPException(
+            status_code=400, detail=f"kind 须为 {'/'.join(sorted(VIDEO_KINDS))}"
+        )
     rel, checksum = save_upload_stream(
         "video", clip_id, file.filename or "video.mp4", file.file
     )
@@ -331,9 +339,58 @@ async def upload_real_video(
     db.commit()
     db.refresh(rv)
     out = RealVideoOut.model_validate(rv)
-    out.can_download = user_has_capability(
-        db, user, Capability.download, folder_path_of_clip(db, clip)
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
+    return out
+
+
+@router.post("/clips/{clip_id}/shared-texts", response_model=SharedTextOut)
+async def upload_shared_text(
+    clip_id: int,
+    format: str = Form(""),
+    label: str = Form(""),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """人机共享·文本描述（txt/json/…）。"""
+    clip = db.get(MotionClip, clip_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail="条目不存在")
+    ensure_clip_capability(db, user, Capability.upload, clip)
+    fmt = (format or "").strip().lower()
+    if not fmt:
+        from pathlib import Path as _P
+
+        fmt = (_P(file.filename or "").suffix.lstrip(".") or "txt").lower()
+    ver = (label or "").strip()
+    if not ver:
+        ver = _next_version_label(db, SharedTextFile, clip_id=clip_id, format=fmt)
+    rel, checksum = save_upload_stream(
+        "shared", clip_id, file.filename or f"text.{fmt}", file.file
     )
+    st = SharedTextFile(
+        clip_id=clip_id,
+        format=fmt,
+        label=ver,
+        file_path=rel,
+        original_name=file.filename or "",
+        checksum=checksum,
+    )
+    db.add(st)
+    clip.updated_by = user.id
+    db.flush()
+    write_audit(
+        db,
+        user_id=user.id,
+        action="upload",
+        entity_type="shared_text",
+        entity_id=st.id,
+        detail={"format": fmt, "clip_id": clip_id, "name": file.filename},
+    )
+    db.commit()
+    db.refresh(st)
+    out = SharedTextOut.model_validate(st)
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
     return out
 
 
@@ -368,8 +425,16 @@ def download_file(
         ensure_clip_capability(db, user, Capability.download, clip)
         path = absolute_path(rec.file_path)
         name = rec.original_name or path.name
+    elif kind == "shared":
+        rec = db.get(SharedTextFile, file_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="文件不存在")
+        clip = db.get(MotionClip, rec.clip_id)
+        ensure_clip_capability(db, user, Capability.download, clip)
+        path = absolute_path(rec.file_path)
+        name = rec.original_name or path.name
     else:
-        raise HTTPException(status_code=400, detail="kind 必须为 human、robot 或 video")
+        raise HTTPException(status_code=400, detail="kind 必须为 human、robot、video 或 shared")
     if not path.is_file():
         raise HTTPException(status_code=404, detail="磁盘文件缺失")
     return FileResponse(path, filename=name, media_type="application/octet-stream")
@@ -469,6 +534,8 @@ def delete_file(
         rec = db.get(RobotMotionFile, file_id)
     elif kind == "video":
         rec = db.get(RealVideo, file_id)
+    elif kind == "shared":
+        rec = db.get(SharedTextFile, file_id)
     else:
         raise HTTPException(status_code=400, detail="kind 无效")
     if not rec:

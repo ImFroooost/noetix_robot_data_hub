@@ -1,17 +1,158 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api } from "../api";
+import { api, downloadAuth } from "../api";
 import { useAuth } from "../auth";
 import { FolderDropZone } from "../components/FolderDropZone";
-import type { RobotModel } from "../types";
+import type { ModelAsset, RobotModel } from "../types";
+import {
+  HUMAN_MODEL_FORMATS,
+  MODEL_CATEGORY_LABEL,
+  ROBOT_MODEL_FORMATS,
+} from "../types";
 import {
   guessFolderName,
   zipRelFiles,
   type RelFile,
 } from "../utils/folderUpload";
 
+function ModelAssetSection({
+  category,
+  assets,
+  isAdmin,
+  busy,
+  onChanged,
+  onError,
+}: {
+  category: "human" | "robot";
+  assets: ModelAsset[];
+  isAdmin: boolean;
+  busy: boolean;
+  onChanged: () => void;
+  onError: (msg: string) => void;
+}) {
+  const formats = category === "human" ? HUMAN_MODEL_FORMATS : ROBOT_MODEL_FORMATS;
+  const list = assets.filter((a) => a.category === category);
+  return (
+    <div className="card stack">
+      <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+        <h2 style={{ margin: 0 }}>{MODEL_CATEGORY_LABEL[category]}模型</h2>
+        <span className="muted">支持格式：{formats.join(" / ")}</span>
+      </div>
+      {!list.length && <div className="muted">暂无{MODEL_CATEGORY_LABEL[category]}模型文件</div>}
+      {!!list.length && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>格式</th>
+              <th>描述</th>
+              <th>文件</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {list.map((a) => (
+              <tr key={a.id}>
+                <td>{a.name}</td>
+                <td>
+                  <span className="badge">{a.format.toUpperCase()}</span>
+                </td>
+                <td>{a.description || "-"}</td>
+                <td className="muted" style={{ fontSize: "0.85rem" }}>
+                  {a.original_name}
+                </td>
+                <td>
+                  <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                    <button
+                      className="secondary"
+                      onClick={() =>
+                        downloadAuth(
+                          api.modelAssetDownloadUrl(a.id),
+                          a.original_name || `${a.name}.${a.format}`
+                        )
+                      }
+                    >
+                      下载
+                    </button>
+                    {isAdmin && (
+                      <>
+                        <button
+                          className="secondary"
+                          disabled={busy}
+                          onClick={async () => {
+                            const name = prompt("新名称：", a.name);
+                            if (!name || !name.trim()) return;
+                            try {
+                              await api.updateModelAsset(a.id, { name: name.trim() });
+                              onChanged();
+                            } catch (e) {
+                              onError(e instanceof Error ? e.message : "重命名失败");
+                            }
+                          }}
+                        >
+                          重命名
+                        </button>
+                        <button
+                          className="danger"
+                          disabled={busy}
+                          onClick={async () => {
+                            if (!confirm(`确认删除模型「${a.name}」？`)) return;
+                            try {
+                              await api.deleteModelAsset(a.id);
+                              onChanged();
+                            } catch (e) {
+                              onError(e instanceof Error ? e.message : "删除失败");
+                            }
+                          }}
+                        >
+                          删除
+                        </button>
+                      </>
+                    )}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {isAdmin && (
+        <form
+          className="row"
+          style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}
+          onSubmit={async (e: FormEvent<HTMLFormElement>) => {
+            e.preventDefault();
+            const el = e.currentTarget;
+            const fd = new FormData(el);
+            fd.set("category", category);
+            try {
+              await api.uploadModelAsset(fd);
+              el.reset();
+              onChanged();
+            } catch (err) {
+              onError(err instanceof Error ? err.message : "上传失败");
+            }
+          }}
+        >
+          <input name="name" placeholder="模型名称（可选，默认取文件名）" />
+          <input
+            name="file"
+            type="file"
+            required
+            accept={formats.map((f) => `.${f}`).join(",") + ",.blender"}
+          />
+          <button type="submit" disabled={busy}>
+            上传{MODEL_CATEGORY_LABEL[category]}模型
+          </button>
+        </form>
+      )}
+    </div>
+  );
+}
+
 export function RobotModelsPage() {
-  const { canEdit } = useAuth();
+  const { canEdit, isAdmin } = useAuth();
   const [models, setModels] = useState<RobotModel[]>([]);
+  const [assets, setAssets] = useState<ModelAsset[]>([]);
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
@@ -20,7 +161,8 @@ export function RobotModelsPage() {
   const [folderDesc, setFolderDesc] = useState("");
   const [folderJoints, setFolderJoints] = useState("");
 
-  const reload = () => api.listRobotModels().then(setModels);
+  const reload = () =>
+    Promise.all([api.listRobotModels().then(setModels), api.listModelAssets().then(setAssets)]);
 
   useEffect(() => {
     reload().catch((e) => setError(e.message));
@@ -110,12 +252,37 @@ export function RobotModelsPage() {
   return (
     <div className="page stack">
       <div className="card stack">
-        <h1>机器人型号</h1>
-        <p className="muted">
-          支持拖拽/选择文件夹、上传 zip，或填写服务器本机路径导入。
+        <h1>3D 模型</h1>
+        <p className="muted" style={{ margin: 0 }}>
+          人体模型（fbx / bvh / smpl / blender）与机器人模型（urdf / xml / fbx / blender）文件库；
+          下方为机器人 URDF 可视化型号（用于动作预览）。
         </p>
         {error && <div className="error">{error}</div>}
         {msg && <div className="success">{msg}</div>}
+      </div>
+
+      <ModelAssetSection
+        category="human"
+        assets={assets}
+        isAdmin={isAdmin}
+        busy={busy}
+        onChanged={() => void reload()}
+        onError={setError}
+      />
+      <ModelAssetSection
+        category="robot"
+        assets={assets}
+        isAdmin={isAdmin}
+        busy={busy}
+        onChanged={() => void reload()}
+        onError={setError}
+      />
+
+      <div className="card stack">
+        <h2>机器人 URDF 可视化型号</h2>
+        <p className="muted">
+          支持拖拽/选择文件夹、上传 zip，或填写服务器本机路径导入；用于动作数据的 3D 预览。
+        </p>
         <table className="table">
           <thead>
             <tr>

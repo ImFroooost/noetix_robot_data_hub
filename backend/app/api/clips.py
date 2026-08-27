@@ -13,11 +13,14 @@ from ..models import (
     RealVideo,
     RobotModel,
     RobotMotionFile,
+    SharedTextFile,
     TaxonomyNode,
     User,
 )
 from ..models.enums import QualityLevel, RobotStage, TaxonomyScheme
 from ..schemas import (
+    REVIEW_VALUES,
+    VIDEO_KINDS,
     ClipBatchIn,
     ClipCreate,
     ClipListItem,
@@ -31,6 +34,8 @@ from ..schemas import (
     RobotFileOut,
     RobotFileUpdate,
     SearchResult,
+    SharedTextOut,
+    SharedTextUpdate,
     SliceInfoOut,
     TaxonomyTagBrief,
 )
@@ -41,7 +46,7 @@ from ..services.permissions import (
     ensure_clip_capability,
     ensure_unclassified_folder,
     folder_path_of_clip,
-    user_has_capability,
+    user_has_clip_capability,
 )
 from ..services.taxonomy_schemes import (
     clip_taxonomy_tag_map,
@@ -137,10 +142,10 @@ def _apply_taxonomy_writes(
 
 def _clip_out(db: Session, clip: MotionClip, user: User) -> ClipOut:
     path = folder_path_of_clip(db, clip)
-    can_dl = user_has_capability(db, user, Capability.download, path)
-    can_edit = user_has_capability(db, user, Capability.edit, path)
-    can_ann = user_has_capability(db, user, Capability.annotate, path)
-    can_up = user_has_capability(db, user, Capability.upload, path)
+    can_dl = user_has_clip_capability(db, user, Capability.download, clip)
+    can_edit = user_has_clip_capability(db, user, Capability.edit, clip)
+    can_ann = user_has_clip_capability(db, user, Capability.annotate, clip)
+    can_up = user_has_clip_capability(db, user, Capability.upload, clip)
     tax = _taxonomy_tags_dict(db, clip)
     return ClipOut(
         id=clip.id,
@@ -185,6 +190,10 @@ def _clip_out(db: Session, clip: MotionClip, user: User) -> ClipOut:
             RealVideoOut.model_validate(v).model_copy(update={"can_download": can_dl})
             for v in (clip.real_videos or [])
         ],
+        shared_texts=[
+            SharedTextOut.model_validate(t).model_copy(update={"can_download": can_dl})
+            for t in (clip.shared_texts or [])
+        ],
         slice_info=SliceInfoOut(
             has_file=bool(clip.slice_json_path),
             original_name=clip.slice_json_name,
@@ -205,6 +214,7 @@ def _load_clip(db: Session, clip_id: int) -> MotionClip | None:
             joinedload(MotionClip.human_files),
             joinedload(MotionClip.robot_files).joinedload(RobotMotionFile.robot_model),
             joinedload(MotionClip.real_videos),
+            joinedload(MotionClip.shared_texts),
             joinedload(MotionClip.folder),
             joinedload(MotionClip.atomic_tag),
             joinedload(MotionClip.intent_tag),
@@ -502,6 +512,7 @@ def search_clips(
                 joinedload(MotionClip.human_files),
                 joinedload(MotionClip.robot_files).joinedload(RobotMotionFile.robot_model),
                 joinedload(MotionClip.real_videos),
+                joinedload(MotionClip.shared_texts),
                 joinedload(MotionClip.folder),
                 joinedload(MotionClip.atomic_tag),
                 joinedload(MotionClip.intent_tag),
@@ -545,6 +556,8 @@ def search_clips(
                 robot_models=list(
                     {r.robot_model.name for r in c.robot_files if r.robot_model}
                 ),
+                shared_formats=[t.format for t in (c.shared_texts or [])],
+                video_kinds=list({v.kind for v in (c.real_videos or [])}),
                 has_slice=bool(c.slice_json_path),
                 has_video=bool(c.real_videos),
             )
@@ -803,6 +816,20 @@ def delete_clip(
     return {"ok": True}
 
 
+ANNOTATE_FILE_FIELDS = {"quality", "review", "kind"}
+
+
+def _validate_review(data: dict) -> None:
+    if "review" in data:
+        val = (data["review"] or "").strip()
+        if val not in REVIEW_VALUES:
+            raise HTTPException(
+                status_code=400,
+                detail="review 须为 pass / needs_fix / discard 或空",
+            )
+        data["review"] = val
+
+
 @router.patch("/human-files/{file_id}", response_model=HumanFileOut)
 def update_human_file(
     file_id: int,
@@ -815,9 +842,10 @@ def update_human_file(
         raise HTTPException(status_code=404, detail="文件不存在")
     clip = db.get(MotionClip, hf.clip_id)
     data = body.model_dump(exclude_unset=True)
-    if "quality" in data:
+    _validate_review(data)
+    if ANNOTATE_FILE_FIELDS & data.keys():
         ensure_clip_capability(db, user, Capability.annotate, clip)
-    other = set(data) - {"quality"}
+    other = set(data) - ANNOTATE_FILE_FIELDS
     if other:
         ensure_clip_capability(db, user, Capability.edit, clip)
     for k, v in data.items():
@@ -832,9 +860,8 @@ def update_human_file(
     )
     db.commit()
     db.refresh(hf)
-    path = folder_path_of_clip(db, clip)
     out = HumanFileOut.model_validate(hf)
-    out.can_download = user_has_capability(db, user, Capability.download, path)
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
     return out
 
 
@@ -855,9 +882,10 @@ def update_robot_file(
         raise HTTPException(status_code=404, detail="文件不存在")
     clip = db.get(MotionClip, rf.clip_id)
     data = body.model_dump(exclude_unset=True)
-    if "quality" in data:
+    _validate_review(data)
+    if ANNOTATE_FILE_FIELDS & data.keys():
         ensure_clip_capability(db, user, Capability.annotate, clip)
-    other = set(data) - {"quality"}
+    other = set(data) - ANNOTATE_FILE_FIELDS
     if other:
         ensure_clip_capability(db, user, Capability.edit, clip)
     for k, v in data.items():
@@ -872,8 +900,9 @@ def update_robot_file(
     )
     db.commit()
     db.refresh(rf)
-    path = folder_path_of_clip(db, clip)
-    return _robot_file_out(rf, user_has_capability(db, user, Capability.download, path))
+    return _robot_file_out(
+        rf, user_has_clip_capability(db, user, Capability.download, clip)
+    )
 
 
 @router.patch("/real-videos/{video_id}", response_model=RealVideoOut)
@@ -888,14 +917,17 @@ def update_real_video(
         raise HTTPException(status_code=404, detail="视频不存在")
     clip = db.get(MotionClip, rv.clip_id)
     data = body.model_dump(exclude_unset=True)
+    _validate_review(data)
     if "kind" in data:
         kind = (data["kind"] or "").strip().lower()
-        if kind not in {"human", "robot_motion"}:
-            raise HTTPException(status_code=400, detail="kind 须为 human 或 robot_motion")
+        if kind not in VIDEO_KINDS:
+            raise HTTPException(
+                status_code=400, detail=f"kind 须为 {'/'.join(sorted(VIDEO_KINDS))}"
+            )
         data["kind"] = kind
-    if "quality" in data or "kind" in data:
+    if ANNOTATE_FILE_FIELDS & data.keys():
         ensure_clip_capability(db, user, Capability.annotate, clip)
-    other = set(data) - {"quality", "kind"}
+    other = set(data) - ANNOTATE_FILE_FIELDS
     if other:
         ensure_clip_capability(db, user, Capability.edit, clip)
     for k, v in data.items():
@@ -910,7 +942,41 @@ def update_real_video(
     )
     db.commit()
     db.refresh(rv)
-    path = folder_path_of_clip(db, clip)
     out = RealVideoOut.model_validate(rv)
-    out.can_download = user_has_capability(db, user, Capability.download, path)
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
+    return out
+
+
+@router.patch("/shared-texts/{text_id}", response_model=SharedTextOut)
+def update_shared_text(
+    text_id: int,
+    body: SharedTextUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    st = db.get(SharedTextFile, text_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="文本文件不存在")
+    clip = db.get(MotionClip, st.clip_id)
+    data = body.model_dump(exclude_unset=True)
+    _validate_review(data)
+    if ANNOTATE_FILE_FIELDS & data.keys():
+        ensure_clip_capability(db, user, Capability.annotate, clip)
+    other = set(data) - ANNOTATE_FILE_FIELDS
+    if other:
+        ensure_clip_capability(db, user, Capability.edit, clip)
+    for k, v in data.items():
+        setattr(st, k, v)
+    write_audit(
+        db,
+        user_id=user.id,
+        action="update",
+        entity_type="shared_text",
+        entity_id=text_id,
+        detail=data,
+    )
+    db.commit()
+    db.refresh(st)
+    out = SharedTextOut.model_validate(st)
+    out.can_download = user_has_clip_capability(db, user, Capability.download, clip)
     return out

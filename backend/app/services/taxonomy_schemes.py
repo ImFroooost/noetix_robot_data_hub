@@ -7,9 +7,57 @@ import re
 from sqlalchemy.orm import Session
 
 from ..models import ClipTaxonomyTag, MotionClip, TaxonomyNode, TaxonomySchemeDef
-from ..models.enums import BUILTIN_TAXONOMY_SCHEMES, TaxonomyScheme
+from ..models.enums import (
+    BUILTIN_TAXONOMY_SCHEMES,
+    LEGACY_SCHEME_NAMES,
+    TaxonomyScheme,
+)
 
 BUILTIN_KEYS = {k for k, *_ in BUILTIN_TAXONOMY_SCHEMES}
+
+# 图表方案的自定义分类维度（builtin=False，分类管理显示「·自定」）
+DEFAULT_CUSTOM_SCHEMES: tuple[tuple[str, str, str, int], ...] = (
+    ("custom", "所属项目", "D", 3),
+    ("custom_3", "获取方式", "E", 4),
+    ("custom_2", "获取地点", "F", 5),
+    ("custom_4", "获取设备", "G", 6),
+    ("custom_5", "所处阶段", "H", 7),
+)
+
+DEFAULT_CUSTOM_TREES: dict[str, dict] = {
+    "custom": {
+        "运动会": ("D1", None),
+        "GMT": ("D2", {"动作表2": ("D2.1", None)}),
+        "马拉松": ("D3", None),
+    },
+    "custom_3": {
+        "全身动捕": ("E1", None),
+        "视频生成": ("E2", None),
+        "vr5点式": ("E3", None),
+    },
+    "custom_2": {
+        "松延大厦": ("F1", None),
+        "机器人产业园": ("F2", None),
+    },
+    "custom_4": {
+        "op": ("G1", None),
+        "xsens": ("G2", None),
+        "pico": ("G3", None),
+    },
+    "custom_5": {
+        "待描述": ("H1", None),
+        "待采集": ("H2", None),
+        "待重定向": ("H3", None),
+        "待精修": ("H4", None),
+        "待训练": ("H5", None),
+        "待真机测试": ("H6", None),
+    },
+}
+
+# 旧节点名 → 新节点名（仅在无条目引用歧义时安全改名）
+LEGACY_NODE_RENAMES: dict[str, dict[str, str]] = {
+    "custom_4": {"optitrack": "op"},
+}
 BUILTIN_COLUMN = {
     TaxonomyScheme.atomic.value: "atomic_tag_id",
     TaxonomyScheme.intent.value: "intent_tag_id",
@@ -26,7 +74,7 @@ def ensure_builtin_schemes(db: Session) -> None:
             if row.sort_order is None:
                 row.sort_order = sort_order
             row.builtin = True
-            if not row.name:
+            if not row.name or LEGACY_SCHEME_NAMES.get(row.name) == name:
                 row.name = name
             continue
         db.add(
@@ -39,6 +87,124 @@ def ensure_builtin_schemes(db: Session) -> None:
                 description="",
             )
         )
+    db.flush()
+
+
+def _rename_node_with_subtree(db: Session, node: TaxonomyNode, new_name: str) -> None:
+    """Rename node and re-prefix its own + descendant paths."""
+    from .permissions import join_folder_path
+
+    old_path = node.path
+    parent = db.get(TaxonomyNode, node.parent_id) if node.parent_id else None
+    new_path = join_folder_path(parent.path if parent else None, new_name)
+    if new_path == old_path:
+        node.name = new_name
+        return
+    clash = (
+        db.query(TaxonomyNode)
+        .filter(TaxonomyNode.scheme == node.scheme, TaxonomyNode.path == new_path)
+        .first()
+    )
+    if clash:
+        return  # 目标名已存在，跳过改名
+    node.name = new_name
+    node.path = new_path
+    descendants = (
+        db.query(TaxonomyNode)
+        .filter(
+            TaxonomyNode.scheme == node.scheme,
+            TaxonomyNode.path.like(f"{old_path}%"),
+            TaxonomyNode.id != node.id,
+        )
+        .all()
+    )
+    for d in descendants:
+        d.path = new_path + d.path[len(old_path):]
+    db.flush()
+
+
+def ensure_default_custom_schemes(db: Session) -> None:
+    """补齐图表方案的自定义维度：所属项目/获取方式/获取地点/获取设备/所处阶段。"""
+    from .permissions import join_folder_path, normalize_path
+
+    for key, name, prefix, sort_order in DEFAULT_CUSTOM_SCHEMES:
+        row = db.get(TaxonomySchemeDef, key)
+        if not row:
+            db.add(
+                TaxonomySchemeDef(
+                    key=key,
+                    name=name,
+                    code_prefix=prefix,
+                    sort_order=sort_order,
+                    builtin=False,
+                    description="",
+                )
+            )
+            db.flush()
+        elif LEGACY_SCHEME_NAMES.get(row.name) == name:
+            row.name = name
+            db.flush()
+        root_path = normalize_path(f"/{name}/")
+        root = (
+            db.query(TaxonomyNode)
+            .filter(TaxonomyNode.scheme == key, TaxonomyNode.parent_id.is_(None))
+            .first()
+        )
+        if root and root.name != name and LEGACY_SCHEME_NAMES.get(root.name) == name:
+            _rename_node_with_subtree(db, root, name)
+        if not root:
+            root = TaxonomyNode(
+                scheme=key,
+                parent_id=None,
+                code=prefix,
+                name=name,
+                path=root_path,
+                sort_order=0,
+                description="",
+            )
+            db.add(root)
+            db.flush()
+
+        for old_name, new_name in (LEGACY_NODE_RENAMES.get(key) or {}).items():
+            stale = (
+                db.query(TaxonomyNode)
+                .filter(TaxonomyNode.scheme == key, TaxonomyNode.name == old_name)
+                .first()
+            )
+            if stale:
+                _rename_node_with_subtree(db, stale, new_name)
+
+        def _ensure(parent: TaxonomyNode, tree: dict) -> None:
+            for idx, (child_name, payload) in enumerate(tree.items()):
+                code, children = payload
+                path = join_folder_path(parent.path, child_name)
+                node = (
+                    db.query(TaxonomyNode)
+                    .filter(TaxonomyNode.scheme == key, TaxonomyNode.path == path)
+                    .first()
+                )
+                if not node:
+                    node = TaxonomyNode(
+                        scheme=key,
+                        parent_id=parent.id,
+                        code=code or "",
+                        name=child_name,
+                        path=path,
+                        sort_order=idx,
+                        description="",
+                    )
+                    db.add(node)
+                    db.flush()
+                else:
+                    if code and node.code != code:
+                        node.code = code
+                    if node.sort_order != idx:
+                        node.sort_order = idx
+                if children:
+                    _ensure(node, children)
+
+        tree = DEFAULT_CUSTOM_TREES.get(key) or {}
+        _ensure(root, tree)
     db.flush()
 
 

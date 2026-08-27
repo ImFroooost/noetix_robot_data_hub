@@ -15,8 +15,8 @@ from ..models.enums import TaxonomyScheme
 from .permissions import join_folder_path, normalize_path
 from .taxonomy_schemes import ensure_builtin_schemes
 
-TAXONOMY_REVISION = "v6-daily-life-i1-i9"
-REVISION_MARKER_PATH = "/原子/位移类/"
+TAXONOMY_REVISION = "v7-atomic-or-combo"
+REVISION_MARKER_PATH = "/原子or组合/原子/"
 
 
 def _leaves(parent_code: str, *names: str) -> dict:
@@ -27,7 +27,14 @@ def _leaves(parent_code: str, *names: str) -> dict:
 # Nested dict: name -> (code, children_dict | None)
 # Note: names must not contain "/".
 
+# 图表方案：原子or组合 只分两类
 ATOMIC_TREE = {
+    "原子": ("A1", None),
+    "组合": ("A2", None),
+}
+
+# 已弃用：v6 原子动作大树（保留备查，不再种子化）
+_LEGACY_ATOMIC_TREE = {
     "位移类": (
         "A1",
         {
@@ -465,7 +472,7 @@ STYLE_TREE = {
 }
 
 ROOTS = {
-    TaxonomyScheme.atomic.value: ("原子", ATOMIC_TREE),
+    TaxonomyScheme.atomic.value: ("原子or组合", ATOMIC_TREE),
     TaxonomyScheme.intent.value: ("意图", INTENT_TREE),
     TaxonomyScheme.style.value: ("风格", STYLE_TREE),
 }

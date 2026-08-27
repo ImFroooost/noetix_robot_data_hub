@@ -31,14 +31,22 @@ class RobotStage(str, enum.Enum):
 class TaxonomyScheme(str, enum.Enum):
     """Built-in scheme keys (stored as plain strings on nodes/tags)."""
 
-    atomic = "atomic"  # 原子动作
-    intent = "intent"  # 意图/功能
-    style = "style"  # 风格化模式
+    atomic = "atomic"  # 原子or组合
+    intent = "intent"  # 动作意图
+    style = "style"  # 动作风格
 
 
 BUILTIN_TAXONOMY_SCHEMES: tuple[tuple[str, str, str, int], ...] = (
     # key, name, code_prefix, sort_order
-    ("atomic", "原子动作", "A", 0),
-    ("intent", "意图功能", "B", 1),
-    ("style", "风格化模式", "C", 2),
+    ("atomic", "原子or组合", "A", 0),
+    ("intent", "动作意图", "B", 1),
+    ("style", "动作风格", "C", 2),
 )
+
+# 旧显示名 → 新显示名（启动时自动改名）
+LEGACY_SCHEME_NAMES: dict[str, str] = {
+    "原子动作": "原子or组合",
+    "意图功能": "动作意图",
+    "风格化模式": "动作风格",
+    "录制地点": "获取地点",
+}

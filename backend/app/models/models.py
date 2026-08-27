@@ -60,7 +60,11 @@ class UserPermission(Base):
     __tablename__ = "user_permissions"
     __table_args__ = (
         UniqueConstraint(
-            "user_id", "capability", "path_prefix", name="uq_user_perm_cap_path"
+            "user_id",
+            "capability",
+            "scheme",
+            "path_prefix",
+            name="uq_user_perm_cap_scheme_path",
         ),
     )
 
@@ -69,6 +73,8 @@ class UserPermission(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     capability: Mapped[Capability] = mapped_column(Enum(Capability), index=True)
+    # ""=按文件夹树；否则为分类标准 key（atomic/intent/style/custom...）
+    scheme: Mapped[str] = mapped_column(String(64), default="", index=True)
     path_prefix: Mapped[str] = mapped_column(String(1024), default="/")
     recursive: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -198,6 +204,9 @@ class MotionClip(Base):
     real_videos = relationship(
         "RealVideo", back_populates="clip", cascade="all, delete-orphan"
     )
+    shared_texts = relationship(
+        "SharedTextFile", back_populates="clip", cascade="all, delete-orphan"
+    )
 
 
 class HumanMotionFile(Base):
@@ -213,6 +222,8 @@ class HumanMotionFile(Base):
     fps: Mapped[float | None] = mapped_column(Float, nullable=True)
     frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quality: Mapped[QualityLevel] = mapped_column(Enum(QualityLevel), default=QualityLevel.medium)
+    # 数据评价：'' 未评价 / pass 直接通过 / needs_fix 需要修改 / discard 建议丢弃
+    review: Mapped[str] = mapped_column(String(32), default="", index=True)
     file_path: Mapped[str] = mapped_column(String(1024))
     original_name: Mapped[str] = mapped_column(String(512), default="")
     checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -232,9 +243,10 @@ class RealVideo(Base):
     clip_id: Mapped[int] = mapped_column(
         ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True
     )
-    # human=真人视频；robot_motion=机器人 motion 视频
+    # human=真人视频；robot_motion=motion播放；robot_policy_sim=策略仿真；robot_policy_real=策略真机
     kind: Mapped[str] = mapped_column(String(32), default="human", index=True)
     quality: Mapped[QualityLevel] = mapped_column(Enum(QualityLevel), default=QualityLevel.medium)
+    review: Mapped[str] = mapped_column(String(32), default="", index=True)
     file_path: Mapped[str] = mapped_column(String(1024))
     original_name: Mapped[str] = mapped_column(String(512), default="")
     checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -243,6 +255,45 @@ class RealVideo(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     clip = relationship("MotionClip", back_populates="real_videos")
+
+
+class SharedTextFile(Base):
+    """人机共享·文本描述文件（txt/json/…）。"""
+
+    __tablename__ = "shared_text_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    clip_id: Mapped[int] = mapped_column(
+        ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True
+    )
+    format: Mapped[str] = mapped_column(String(32), index=True)  # txt/json/md/...
+    label: Mapped[str] = mapped_column(String(64), default="v1")
+    file_path: Mapped[str] = mapped_column(String(1024))
+    original_name: Mapped[str] = mapped_column(String(512), default="")
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    review: Mapped[str] = mapped_column(String(32), default="", index=True)
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    clip = relationship("MotionClip", back_populates="shared_texts")
+
+
+class ModelAsset(Base):
+    """3D 模型库文件：人体（fbx/bvh/smpl/blender）与机器人（urdf/xml/fbx/blender）。"""
+
+    __tablename__ = "model_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    category: Mapped[str] = mapped_column(String(32), index=True)  # human / robot
+    name: Mapped[str] = mapped_column(String(256), default="", index=True)
+    format: Mapped[str] = mapped_column(String(32), index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    file_path: Mapped[str] = mapped_column(String(1024))
+    original_name: Mapped[str] = mapped_column(String(512), default="")
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class RobotModel(Base):
@@ -284,6 +335,7 @@ class RobotMotionFile(Base):
     fps: Mapped[float | None] = mapped_column(Float, nullable=True)
     frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quality: Mapped[QualityLevel] = mapped_column(Enum(QualityLevel), default=QualityLevel.medium)
+    review: Mapped[str] = mapped_column(String(32), default="", index=True)
     file_path: Mapped[str] = mapped_column(String(1024))
     original_name: Mapped[str] = mapped_column(String(512), default="")
     checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)

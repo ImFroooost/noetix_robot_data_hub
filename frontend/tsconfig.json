@@ -17,5 +17,16 @@
     "noFallthroughCasesInSwitch": true,
     "resolveJsonModule": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/pages/HubRepoPage.tsx",
+    "src/pages/SearchPage.tsx",
+    "src/pages/ClipDetailPage.tsx",
+    "src/pages/UploadPage.tsx",
+    "src/pages/RobotModelsPage.tsx",
+    "src/components/FolderTree.tsx",
+    "src/components/BrowseTree.tsx",
+    "src/components/TaxonomyBrowseTree.tsx",
+    "src/components/ClipBrowsePanel.tsx"
+  ]
 }

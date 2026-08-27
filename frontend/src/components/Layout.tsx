@@ -3,11 +3,11 @@ import { useAuth } from "../auth";
 import { ROLE_LABEL } from "../types";
 
 export function Layout() {
-  const { user, logout, canEdit, isAdmin } = useAuth();
+  const { user, logout, canEdit, isAdmin, hasPerm } = useAuth();
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand">Noetix Robot Data Hub</div>
+        <div className="brand">Noetix Motion Data Hub</div>
         <nav className="nav">
           <NavLink to="/" end className={({ isActive }) => (isActive ? "active" : undefined)}>
             浏览
@@ -17,14 +17,21 @@ export function Layout() {
               上传
             </NavLink>
           )}
-          <NavLink to="/hub" className={({ isActive }) => (isActive ? "active" : undefined)}>
-            维度仓库
-          </NavLink>
+          {(isAdmin || hasPerm("annotate") || hasPerm("edit")) && (
+            <NavLink to="/annotate" className={({ isActive }) => (isActive ? "active" : undefined)}>
+              标注
+            </NavLink>
+          )}
+          {isAdmin && (
+            <NavLink to="/manage" className={({ isActive }) => (isActive ? "active" : undefined)}>
+              数据管理
+            </NavLink>
+          )}
           <NavLink to="/taxonomies" className={({ isActive }) => (isActive ? "active" : undefined)}>
             分类管理
           </NavLink>
           <NavLink to="/robots" className={({ isActive }) => (isActive ? "active" : undefined)}>
-            机器人型号
+            3D模型管理
           </NavLink>
           {isAdmin && (
             <NavLink to="/users" className={({ isActive }) => (isActive ? "active" : undefined)}>

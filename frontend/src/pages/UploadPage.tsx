@@ -54,6 +54,24 @@ export function UploadPage() {
         await api.uploadHuman(clip.id, hfd);
       }
 
+      // 人体 · 真人视频
+      const humanVideo = (form.elements.namedItem("human_video") as HTMLInputElement)?.files?.[0];
+      if (humanVideo) {
+        const vfd = new FormData();
+        vfd.set("kind", "human");
+        vfd.set("quality", "medium");
+        vfd.set("file", humanVideo);
+        await api.uploadRealVideo(clip.id, vfd);
+      }
+
+      // 人机共享 · 文本描述
+      const sharedInput = form.elements.namedItem("shared_file") as HTMLInputElement;
+      for (const file of Array.from(sharedInput?.files || [])) {
+        const sfd = new FormData();
+        sfd.set("file", file);
+        await api.uploadSharedText(clip.id, sfd);
+      }
+
       const robotFile = (form.elements.namedItem("robot_file") as HTMLInputElement)?.files?.[0];
       const robotModelId = fd.get("robot_model_id");
       const stage = fd.get("stage") as RobotStage;
@@ -65,6 +83,16 @@ export function UploadPage() {
         rfd.set("quality", String(fd.get("robot_quality") || "medium"));
         rfd.set("file", robotFile);
         await api.uploadRobot(clip.id, rfd);
+      }
+
+      // 机器人 · 视频（motion播放 / 策略仿真 / 策略真机）
+      const robotVideo = (form.elements.namedItem("robot_video") as HTMLInputElement)?.files?.[0];
+      if (robotVideo) {
+        const vfd = new FormData();
+        vfd.set("kind", String(fd.get("robot_video_kind") || "robot_motion"));
+        vfd.set("quality", "medium");
+        vfd.set("file", robotVideo);
+        await api.uploadRealVideo(clip.id, vfd);
       }
 
       nav(`/clips/${clip.id}`);
@@ -105,7 +133,13 @@ export function UploadPage() {
           <input name="duration_sec" type="number" step="0.001" />
         </label>
 
-        <h2>人体动捕（可多格式）</h2>
+        <h2>人体 · 视频（可选）</h2>
+        <label>
+          真人视频
+          <input name="human_video" type="file" accept="video/*" />
+        </label>
+
+        <h2>人体 · 动作数据（smpl / fbx / bvh / csv…）</h2>
         {[0, 1, 2, 3, 4].map((i) => (
           <div className="row" key={i}>
             <label>
@@ -130,7 +164,13 @@ export function UploadPage() {
           </div>
         ))}
 
-        <h2>机器人数据（可选）</h2>
+        <h2>人机共享 · 文本描述（txt / json，可多选）</h2>
+        <label>
+          文本文件
+          <input name="shared_file" type="file" accept=".txt,.json,.md,.yaml,.yml" multiple />
+        </label>
+
+        <h2>机器人 · 动力学数据（csv / json，可选）</h2>
         <label>
           型号
           <select name="robot_model_id">
@@ -167,6 +207,20 @@ export function UploadPage() {
         <label>
           文件
           <input name="robot_file" type="file" />
+        </label>
+
+        <h2>机器人 · 视频（可选）</h2>
+        <label>
+          视频类型
+          <select name="robot_video_kind" defaultValue="robot_motion">
+            <option value="robot_motion">motion播放</option>
+            <option value="robot_policy_sim">策略仿真</option>
+            <option value="robot_policy_real">策略真机</option>
+          </select>
+        </label>
+        <label>
+          机器人视频
+          <input name="robot_video" type="file" accept="video/*" />
         </label>
 
         {error && <div className="error">{error}</div>}

@@ -29,6 +29,7 @@ from ..services.repo_taxonomy import pack_exact_sets, subtree_pack_counts
 from ..services.taxonomy_schemes import (
     BUILTIN_KEYS,
     ensure_builtin_schemes,
+    ensure_default_custom_schemes,
     get_scheme,
     list_schemes,
     next_code_prefix,
@@ -317,6 +318,7 @@ def get_schemes(
     _: User = Depends(get_current_user),
 ):
     ensure_builtin_schemes(db)
+    ensure_default_custom_schemes(db)
     db.commit()
     return [_scheme_out(db, s) for s in list_schemes(db)]
 

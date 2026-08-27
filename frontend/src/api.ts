@@ -93,8 +93,18 @@ export const api = {
     request(`/api/clips/human-files/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   updateRobotFile: (id: number, body: Record<string, unknown>) =>
     request(`/api/clips/robot-files/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateRealVideo: (id: number, body: Record<string, unknown>) =>
+    request(`/api/clips/real-videos/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateSharedText: (id: number, body: Record<string, unknown>) =>
+    request(`/api/clips/shared-texts/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   uploadHuman: (clipId: number, form: FormData) =>
     request(`/api/clips/${clipId}/human-files`, { method: "POST", body: form }),
+  uploadRealVideo: (clipId: number, form: FormData) =>
+    request(`/api/clips/${clipId}/real-videos`, { method: "POST", body: form }),
+  uploadSharedText: (clipId: number, form: FormData) =>
+    request(`/api/clips/${clipId}/shared-texts`, { method: "POST", body: form }),
+  deleteClipFile: (kind: "human" | "robot" | "video" | "shared", id: number) =>
+    request<{ ok: boolean }>(`/api/files/${kind}/${id}`, { method: "DELETE" }),
   importHumanZip: (form: FormData) =>
     request<{
       created_clip_ids: number[];
@@ -113,11 +123,38 @@ export const api = {
   createRobotModelFromPath: (form: FormData) =>
     request("/api/robot-models/from-path", { method: "POST", body: form }),
 
+  listModelAssets: (category?: string) =>
+    request<import("./types").ModelAsset[]>(
+      `/api/model-assets${category ? `?category=${category}` : ""}`
+    ),
+  uploadModelAsset: (form: FormData) =>
+    request<import("./types").ModelAsset>("/api/model-assets", {
+      method: "POST",
+      body: form,
+    }),
+  updateModelAsset: (id: number, body: Record<string, unknown>) =>
+    request<import("./types").ModelAsset>(`/api/model-assets/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteModelAsset: (id: number) =>
+    request<{ ok: boolean }>(`/api/model-assets/${id}`, { method: "DELETE" }),
+  modelAssetDownloadUrl: (id: number) => `/api/model-assets/${id}/download`,
+
   listUsers: () => request<import("./types").User[]>("/api/users"),
   createUser: (body: Record<string, unknown>) =>
     request("/api/users", { method: "POST", body: JSON.stringify(body) }),
   updateUser: (id: number, body: Record<string, unknown>) =>
     request(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteUser: (id: number) =>
+    request<{ ok: boolean }>(`/api/users/${id}`, { method: "DELETE" }),
+  getUserPermissions: (id: number) =>
+    request<import("./types").PermissionItem[]>(`/api/users/${id}/permissions`),
+  putUserPermissions: (id: number, permissions: import("./types").PermissionItem[]) =>
+    request<import("./types").PermissionItem[]>(`/api/users/${id}/permissions`, {
+      method: "PUT",
+      body: JSON.stringify({ permissions }),
+    }),
 
   listFolders: () => request<import("./types").Folder[]>("/api/folders"),
   createFolder: (body: Record<string, unknown>) =>
@@ -189,6 +226,95 @@ export const api = {
       body: JSON.stringify({ parent_id, ordered_ids, renumber_codes }),
     }),
 
+  storageOverview: (
+    params: Record<string, string | number | undefined | null> = {}
+  ) => {
+    const q = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") {
+        q.set(key, String(value));
+      }
+    });
+    return request<import("./types").StorageOverview>(
+      `/api/storage/overview${q.size ? `?${q}` : ""}`
+    );
+  },
+  storageRescan: () =>
+    request("/api/storage/rescan", { method: "POST" }),
+  storageCreateBatch: (name: string) =>
+    request<import("./types").StorageBatch>("/api/storage/batches", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  storageUpdateBatch: (name: string, body: Record<string, unknown>) =>
+    request<import("./types").StorageBatch>(
+      `/api/storage/batches/${encodeURIComponent(name)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    ),
+  storageUpdateFileMeta: (path: string, body: Record<string, unknown>) =>
+    request<import("./types").StorageFile>(
+      `/api/storage/file-meta?path=${encodeURIComponent(path)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    ),
+  storageUpdateUnit: (
+    batch: string,
+    unitName: string,
+    body: Record<string, unknown>
+  ) =>
+    request<import("./types").StorageUnit>(
+      `/api/storage/units/${encodeURIComponent(batch)}/${encodeURIComponent(unitName)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    ),
+  storageUpload: (form: FormData) =>
+    request<import("./types").StorageFile>("/api/storage/data/upload", {
+      method: "POST",
+      body: form,
+    }),
+  storageUploadFolder: (form: FormData) =>
+    request<import("./types").StorageFolderUploadResult>(
+      "/api/storage/data/upload-folder",
+      { method: "POST", body: form }
+    ),
+  storageDeleteFile: (path: string) =>
+    request<{ ok: boolean }>(
+      `/api/storage/file?path=${encodeURIComponent(path)}`,
+      { method: "DELETE" }
+    ),
+  storageFileUrl: (path: string, download = false) =>
+    `/api/storage/file?path=${encodeURIComponent(path)}${
+      download ? "&download=true" : ""
+    }`,
+  storageFileDetail: (path: string) =>
+    request<import("./types").StorageFileDetail>(
+      `/api/storage/file-detail?path=${encodeURIComponent(path)}`
+    ),
+  storageModels: () =>
+    request<import("./types").ModelRepositoryOverview>("/api/storage/models"),
+  storageCreateModelInstance: (ontology: "human" | "robot", name: string) =>
+    request<import("./types").ModelInstance>("/api/storage/models/instances", {
+      method: "POST",
+      body: JSON.stringify({ ontology, name }),
+    }),
+  storageUploadModel: (form: FormData) =>
+    request("/api/storage/models/upload", { method: "POST", body: form }),
+  storageDeleteModelInstance: (ontology: string, name: string) =>
+    request<{ ok: boolean }>(
+      `/api/storage/models/instances/${encodeURIComponent(ontology)}/${encodeURIComponent(name)}`,
+      { method: "DELETE" }
+    ),
+  storageDeleteModelFile: (path: string) =>
+    request<{ ok: boolean }>(
+      `/api/storage/models/file?path=${encodeURIComponent(path)}`,
+      { method: "DELETE" }
+    ),
+  storageSchema: () =>
+    request<{
+      ontologies: string[];
+      modalities: string[];
+      fpv_channels: string[];
+      model_kinds: Record<string, string[]>;
+    }>("/api/storage/schema"),
+
   repoBrowseTree: () => request<{ tree: unknown }>("/api/repo/browse-tree"),
   repoCatalog: () => request<unknown>("/api/repo/catalog"),
   repoListPacks: (
@@ -229,7 +355,8 @@ export const api = {
     request<import("./types").RepoFile[]>("/api/repo/upload-zip", { method: "POST", body: form }),
 
   previewUrl: (kind: "human" | "robot", id: number) => `/api/previews/${kind}/${id}`,
-  fileUrl: (kind: "human" | "robot" | "video", id: number) => `/api/files/${kind}/${id}`,
+  fileUrl: (kind: "human" | "robot" | "video" | "shared", id: number) =>
+    `/api/files/${kind}/${id}`,
   thumbUrl: (clipId: number) => `/api/thumbnails/${clipId}`,
   mediaUrl: (path: string) => `/api/media/${path}`,
 };

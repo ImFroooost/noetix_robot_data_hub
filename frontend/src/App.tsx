@@ -1,13 +1,13 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { useAuth } from "./auth";
 import { Layout } from "./components/Layout";
-import { ClipDetailPage } from "./pages/ClipDetailPage";
-import { HubRepoPage } from "./pages/HubRepoPage";
 import { LoginPage } from "./pages/LoginPage";
-import { RobotModelsPage } from "./pages/RobotModelsPage";
-import { SearchPage } from "./pages/SearchPage";
+import { RepositoryAnnotatePage } from "./pages/RepositoryAnnotatePage";
+import { RepositoryBrowsePage } from "./pages/RepositoryBrowsePage";
+import { RepositoryManagePage } from "./pages/RepositoryManagePage";
+import { RepositoryModelsPage } from "./pages/RepositoryModelsPage";
+import { RepositoryUploadPage } from "./pages/RepositoryUploadPage";
 import { TaxonomyManagePage } from "./pages/TaxonomyManagePage";
-import { UploadPage } from "./pages/UploadPage";
 import { UsersPage } from "./pages/UsersPage";
 
 function Private({ children }: { children: React.ReactNode }) {
@@ -29,12 +29,12 @@ export default function App() {
           </Private>
         }
       >
-        <Route index element={<SearchPage />} />
-        <Route path="clips/:id" element={<ClipDetailPage />} />
-        <Route path="upload" element={<UploadPage />} />
-        <Route path="hub" element={<HubRepoPage />} />
+        <Route index element={<RepositoryBrowsePage />} />
+        <Route path="annotate" element={<RepositoryAnnotatePage />} />
+        <Route path="manage" element={<RepositoryManagePage />} />
+        <Route path="upload" element={<RepositoryUploadPage />} />
         <Route path="taxonomies" element={<TaxonomyManagePage />} />
-        <Route path="robots" element={<RobotModelsPage />} />
+        <Route path="robots" element={<RepositoryModelsPage />} />
         <Route path="users" element={<UsersPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
