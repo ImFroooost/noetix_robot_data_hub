@@ -8,26 +8,14 @@ from ..database import get_db
 from ..models import RobotModel, User
 from ..schemas import RobotModelOut, RobotModelUpdate
 from ..services.audit import write_audit
-from ..services.storage import data_root, extract_zip_to_robot_model, import_robot_model_from_dir
+from ..services.storage import extract_zip_to_robot_model, import_robot_model_from_dir, resolve_project_dir
 
 router = APIRouter(prefix="/robot-models", tags=["robot-models"])
 
 
 def _resolve_host_path(path: str) -> Path:
-    """Map host absolute paths into container mounts (/host/...)."""
-    p = Path(path).expanduser()
-    candidates = [p]
-    if str(p).startswith("/home/"):
-        candidates.append(Path("/host") / str(p).lstrip("/"))
-    if not str(p).startswith("/host/"):
-        candidates.append(Path("/host") / str(p).lstrip("/"))
-    for c in candidates:
-        if c.is_dir():
-            return c.resolve()
-    raise ValueError(
-        f"服务器上找不到目录：{path}。"
-        "请确认路径在本机存在，且 docker-compose 已挂载 /home/noetix（或改用 zip 上传）。"
-    )
+    """Resolve a directory relative to ./data/files or ./data/hub_repo."""
+    return resolve_project_dir(path)
 
 
 @router.get("", response_model=list[RobotModelOut])
@@ -38,7 +26,7 @@ def list_models(db: Session = Depends(get_db), _: User = Depends(get_current_use
 @router.post("/from-path", response_model=RobotModelOut)
 def create_model_from_path(
     name: str = Form(...),
-    path: str = Form(..., description="服务器本机上的机器人资源目录绝对路径"),
+    path: str = Form(..., description="相对 ./data/files 或 ./data/hub_repo 的目录，例如 import/noetix_e2"),
     description: str = Form(""),
     joint_names: str = Form(""),
     db: Session = Depends(get_db),

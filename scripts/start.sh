@@ -21,6 +21,16 @@ else
   exit 1
 fi
 
+API_CONTAINER="${COMPOSE_PROJECT_NAME:-$(basename "$ROOT")}-api-1"
+if docker inspect "$API_CONTAINER" >/dev/null 2>&1; then
+  CURRENT="$(docker inspect "$API_CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+  if [[ -n "$CURRENT" && "$CURRENT" != "$ROOT" ]]; then
+    echo "容器仍绑定旧目录：$CURRENT"
+    echo "将按当前项目目录重建：$ROOT"
+    $COMPOSE down
+  fi
+fi
+
 $COMPOSE up -d --build
 echo ""
 echo "网页:  http://$(hostname -I | awk '{print $1}'):${WEB_PORT:-80}/"

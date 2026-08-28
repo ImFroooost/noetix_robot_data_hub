@@ -770,7 +770,7 @@ button:disabled {
 }
 
 .storage-preview-box {
-  min-height: 200px;
+  min-height: 280px;
   border: 1px solid var(--border);
   border-radius: 6px;
   display: flex;
@@ -827,6 +827,37 @@ button:disabled {
   align-items: center;
   justify-content: center;
   overflow: auto;
+}
+
+.storage-preview-content:has(.animation-format-preview) {
+  align-items: stretch;
+  overflow: hidden;
+}
+
+.animation-format-preview {
+  width: 100%;
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+}
+
+.animation-format-canvas {
+  flex: 1;
+  height: 210px;
+  min-height: 180px;
+  border-radius: 0;
+  border: 0;
+}
+
+.animation-format-controls {
+  padding: 6px 8px;
+  gap: 6px;
+}
+
+.animation-format-status {
+  white-space: nowrap;
+  background: #0b0d12cc;
+  padding: 6px 10px;
 }
 
 .storage-preview-empty {

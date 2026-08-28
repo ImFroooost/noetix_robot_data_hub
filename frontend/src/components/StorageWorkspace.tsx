@@ -1,6 +1,7 @@
 import { Children, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, downloadAuth, getToken } from "../api";
 import { useAuth } from "../auth";
+import { AnimationFormatPreview, animationFormatOf } from "./AnimationFormatPreview";
 import { FolderBatchImport } from "./FolderBatchImport";
 import { TaxonomySelect } from "./TaxonomyTree";
 import type {
@@ -58,6 +59,7 @@ function Preview({ file }: { file: StorageFile | null }) {
   const [url, setUrl] = useState("");
   const [text, setText] = useState("");
   const [error, setError] = useState("");
+  const animationFormat = file ? animationFormatOf(file) : null;
 
   useEffect(() => {
     let objectUrl = "";
@@ -65,7 +67,7 @@ function Preview({ file }: { file: StorageFile | null }) {
     setUrl("");
     setText("");
     setError("");
-    if (!file) return;
+    if (!file || animationFormat) return;
     const token = getToken();
     fetch(api.storageFileUrl(file.path), {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -89,9 +91,18 @@ function Preview({ file }: { file: StorageFile | null }) {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file?.path]);
+  }, [file?.path, animationFormat]);
 
   if (!file) return <div className="storage-preview-empty">选择右上方文件后在这里预览</div>;
+  if (animationFormat) {
+    return (
+      <AnimationFormatPreview
+        url={api.storageFileUrl(file.path)}
+        format={animationFormat}
+        durationHint={file.duration_sec}
+      />
+    );
+  }
   if (error) return <div className="storage-preview-empty">{error}</div>;
   if (text) return <pre className="storage-text-preview">{text}</pre>;
   if (!url) return <div className="storage-preview-empty">正在加载 {file.name}…</div>;

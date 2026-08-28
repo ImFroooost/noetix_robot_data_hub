@@ -240,7 +240,7 @@ export function RobotModelsPage() {
     try {
       await api.createRobotModelFromPath(fd);
       form.reset();
-      setMsg("已从本机目录导入机器人型号");
+      setMsg("已从项目目录导入机器人型号");
       await reload();
     } catch (err) {
       setError(err instanceof Error ? err.message : "导入失败");
@@ -343,20 +343,21 @@ export function RobotModelsPage() {
           </form>
 
           <form className="card stack" style={{ maxWidth: 720 }} onSubmit={onCreatePath}>
-            <h2>方式二：本机目录路径导入</h2>
+            <h2>方式二：项目目录路径导入</h2>
             <p className="muted" style={{ margin: 0 }}>
-              资源已在服务器本机磁盘时可用，无需经过浏览器打包。
+              资源已在项目 data 目录内时可用，无需经过浏览器打包。路径相对
+              ./data/files 或 ./data/hub_repo。
             </p>
             <label>
               名称
               <input name="name" required placeholder="例如 noetix_e2" />
             </label>
             <label>
-              本机目录绝对路径
+              相对路径
               <input
                 name="path"
                 required
-                placeholder="/home/noetix/.../robot/noetix_e2"
+                placeholder="import/noetix_e2"
               />
             </label>
             <label>

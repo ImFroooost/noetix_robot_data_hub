@@ -22,6 +22,51 @@ def data_root() -> Path:
     return root
 
 
+def _reject_absolute(relative: str) -> Path:
+    raw = (relative or "").strip()
+    if not raw:
+        raise ValueError("路径不能为空")
+    path = Path(raw)
+    if path.is_absolute() or path.anchor:
+        raise ValueError("请使用相对路径，不要填写本机绝对路径")
+    if ".." in path.parts:
+        raise ValueError("路径不能包含 ..")
+    return path
+
+
+def resolve_relative_under(root: Path, relative: str) -> Path:
+    """Resolve a relative path that must stay inside root."""
+    rel = _reject_absolute(relative)
+    base = Path(root).resolve()
+    dest = (base / rel).resolve()
+    dest.relative_to(base)
+    return dest
+
+
+def resolve_project_dir(relative: str) -> Path:
+    """Resolve a directory relative to data/files, then hub_repo."""
+    rel = _reject_absolute(relative)
+    roots = [data_root(), Path(settings.hub_repo_root)]
+    for root in roots:
+        try:
+            dest = resolve_relative_under(root, str(rel))
+        except ValueError:
+            continue
+        if dest.is_dir():
+            return dest
+    raise ValueError(
+        f"找不到目录：{relative}。请放到 ./data/files/ 下并用相对路径（如 import/noetix_e2）。"
+    )
+
+
+def resolve_import_file(relative: str) -> Path:
+    """Resolve a file relative to data/files/import."""
+    dest = resolve_relative_under(data_root() / "import", relative)
+    if not dest.is_file():
+        raise ValueError(f"文件不存在：{relative}")
+    return dest
+
+
 def checksum_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:

@@ -513,7 +513,7 @@ class BatchClipItem(BaseModel):
 
 
 class BatchImportIn(BaseModel):
-    """相对路径相对于服务器 DATA_ROOT/import staging 或绝对路径（容器内）。"""
+    """清单中的 path 必须相对 ./data/files/import，不接受本机绝对路径。"""
     items: list[BatchClipItem]
     copy_files: bool = True
 

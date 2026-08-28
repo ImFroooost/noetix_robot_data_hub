@@ -32,7 +32,6 @@ services:
     volumes:
       - ./data/files:/data
       - ./data/hub_repo:/hub_repo
-      - /home/noetix:/host/home/noetix:ro
     depends_on:
       db:
         condition: service_healthy
@@ -49,7 +48,6 @@ services:
     volumes:
       - ./data/files:/data
       - ./data/hub_repo:/hub_repo
-      - /home/noetix:/host/home/noetix:ro
 
     depends_on:
       db:

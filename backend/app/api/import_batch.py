@@ -1,7 +1,6 @@
 import json
 import shutil
 import uuid
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import func
@@ -22,7 +21,7 @@ from ..services.permissions import (
     normalize_path,
 )
 from ..services.queue import enqueue_process_human, enqueue_process_robot
-from ..services.storage import copy_into_storage, data_root
+from ..services.storage import copy_into_storage, data_root, resolve_import_file
 
 router = APIRouter(prefix="/import", tags=["import"])
 
@@ -66,11 +65,10 @@ def batch_import(
         db.flush()
 
         for hf in item.human_files:
-            src = Path(hf.path)
-            if not src.is_absolute():
-                src = root / "import" / hf.path
-            if not src.is_file():
-                warnings.append(f"item[{idx}] human {hf.format}: 文件不存在 {src}")
+            try:
+                src = resolve_import_file(hf.path)
+            except ValueError as e:
+                warnings.append(f"item[{idx}] human {hf.format}: {e}")
                 continue
             try:
                 if body.copy_files:
@@ -111,11 +109,10 @@ def batch_import(
             if not model:
                 warnings.append(f"item[{idx}] robot: 未知型号 {rf.robot_model}")
                 continue
-            src = Path(rf.path)
-            if not src.is_absolute():
-                src = root / "import" / rf.path
-            if not src.is_file():
-                warnings.append(f"item[{idx}] robot {rf.stage}: 文件不存在 {src}")
+            try:
+                src = resolve_import_file(rf.path)
+            except ValueError as e:
+                warnings.append(f"item[{idx}] robot {rf.stage}: {e}")
                 continue
             try:
                 if body.copy_files:

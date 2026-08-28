@@ -18,7 +18,7 @@
 需要已安装 Docker，以及 Compose 插件（`docker compose`）或独立二进制 `docker-compose`。
 
 ```bash
-cd /media/noetix/my_passport/noetix_robot_data_hub
+# 在项目根目录执行（不要写死本机绝对路径，硬盘换挂载点后仍可用）
 # 一键启动（自动复制 .env、创建数据目录、构建并启动）
 ./scripts/start.sh
 
@@ -31,9 +31,9 @@ docker compose up -d --build   # 或 docker-compose up -d --build
 - API / OpenAPI：`http://<服务器IP>:18000/docs`（见 `.env` 的 `API_PORT`）
 - 默认管理员：`admin` / `admin123`（请立刻修改）
 
-数据文件目录：`./data/files`  
-维度仓库：`./data/hub_repo`  
-数据库目录：`./data/pgdata`
+数据目录都相对项目根：`./data/files`、`./data/hub_repo`。不要在配置或导入里写 `/media/...`、`/home/...` 这类本机绝对路径。硬盘换挂载点后，在项目根再执行一次 `./scripts/start.sh` 即可按当前目录重建容器。
+
+数据库在 Docker 卷 `pgdata` 中（不依赖盘符路径）。
 
 ## 使用流程
 
