@@ -19,6 +19,11 @@ class PermissionItem(BaseModel):
     recursive: bool = True
 
 
+class ImpersonatorOut(BaseModel):
+    id: int
+    username: str
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -27,6 +32,7 @@ class TokenOut(BaseModel):
     is_admin: bool = False
     capabilities: dict[str, list[str]] = Field(default_factory=dict)
     permissions: list[PermissionItem] = Field(default_factory=list)
+    impersonated_by: ImpersonatorOut | None = None
 
 
 class LoginIn(BaseModel):
@@ -37,7 +43,7 @@ class LoginIn(BaseModel):
 class UserCreate(BaseModel):
     username: str = Field(min_length=2, max_length=64)
     password: str = Field(min_length=4, max_length=128)
-    role: UserRole = UserRole.viewer
+    role: UserRole = UserRole.visitor
     permissions: list[PermissionItem] = Field(default_factory=list)
 
 
@@ -56,6 +62,7 @@ class UserOut(ORMModel):
     is_admin: bool = False
     capabilities: dict[str, list[str]] = Field(default_factory=dict)
     permissions: list[PermissionItem] = Field(default_factory=list)
+    impersonated_by: ImpersonatorOut | None = None
 
 
 class UserPermissionsPut(BaseModel):

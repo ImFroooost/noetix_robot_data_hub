@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ..core.deps import get_current_user, require_admin
+from ..core.deps import get_current_user, require_manage_data
 from ..database import get_db
 from ..models import ClipTaxonomyTag, MotionClip, TaxonomyNode, TaxonomySchemeDef, User
 from ..schemas import (
@@ -19,10 +19,8 @@ from ..schemas import (
 )
 from ..services.audit import write_audit
 from ..services.permissions import (
-    is_admin,
     join_folder_path,
     normalize_path,
-    user_has_capability,
 )
 from ..models.enums import Capability
 from ..services.repo_taxonomy import pack_exact_sets, subtree_pack_counts
@@ -41,24 +39,12 @@ router = APIRouter(prefix="/taxonomies", tags=["taxonomies"])
 
 
 def _require_taxonomy_write(db: Session, user: User) -> None:
-    """管理员，或具备全局/任意编辑权限的用户，可新增分类节点。"""
-    if is_admin(user):
-        return
-    if user_has_capability(db, user, Capability.edit, "/"):
-        return
-    from ..models import UserPermission
+    """具备管理数据权限的用户可维护分类树。"""
+    from ..services.permissions import user_has_any_capability
 
-    has_edit = (
-        db.query(UserPermission.id)
-        .filter(
-            UserPermission.user_id == user.id,
-            UserPermission.capability == Capability.edit,
-        )
-        .first()
-    )
-    if has_edit:
+    if user_has_any_capability(db, user, Capability.manage_data):
         return
-    raise HTTPException(status_code=403, detail="缺少编辑权限，无法新增分类")
+    raise HTTPException(status_code=403, detail="缺少管理数据权限，无法维护分类")
 
 
 def _scheme_str(scheme) -> str:
@@ -327,7 +313,7 @@ def get_schemes(
 def create_scheme(
     body: TaxonomySchemeCreate,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     ensure_builtin_schemes(db)
     name = body.name.strip()
@@ -400,7 +386,7 @@ def update_scheme(
     key: str,
     body: TaxonomySchemeUpdate,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     row = _require_registered_scheme(db, key)
     data = body.model_dump(exclude_unset=True)
@@ -478,7 +464,7 @@ def update_scheme(
 def reorder_schemes(
     body: TaxonomySchemeReorder,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     """Reorder schemes by ordered_keys list (full or partial)."""
     ensure_builtin_schemes(db)
@@ -515,7 +501,7 @@ def delete_scheme(
     key: str,
     cascade: bool = Query(False, description="为 true 时级联删除节点与条目标签"),
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     row = _require_registered_scheme(db, key)
     if row.builtin or key in BUILTIN_KEYS:
@@ -678,7 +664,7 @@ def create_node(
 def reorder_nodes(
     body: TaxonomyNodeReorder,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     """同级重排；默认按新顺序重编号码（含子树前缀）。"""
     if body.parent_id is not None:
@@ -744,7 +730,7 @@ def update_node(
     node_id: int,
     body: TaxonomyNodeUpdate,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     node = db.get(TaxonomyNode, node_id)
     if not node:
@@ -842,7 +828,7 @@ def update_node(
 def delete_node(
     node_id: int,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_manage_data),
 ):
     node = db.get(TaxonomyNode, node_id)
     if not node:

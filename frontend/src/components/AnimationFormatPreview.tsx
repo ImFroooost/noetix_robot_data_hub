@@ -119,7 +119,10 @@ export function BvhScene({
         );
         offsetReady.current = true;
 
-        const jointGeo = new THREE.SphereGeometry(2.2, 10, 10);
+        // Radius is in BVH local units. A fixed 2.2 worked for centimetre
+        // files but swallowed metre-scale skeletons (height ≈ 1–2).
+        const jointRadius = Math.max(maxHeight * 0.016, 0.002);
+        const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
         const jointMat = new THREE.MeshStandardMaterial({
           color: 0xffb454,
           emissive: 0x663300,
@@ -221,20 +224,88 @@ export function BvhScene({
   );
 }
 
+function expandSkeletonBox(root: THREE.Object3D, box: THREE.Box3) {
+  box.makeEmpty();
+  root.updateMatrixWorld(true);
+  root.traverse((obj) => {
+    if ((obj as THREE.Bone).isBone) {
+      obj.getWorldPosition(_bvhPt);
+      box.expandByPoint(_bvhPt);
+    }
+  });
+  if (box.isEmpty()) {
+    box.setFromObject(root);
+  }
+}
+
+function styleSkeletonHelper(helper: THREE.SkeletonHelper) {
+  const mat = helper.material as THREE.LineBasicMaterial;
+  mat.depthTest = false;
+  mat.depthWrite = false;
+  mat.transparent = true;
+  mat.opacity = 1;
+  helper.frustumCulled = false;
+  return helper;
+}
+
+function attachJointDots(root: THREE.Object3D, height: number) {
+  const jointRadius = Math.max(height * 0.016, 0.002);
+  const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
+  const jointMat = new THREE.MeshStandardMaterial({
+    color: 0xffb454,
+    emissive: 0x663300,
+    roughness: 0.55,
+  });
+  root.traverse((obj) => {
+    if (!(obj as THREE.Bone).isBone) return;
+    const dot = new THREE.Mesh(jointGeo, jointMat);
+    dot.name = "__joint_dot";
+    obj.add(dot);
+  });
+}
+
+function detachJointDots(root: THREE.Object3D | null) {
+  if (!root) return;
+  let disposedGeo: THREE.BufferGeometry | null = null;
+  let disposedMat: THREE.Material | null = null;
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.name !== "__joint_dot") return;
+    if (mesh.parent) mesh.parent.remove(mesh);
+    if (mesh.geometry && mesh.geometry !== disposedGeo) {
+      disposedGeo = mesh.geometry;
+      disposedGeo.dispose();
+    }
+    if (mesh.material && mesh.material !== disposedMat) {
+      disposedMat = mesh.material as THREE.Material;
+      disposedMat.dispose();
+    }
+  });
+}
+
 export function FbxScene({
   url,
   time,
+  duration = 1,
   onDuration,
 }: {
   url: string;
   time: number;
+  duration?: number;
   onDuration?: (sec: number) => void;
 }) {
-  const root = useRef<THREE.Group>(null);
+  const { scene } = useThree();
+  const centerRef = useRef<THREE.Group>(null);
+  const objectRef = useRef<THREE.Group | null>(null);
+  const helperRef = useRef<THREE.SkeletonHelper | null>(null);
   const mixer = useRef<THREE.AnimationMixer | null>(null);
   const action = useRef<THREE.AnimationAction | null>(null);
+  const fixedOffset = useRef(new THREE.Vector3());
+  const offsetReady = useRef(false);
   const onDurationRef = useRef(onDuration);
   onDurationRef.current = onDuration;
+  const [object, setObject] = useState<THREE.Group | null>(null);
+  const [scale, setScale] = useState(0.01);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
 
@@ -242,26 +313,92 @@ export function FbxScene({
     let cancelled = false;
     setStatus("loading");
     setError("");
+    setObject(null);
+    objectRef.current = null;
     mixer.current = null;
     action.current = null;
+    offsetReady.current = false;
+    fixedOffset.current.set(0, 0, 0);
+    if (helperRef.current) {
+      scene.remove(helperRef.current);
+      helperRef.current.geometry.dispose();
+      (helperRef.current.material as THREE.Material).dispose();
+      helperRef.current = null;
+    }
+
     const loader = new FBXLoader();
     fetchBinary(url)
       .then((buf) => {
         if (cancelled) return;
         const obj = loader.parse(buf, "");
-        obj.scale.setScalar(0.01);
-        if (root.current) {
-          root.current.clear();
-          root.current.add(obj);
+        let meshCount = 0;
+        let boneCount = 0;
+        obj.traverse((item) => {
+          if ((item as THREE.Bone).isBone) boneCount += 1;
+          const mesh = item as THREE.Mesh;
+          if (mesh.isMesh && mesh.geometry?.attributes?.position?.count) {
+            meshCount += 1;
+          }
+        });
+        if (!boneCount && !meshCount) {
+          throw new Error("FBX 中没有可显示的网格或骨骼");
         }
-        if (obj.animations?.length) {
-          mixer.current = new THREE.AnimationMixer(obj);
-          action.current = mixer.current.clipAction(obj.animations[0]);
-          action.current.play();
-          action.current.paused = true;
-          const dur = obj.animations[0].duration || 0;
-          if (dur > 0) onDurationRef.current?.(dur);
+
+        const clip = obj.animations?.[0];
+        const probeMixer = clip ? new THREE.AnimationMixer(obj) : null;
+        const probeAction = clip && probeMixer ? probeMixer.clipAction(clip) : null;
+        if (probeAction && probeMixer) {
+          probeAction.play();
+          probeAction.paused = true;
         }
+
+        const clipDur = clip?.duration || 1;
+        let sumX = 0;
+        let sumZ = 0;
+        let samples = 0;
+        let minY = Infinity;
+        let maxHeight = 0;
+        const n = probeAction && probeMixer ? 24 : 1;
+        for (let i = 0; i < n; i++) {
+          if (probeAction && probeMixer) {
+            probeAction.time = (i / Math.max(n - 1, 1)) * clipDur;
+            probeMixer.update(0);
+          }
+          expandSkeletonBox(obj, _bvhBox);
+          if (_bvhBox.isEmpty()) continue;
+          const mid = _bvhBox.getCenter(_bvhHips);
+          sumX += mid.x;
+          sumZ += mid.z;
+          samples += 1;
+          minY = Math.min(minY, _bvhBox.min.y);
+          maxHeight = Math.max(maxHeight, _bvhBox.max.y - _bvhBox.min.y);
+        }
+        const meanX = samples ? sumX / samples : 0;
+        const meanZ = samples ? sumZ / samples : 0;
+        if (!Number.isFinite(minY)) minY = 0;
+        const nextScale = maxHeight > 8 ? 0.01 : 1;
+        fixedOffset.current.set(
+          -meanX * nextScale,
+          -minY * nextScale,
+          -meanZ * nextScale
+        );
+        offsetReady.current = true;
+
+        if (boneCount && !meshCount) {
+          attachJointDots(obj, maxHeight || 1);
+        }
+        if (boneCount) {
+          const helper = styleSkeletonHelper(new THREE.SkeletonHelper(obj));
+          scene.add(helper);
+          helperRef.current = helper;
+        }
+
+        objectRef.current = obj;
+        mixer.current = probeMixer;
+        action.current = probeAction;
+        if (clip && clip.duration > 0) onDurationRef.current?.(clip.duration);
+        setScale(nextScale);
+        setObject(obj);
         setStatus("ready");
       })
       .catch((e: unknown) => {
@@ -270,21 +407,40 @@ export function FbxScene({
         setStatus("error");
         setError(e instanceof Error ? e.message : "FBX 加载失败");
       });
+
     return () => {
       cancelled = true;
+      if (helperRef.current) {
+        scene.remove(helperRef.current);
+        helperRef.current.geometry.dispose();
+        (helperRef.current.material as THREE.Material).dispose();
+        helperRef.current = null;
+      }
+      detachJointDots(objectRef.current);
     };
-  }, [url]);
+  }, [url, scene]);
 
   useFrame(() => {
-    if (!mixer.current || !action.current) return;
-    const clipDur = action.current.getClip().duration || 1;
-    action.current.time = Math.min(time, clipDur);
-    mixer.current.update(0);
+    const center = centerRef.current;
+    if (mixer.current && action.current) {
+      const clipDur = action.current.getClip().duration || duration || 1;
+      action.current.time = Math.min(Math.max(time, 0), clipDur);
+      mixer.current.update(0);
+    }
+    if (center && offsetReady.current) {
+      center.position.copy(fixedOffset.current);
+    }
   });
 
   return (
     <group>
-      <group ref={root} />
+      <group ref={centerRef}>
+        {object && (
+          <group scale={scale}>
+            <primitive object={object} />
+          </group>
+        )}
+      </group>
       {status === "loading" && (
         <Html center style={{ pointerEvents: "none" }}>
           <div className="muted animation-format-status">FBX 加载中…</div>
@@ -364,7 +520,12 @@ export function AnimationFormatPreview({
               onDuration={setMediaDuration}
             />
           ) : (
-            <FbxScene url={url} time={time} onDuration={setMediaDuration} />
+            <FbxScene
+              url={url}
+              time={time}
+              duration={duration}
+              onDuration={setMediaDuration}
+            />
           )}
           <OrbitControls makeDefault />
         </Canvas>

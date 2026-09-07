@@ -20,7 +20,7 @@ def ensure_admin():
             user = User(
                 username=settings.admin_username,
                 password_hash=hash_password(settings.admin_password),
-                role=UserRole.admin,
+                role=UserRole.super_manager,
             )
             db.add(user)
             db.commit()

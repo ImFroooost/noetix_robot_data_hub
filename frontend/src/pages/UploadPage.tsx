@@ -17,7 +17,7 @@ export function UploadPage() {
   }, []);
 
   if (!canEdit) {
-    return <div className="page error">需要编辑者权限</div>;
+    return <div className="page error">没有上传权限</div>;
   }
 
   const onSubmit = async (e: FormEvent<HTMLFormElement>) => {

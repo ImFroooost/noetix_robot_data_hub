@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, downloadAuth } from "../api";
 import { useAuth } from "../auth";
 import { FolderDropZone } from "../components/FolderDropZone";
+import { ModelFilePreview, modelPreviewKind } from "../components/ModelFilePreview";
 import type { ModelInstance, ModelRepositoryOverview } from "../types";
 import { zipRelFiles, type RelFile } from "../utils/folderUpload";
 
@@ -14,15 +15,16 @@ const KIND_LABEL: Record<string, string> = {
 };
 
 export function RepositoryModelsPage() {
-  const { isAdmin, hasPerm } = useAuth();
-  const canUpload = isAdmin || hasPerm("upload");
-  const canDelete = isAdmin || hasPerm("edit");
+  const { hasPerm } = useAuth();
+  const canUpload = hasPerm("upload");
+  const canDelete = hasPerm("manage_data");
   const [data, setData] = useState<ModelRepositoryOverview | null>(null);
   const [ontology, setOntology] = useState<"human" | "robot">("human");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [kind, setKind] = useState("fbx");
+  const [kind, setKind] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [folderFiles, setFolderFiles] = useState<RelFile[]>([]);
+  const [previewId, setPreviewId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -47,16 +49,25 @@ export function RepositoryModelsPage() {
   const selected =
     data?.instances.find((item) => item.key === selectedKey) || instances[0] || null;
   const kinds = data?.kinds?.[ontology] || [];
+  const previewFile =
+    selected?.files.find((item) => item.id === previewId) || null;
 
   useEffect(() => {
-    if (!kinds.includes(kind)) setKind(kinds[0] || "");
-  }, [ontology, data]);
+    const preferred =
+      (selected &&
+        kinds.find((item) => selected.files.some((file) => file.kind === item))) ||
+      kinds[0] ||
+      "";
+    setKind(preferred);
+    setPreviewId(null);
+  }, [selected?.key, ontology, kinds.join("|")]);
 
   const switchOntology = (next: "human" | "robot") => {
     setOntology(next);
     setSelectedKey(data?.instances.find((item) => item.ontology === next)?.key || null);
     setFile(null);
     setFolderFiles([]);
+    setPreviewId(null);
   };
 
   const createInstance = async () => {
@@ -212,6 +223,7 @@ export function RepositoryModelsPage() {
                         setKind(item);
                         setFile(null);
                         setFolderFiles([]);
+                        setPreviewId(null);
                       }}
                     >
                       {KIND_LABEL[item] || item}
@@ -221,46 +233,76 @@ export function RepositoryModelsPage() {
                 })}
               </div>
 
-              <section className="card stack">
-                <h3 style={{ margin: 0 }}>{KIND_LABEL[kind] || kind}</h3>
-                {selected.files
-                  .filter((item) => item.kind === kind)
-                  .map((item) => (
-                    <div key={item.id} className="row storage-model-file">
-                      <span>{item.relative_path}</span>
-                      <span className="muted">{(item.size / 1024).toFixed(1)} KB</span>
-                      <button
-                        type="button"
-                        className="secondary"
-                        onClick={() =>
-                          downloadAuth(api.storageFileUrl(item.path, true), item.name)
-                        }
+              <div className="storage-model-browse">
+                <section className="card stack storage-model-files">
+                  <h3 style={{ margin: 0 }}>{KIND_LABEL[kind] || kind}</h3>
+                  <p className="muted" style={{ margin: 0 }}>
+                    点击文件即可在右侧预览网格、URDF、MJCF、FBX 或 BVH
+                  </p>
+                  {selected.files
+                    .filter((item) => item.kind === kind)
+                    .map((item) => (
+                      <div
+                        key={item.id}
+                        className={`row storage-model-file ${
+                          previewId === item.id ? "is-selected" : ""
+                        }`}
+                        onClick={() => setPreviewId(item.id)}
                       >
-                        下载
-                      </button>
-                      {canDelete && kind !== "standard_description" && (
+                        <span title={item.relative_path}>{item.relative_path}</span>
+                        <span className="muted">{(item.size / 1024).toFixed(1)} KB</span>
+                        {modelPreviewKind(item) !== "unsupported" && (
+                          <span className="muted">可预览</span>
+                        )}
                         <button
                           type="button"
-                          className="danger"
-                          onClick={async () => {
-                            if (!confirm(`确认删除 ${item.relative_path}？`)) return;
-                            try {
-                              await api.storageDeleteModelFile(item.path);
-                              await load();
-                            } catch (e) {
-                              setError(e instanceof Error ? e.message : "删除失败");
-                            }
+                          className="secondary"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            downloadAuth(api.storageFileUrl(item.path, true), item.name);
                           }}
                         >
-                          删除
+                          下载
                         </button>
-                      )}
+                        {canDelete && kind !== "standard_description" && (
+                          <button
+                            type="button"
+                            className="danger"
+                            onClick={async (event) => {
+                              event.stopPropagation();
+                              if (!confirm(`确认删除 ${item.relative_path}？`)) return;
+                              try {
+                                await api.storageDeleteModelFile(item.path);
+                                if (previewId === item.id) setPreviewId(null);
+                                await load();
+                              } catch (e) {
+                                setError(e instanceof Error ? e.message : "删除失败");
+                              }
+                            }}
+                          >
+                            删除
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  {!selected.files.some((item) => item.kind === kind) && (
+                    <div className="muted">该实例尚未上传此类模型数据</div>
+                  )}
+                </section>
+                <section className="card stack storage-model-preview">
+                  <h3 style={{ margin: 0 }}>可视化</h3>
+                  {previewFile && selected ? (
+                    <>
+                      <span className="muted">{previewFile.relative_path}</span>
+                      <ModelFilePreview file={previewFile} instance={selected} />
+                    </>
+                  ) : (
+                    <div className="storage-preview-empty">
+                      请在左侧选择一个模型文件进行可视化
                     </div>
-                  ))}
-                {!selected.files.some((item) => item.kind === kind) && (
-                  <div className="muted">该实例尚未上传此类模型数据</div>
-                )}
-              </section>
+                  )}
+                </section>
+              </div>
 
               {canUpload && (
                 <section className="card stack">

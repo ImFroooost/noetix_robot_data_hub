@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 import shutil
 import tempfile
 import threading
@@ -61,6 +62,7 @@ def ensure_layout(base: Path | None = None) -> Path:
                 "units": {},
                 "models": {},
                 "file_uploaders": {},
+                "upload_sessions": [],
             },
         )
     return base
@@ -111,6 +113,7 @@ def read_metadata() -> dict[str, Any]:
         data.setdefault("units", {})
         data.setdefault("models", {})
         data.setdefault("file_uploaders", {})
+        data.setdefault("upload_sessions", [])
         data.setdefault("file_media", {})
         data.setdefault("files", {})
         return data
@@ -127,6 +130,76 @@ def update_metadata(mutator) -> dict[str, Any]:
 
 def unit_key(batch: str, unit_name: str) -> str:
     return f"{batch}::{unit_name}"
+
+
+_SOFT_SUFFIX_MAX_LEN = 32
+_SOFT_SUFFIX_MAX_SEGS = 3
+
+
+def stems_same_unit(left: str, right: str) -> bool:
+    """Treat near-identical stems as one unit, e.g. name vs name_locomotion_test."""
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    if not long.startswith(short):
+        return False
+    extra = long[len(short) :]
+    if not extra or extra[0] not in "-_" or len(extra) > _SOFT_SUFFIX_MAX_LEN:
+        return False
+    segs = [part for part in re.split(r"[-_]+", extra) if part]
+    return 1 <= len(segs) <= _SOFT_SUFFIX_MAX_SEGS
+
+
+def cluster_unit_names(names: list[str]) -> dict[str, str]:
+    """Map each stem to the shortest name in its compatibility cluster."""
+    unique = list(dict.fromkeys(names))
+    parent = {name: name for name in unique}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            return
+        if len(root_left) > len(root_right) or (
+            len(root_left) == len(root_right) and root_left > root_right
+        ):
+            root_left, root_right = root_right, root_left
+        parent[root_right] = root_left
+
+    for index, left in enumerate(unique):
+        for right in unique[index + 1 :]:
+            if stems_same_unit(left, right):
+                union(left, right)
+    return {name: find(name) for name in unique}
+
+
+def _unit_meta_for_names(
+    metadata: dict[str, Any], batch: str, names: list[str]
+) -> dict[str, Any]:
+    units = metadata.get("units") or {}
+    merged: dict[str, Any] = {}
+    for name in names:
+        raw = units.get(unit_key(batch, name))
+        if not raw:
+            continue
+        if not merged:
+            merged = dict(raw)
+            continue
+        tags = dict(merged.get("taxonomy_tag_ids") or {})
+        tags.update(raw.get("taxonomy_tag_ids") or {})
+        merged["taxonomy_tag_ids"] = tags
+        notes = dict(merged.get("annotation") or {})
+        notes.update(raw.get("annotation") or {})
+        merged["annotation"] = notes
+        extra = dict(merged.get("meta") or {})
+        extra.update(raw.get("meta") or {})
+        merged["meta"] = extra
+    return merged
 
 
 def _file_id(rel_path: str) -> str:
@@ -274,7 +347,11 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
 
 
 def scan_data(*, include_empty: bool = False) -> dict[str, Any]:
-    """Scan files and group by ``batch + filename stem`` into data units."""
+    """Scan files and group by batch plus filename stem into data units.
+
+    Near-identical stems (``name`` vs ``name_locomotion_test``) collapse to
+    the shortest name so different formats of the same take share one unit.
+    """
     base = root()
     metadata = read_metadata()
     files: list[dict[str, Any]] = []
@@ -292,9 +369,30 @@ def scan_data(*, include_empty: bool = False) -> dict[str, Any]:
                 _attach_file_tags(rec, metadata)
                 files.append(rec)
 
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    stems_by_batch: dict[str, list[str]] = defaultdict(list)
     for rec in files:
-        grouped[unit_key(rec["batch"], rec["unit_name"])].append(rec)
+        stems_by_batch[rec["batch"]].append(rec["unit_name"])
+    if include_empty:
+        for key in (metadata.get("units") or {}):
+            if "::" not in key:
+                continue
+            batch, name = key.split("::", 1)
+            stems_by_batch[batch].append(name)
+    canon_by_batch = {
+        batch: cluster_unit_names(names) for batch, names in stems_by_batch.items()
+    }
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    aliases_by_unit: dict[str, list[str]] = defaultdict(list)
+    for rec in files:
+        original = rec["unit_name"]
+        canon = canon_by_batch.get(rec["batch"], {}).get(original, original)
+        rec["unit_name"] = canon
+        key = unit_key(rec["batch"], canon)
+        grouped[key].append(rec)
+        aliases_by_unit[key].append(original)
+        if canon != original:
+            aliases_by_unit[key].append(canon)
 
     batch_names = {rec["batch"] for rec in files}
     if include_empty:
@@ -302,7 +400,8 @@ def scan_data(*, include_empty: bool = False) -> dict[str, Any]:
     units = []
     for key, unit_files in sorted(grouped.items()):
         batch, name = key.split("::", 1)
-        meta = dict((metadata.get("units") or {}).get(key) or {})
+        alias_names = list(dict.fromkeys([name, *aliases_by_unit.get(key, [])]))
+        meta = _unit_meta_for_names(metadata, batch, alias_names)
         uploaders = {
             (item["uploader"]["id"], item["uploader"]["username"]): item["uploader"]
             for item in unit_files
@@ -335,6 +434,9 @@ def scan_data(*, include_empty: bool = False) -> dict[str, Any]:
             if key in existing_keys or "::" not in key:
                 continue
             batch, name = key.split("::", 1)
+            canon = canon_by_batch.get(batch, {}).get(name, name)
+            if unit_key(batch, canon) in existing_keys:
+                continue
             batch_names.add(batch)
             meta = dict(raw_meta or {})
             units.append(
@@ -476,6 +578,48 @@ def create_batch(name: str) -> dict[str, Any]:
     )
 
 
+def _batch_unit_names(
+    data: dict[str, Any], batch: str, extra_names: list[str] | None = None
+) -> list[str]:
+    names = {item for item in (extra_names or []) if item}
+    prefix = f"{batch}::"
+    for key in data.get("units") or {}:
+        if key.startswith(prefix) and "::" in key:
+            names.add(key.split("::", 1)[1])
+    return list(names)
+
+
+def apply_batch_taxonomy_to_new_units(batch: str, unit_names: list[str]) -> None:
+    """Copy batch taxonomy onto units that do not yet have those schemes."""
+    batch = safe_name(batch, label="数据批次名")
+    names = [safe_name(name, label="数据单元名") for name in unit_names if name]
+    if not names:
+        return
+
+    def mutate(data):
+        batch_tags = dict(
+            ((data.get("batches") or {}).get(batch) or {}).get("taxonomy_tag_ids")
+            or {}
+        )
+        if not batch_tags:
+            return
+        units = data.setdefault("units", {})
+        for unit_name in names:
+            row = units.setdefault(unit_key(batch, unit_name), {})
+            current = dict(row.get("taxonomy_tag_ids") or {})
+            changed = False
+            for scheme, node_id in batch_tags.items():
+                if scheme in current:
+                    continue
+                current[scheme] = int(node_id)
+                changed = True
+            if changed:
+                row["taxonomy_tag_ids"] = current
+                row["updated_at"] = _now()
+
+    update_metadata(mutate)
+
+
 def update_unit_metadata(
     batch: str,
     name: str,
@@ -519,6 +663,13 @@ def update_batch_metadata(
     meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     name = safe_name(name, label="数据批次名")
+    extra_names: list[str] = []
+    if taxonomy_tag_ids is not None:
+        snapshot = scan_data(include_empty=True)
+        current = next(
+            (item for item in snapshot["batches"] if item["name"] == name), None
+        )
+        extra_names = [unit["name"] for unit in (current or {}).get("units") or []]
 
     def mutate(data):
         row = data["batches"].setdefault(name, {"created_at": _now()})
@@ -528,6 +679,11 @@ def update_batch_metadata(
             annotation=annotation,
             meta=meta,
         )
+        if taxonomy_tag_ids is not None:
+            units = data.setdefault("units", {})
+            for unit_name in _batch_unit_names(data, name, extra_names):
+                unit_row = units.setdefault(unit_key(name, unit_name), {})
+                _merge_tag_updates(unit_row, taxonomy_tag_ids=taxonomy_tag_ids)
 
     update_metadata(mutate)
     snapshot = scan_data(include_empty=True)
@@ -608,6 +764,251 @@ def data_destination(
     return Path(*parts) / fmt / batch / filename
 
 
+def _legacy_session_id(user_id: int, uploaded_at: str, batch: str) -> str:
+    raw = f"{user_id}|{uploaded_at}|{batch}"
+    return "legacy-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _session_view(
+    row: dict[str, Any], file_by_path: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    paths = [str(path) for path in (row.get("paths") or []) if path]
+    files = [file_by_path[path] for path in paths if path in file_by_path]
+    unit_names = list(
+        dict.fromkeys(item.get("unit_name") or "" for item in files if item.get("unit_name"))
+    )
+    first = files[0] if files else {}
+    return {
+        "id": row.get("id"),
+        "created_at": row.get("created_at") or "",
+        "user_id": int(row.get("user_id") or 0),
+        "username": str(row.get("username") or ""),
+        "source": str(row.get("source") or "file"),
+        "legacy": bool(row.get("legacy")),
+        "batch": str(row.get("batch") or first.get("batch") or ""),
+        "ontology": str(row.get("ontology") or first.get("ontology") or ""),
+        "modality": str(row.get("modality") or first.get("modality") or ""),
+        "channel": str(row.get("channel") or first.get("channel") or ""),
+        "format": str(row.get("format") or first.get("format") or ""),
+        "annotation": dict(row.get("annotation") or {}),
+        "paths": [item["path"] for item in files],
+        "unit_names": unit_names,
+        "file_count": len(files),
+        "uploaded": int(row.get("uploaded") or len(files) or 0),
+        "replaced": int(row.get("replaced") or 0),
+    }
+
+
+def record_upload_session(
+    *,
+    user_id: int,
+    username: str,
+    source: str,
+    batch: str,
+    ontology: str = "",
+    modality: str = "",
+    channel: str = "",
+    fmt: str = "",
+    annotation: dict[str, Any] | None = None,
+    paths: list[str],
+    unit_names: list[str] | None = None,
+    uploaded: int = 0,
+    replaced: int = 0,
+) -> dict[str, Any]:
+    session = {
+        "id": uuid.uuid4().hex[:16],
+        "created_at": _now(),
+        "user_id": int(user_id),
+        "username": str(username),
+        "source": source,
+        "legacy": False,
+        "batch": batch,
+        "ontology": ontology,
+        "modality": modality,
+        "channel": channel,
+        "format": fmt,
+        "annotation": dict(annotation or {}),
+        "paths": [str(path) for path in paths if path],
+        "unit_names": [name for name in (unit_names or []) if name],
+        "uploaded": uploaded or len(paths),
+        "replaced": replaced,
+    }
+
+    def mutate(data):
+        data.setdefault("upload_sessions", []).append(session)
+
+    update_metadata(mutate)
+    return session
+
+
+def assemble_upload_sessions(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    metadata = read_metadata()
+    file_by_path = {item["path"]: item for item in files if item.get("path")}
+    claimed: set[str] = set()
+    sessions: list[dict[str, Any]] = []
+    stored = sorted(
+        metadata.get("upload_sessions") or [],
+        key=lambda item: str(item.get("created_at") or ""),
+        reverse=True,
+    )
+    for raw in stored:
+        live_paths = [
+            str(path)
+            for path in (raw.get("paths") or [])
+            if path and path in file_by_path and path not in claimed
+        ]
+        if not live_paths:
+            continue
+        claimed.update(live_paths)
+        view = _session_view({**raw, "paths": live_paths}, file_by_path)
+        if view["file_count"]:
+            sessions.append(view)
+
+    groups: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for item in files:
+        uploader = item.get("uploader") or {}
+        path = item.get("path")
+        if not path or path in claimed or not uploader:
+            continue
+        key = (
+            int(uploader.get("id") or 0),
+            str(uploader.get("uploaded_at") or ""),
+            str(item.get("batch") or ""),
+        )
+        groups[key].append(item)
+
+    for (user_id, uploaded_at, batch), rows in groups.items():
+        first = rows[0]
+        uploader = first.get("uploader") or {}
+        sessions.append(
+            _session_view(
+                {
+                    "id": _legacy_session_id(user_id, uploaded_at, batch),
+                    "created_at": uploaded_at,
+                    "user_id": user_id,
+                    "username": str(uploader.get("username") or ""),
+                    "source": "legacy",
+                    "legacy": True,
+                    "batch": batch,
+                    "ontology": first.get("ontology") or "",
+                    "modality": first.get("modality") or "",
+                    "channel": first.get("channel") or "",
+                    "format": first.get("format") or "",
+                    "annotation": dict(first.get("annotation") or {}),
+                    "paths": [item["path"] for item in rows],
+                    "unit_names": list(
+                        dict.fromkeys(
+                            item.get("unit_name") or "" for item in rows if item.get("unit_name")
+                        )
+                    ),
+                    "uploaded": len(rows),
+                    "replaced": 0,
+                },
+                file_by_path,
+            )
+        )
+    sessions.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return sessions
+
+
+def update_upload_session(
+    session_id: str,
+    *,
+    annotation: dict[str, Any] | None = None,
+    paths: list[str] | None = None,
+) -> dict[str, Any]:
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise ValueError("上传记录无效")
+
+    def mutate(data):
+        sessions = data.setdefault("upload_sessions", [])
+        row = next((item for item in sessions if item.get("id") == session_id), None)
+        if row is None:
+            row = {
+                "id": session_id,
+                "created_at": _now(),
+                "source": "legacy" if session_id.startswith("legacy-") else "file",
+                "legacy": session_id.startswith("legacy-"),
+                "paths": [str(path) for path in (paths or []) if path],
+                "annotation": {},
+            }
+            sessions.append(row)
+        if paths:
+            row["paths"] = list(dict.fromkeys([*(row.get("paths") or []), *paths]))
+        if annotation is not None:
+            current = dict(row.get("annotation") or {})
+            current.update(annotation)
+            row["annotation"] = current
+            row["updated_at"] = _now()
+
+    update_metadata(mutate)
+    metadata = read_metadata()
+    row = next(
+        (item for item in (metadata.get("upload_sessions") or []) if item.get("id") == session_id),
+        None,
+    )
+    if row is None:
+        raise FileNotFoundError(session_id)
+    target_paths = [str(path) for path in (row.get("paths") or []) if path]
+    if annotation is not None and target_paths:
+        update_files_annotation(target_paths, annotation)
+    return _session_view(row, {})
+
+
+def delete_upload_session_files(
+    session_id: str,
+    *,
+    paths: list[str] | None = None,
+) -> dict[str, Any]:
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise ValueError("上传记录无效")
+    metadata = read_metadata()
+    stored = next(
+        (
+            item
+            for item in (metadata.get("upload_sessions") or [])
+            if item.get("id") == session_id
+        ),
+        None,
+    )
+    targets = [
+        str(path)
+        for path in (paths if paths is not None else (stored or {}).get("paths") or [])
+        if path
+    ]
+    if not targets:
+        raise FileNotFoundError(session_id)
+    removed: list[str] = []
+    for rel_path in targets:
+        try:
+            delete_repo_file(rel_path, update_index=False)
+            removed.append(rel_path)
+        except FileNotFoundError:
+            removed.append(rel_path)
+    gone = set(removed)
+
+    def mutate(data):
+        sessions = data.setdefault("upload_sessions", [])
+        next_rows: list[dict[str, Any]] = []
+        for row in sessions:
+            remaining = [path for path in (row.get("paths") or []) if path not in gone]
+            if row.get("id") == session_id and paths is None:
+                continue
+            if row.get("id") == session_id and not remaining:
+                continue
+            row = dict(row)
+            row["paths"] = remaining
+            next_rows.append(row)
+        data["upload_sessions"] = next_rows
+        _drop_path_keys(data, removed)
+
+    update_metadata(mutate)
+    rebuild_catalog()
+    return {"ok": True, "removed": removed, "session_id": session_id}
+
+
 def set_file_uploaders(
     paths: list[str],
     *,
@@ -661,6 +1062,7 @@ def save_data_file(
         shutil.copyfileobj(source, out)
     if update_index:
         create_batch(batch)
+        apply_batch_taxonomy_to_new_units(batch, [unit_name])
         rebuild_catalog()
     parsed = _parse_data_file(dest, root())
     assert parsed is not None
@@ -675,26 +1077,256 @@ def resolve_repo_file(rel_path: str) -> Path:
     return path
 
 
-def delete_repo_file(rel_path: str) -> None:
+def delete_repo_file(rel_path: str, *, update_index: bool = True) -> None:
     path = resolve_repo_file(rel_path)
     if not path.is_file():
         raise FileNotFoundError(rel_path)
     path.unlink()
 
     def mutate(data):
-        (data.get("file_uploaders") or {}).pop(rel_path, None)
-        (data.get("file_media") or {}).pop(rel_path, None)
-        (data.get("files") or {}).pop(rel_path, None)
+        _drop_path_keys(data, [rel_path])
 
     update_metadata(mutate)
-    parent = path.parent
+    _cleanup_empty_parents(path.parent)
+    if update_index:
+        rebuild_catalog()
+
+
+def _drop_path_keys(data: dict[str, Any], paths: list[str]) -> None:
+    for bucket in ("file_uploaders", "file_media", "files"):
+        rows = data.get(bucket) or {}
+        for path in paths:
+            rows.pop(path, None)
+
+
+def _remap_path_keys(data: dict[str, Any], mapping: dict[str, str]) -> None:
+    for bucket in ("file_uploaders", "file_media", "files"):
+        rows = data.setdefault(bucket, {})
+        for old, new in mapping.items():
+            if old in rows:
+                rows[new] = rows.pop(old)
+
+
+def _cleanup_empty_parents(parent: Path) -> None:
     while parent != root() and parent.name not in {"data", "3d_model"}:
         try:
             parent.rmdir()
         except OSError:
             break
         parent = parent.parent
+
+
+def _require_batch(name: str, *, include_empty: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
+    name = safe_name(name, label="数据批次名")
+    snapshot = scan_data(include_empty=include_empty)
+    batch = next((item for item in snapshot["batches"] if item["name"] == name), None)
+    if batch is None:
+        raise FileNotFoundError(name)
+    return snapshot, batch
+
+
+def _require_unit_row(batch: str, unit_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot, current = _require_batch(batch)
+    units = current.get("units") or []
+    unit = next((item for item in units if item["name"] == unit_name), None)
+    if unit is None:
+        unit = next(
+            (item for item in units if stems_same_unit(item["name"], unit_name)),
+            None,
+        )
+    if unit is None:
+        raise FileNotFoundError(f"{batch}/{unit_name}")
+    return snapshot, unit
+
+
+def _relocate_files(mapping: dict[str, Path]) -> dict[str, str]:
+    moved: dict[str, str] = {}
+    for old_rel, dest in mapping.items():
+        src = resolve_repo_file(old_rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and dest.resolve() != src.resolve():
+            raise ValueError(f"目标已存在：{dest.relative_to(root())}")
+        if dest.resolve() != src.resolve():
+            src.rename(dest)
+            _cleanup_empty_parents(src.parent)
+        moved[old_rel] = dest.relative_to(root()).as_posix()
+    return moved
+
+
+def rename_batch(old_name: str, new_name: str) -> dict[str, Any]:
+    old_name = safe_name(old_name, label="数据批次名")
+    new_name = safe_name(new_name, label="数据批次名")
+    snapshot, batch = _require_batch(old_name)
+    if old_name == new_name:
+        return batch
+    if any(item["name"] == new_name for item in snapshot["batches"]):
+        raise ValueError(f"批次名已存在：{new_name}")
+    mapping = {
+        rec["path"]: resolve_repo_file(rec["path"]).parent.with_name(new_name)
+        / Path(rec["path"]).name
+        for rec in snapshot["files"]
+        if rec["batch"] == old_name
+    }
+    moved = _relocate_files(mapping)
+
+    def mutate(data):
+        batches = data.setdefault("batches", {})
+        row = batches.pop(old_name, {"created_at": _now()})
+        batches[new_name] = row
+        units = data.setdefault("units", {})
+        for key in list(units):
+            if key.startswith(f"{old_name}::"):
+                units[f"{new_name}::{key.split('::', 1)[1]}"] = units.pop(key)
+        _remap_path_keys(data, moved)
+
+    update_metadata(mutate)
     rebuild_catalog()
+    snapshot, renamed = _require_batch(new_name)
+    return renamed
+
+
+def rename_unit(batch: str, old_name: str, new_name: str) -> dict[str, Any]:
+    batch = safe_name(batch, label="数据批次名")
+    old_name = safe_name(old_name, label="数据单元名")
+    new_name = safe_name(new_name, label="数据单元名")
+    snapshot, unit = _require_unit_row(batch, old_name)
+    old_name = unit["name"]
+    if old_name == new_name:
+        return unit
+    if any(item["name"] == new_name for item in snapshot["units"] if item["batch"] == batch):
+        raise ValueError(f"数据单元已存在：{new_name}")
+    mapping = {
+        rec["path"]: resolve_repo_file(rec["path"]).with_name(
+            f"{new_name}{Path(rec['path']).suffix}"
+        )
+        for rec in unit.get("files") or []
+    }
+    moved = _relocate_files(mapping)
+
+    def mutate(data):
+        units = data.setdefault("units", {})
+        old_key = unit_key(batch, old_name)
+        new_key = unit_key(batch, new_name)
+        if old_key in units:
+            units[new_key] = units.pop(old_key)
+        _remap_path_keys(data, moved)
+
+    update_metadata(mutate)
+    rebuild_catalog()
+    _, renamed = _require_unit_row(batch, new_name)
+    return renamed
+
+
+def delete_batches(names: list[str]) -> list[str]:
+    removed: list[str] = []
+    deleted_paths: list[str] = []
+    for raw in names:
+        name = safe_name(raw, label="数据批次名")
+        try:
+            snapshot, batch = _require_batch(name)
+        except FileNotFoundError:
+            continue
+        for rec in snapshot["files"]:
+            if rec["batch"] != name:
+                continue
+            path = resolve_repo_file(rec["path"])
+            if path.is_file():
+                path.unlink()
+                _cleanup_empty_parents(path.parent)
+            deleted_paths.append(rec["path"])
+        removed.append(name)
+
+    def mutate(data):
+        batches = data.setdefault("batches", {})
+        units = data.setdefault("units", {})
+        for name in removed:
+            batches.pop(name, None)
+            for key in [key for key in units if key.startswith(f"{name}::")]:
+                units.pop(key, None)
+        _drop_path_keys(data, deleted_paths)
+
+    if removed:
+        update_metadata(mutate)
+        rebuild_catalog()
+    return removed
+
+
+def delete_units(items: list[tuple[str, str]]) -> list[str]:
+    removed: list[str] = []
+    deleted_paths: list[str] = []
+    for raw_batch, raw_name in items:
+        batch = safe_name(raw_batch, label="数据批次名")
+        name = safe_name(raw_name, label="数据单元名")
+        try:
+            _, unit = _require_unit_row(batch, name)
+        except FileNotFoundError:
+            continue
+        for rec in unit.get("files") or []:
+            path = resolve_repo_file(rec["path"])
+            if path.is_file():
+                path.unlink()
+                _cleanup_empty_parents(path.parent)
+            deleted_paths.append(rec["path"])
+        removed.append(unit_key(batch, unit["name"]))
+
+    def mutate(data):
+        units = data.setdefault("units", {})
+        for key in removed:
+            units.pop(key, None)
+        _drop_path_keys(data, deleted_paths)
+
+    if removed:
+        update_metadata(mutate)
+        rebuild_catalog()
+    return removed
+
+
+def collect_archive_entries(
+    *,
+    batches: list[str] | None = None,
+    units: list[tuple[str, str]] | None = None,
+    kinds: list[tuple[str, str]] | None = None,
+    accept: Any | None = None,
+) -> list[tuple[Path, str]]:
+    snapshot = scan_data(include_empty=True)
+    wanted_batches = {safe_name(name, label="数据批次名") for name in batches or []}
+    wanted_units = {
+        unit_key(safe_name(batch, label="数据批次名"), safe_name(name, label="数据单元名"))
+        for batch, name in units or []
+    }
+    wanted_kinds = {(ontology, modality) for ontology, modality in kinds or []}
+    entries: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for rec in snapshot["files"]:
+        key = unit_key(rec["batch"], rec["unit_name"])
+        if rec["batch"] not in wanted_batches and key not in wanted_units:
+            continue
+        if wanted_kinds and (rec["ontology"], rec["modality"]) not in wanted_kinds:
+            continue
+        if accept is not None and not accept(rec):
+            continue
+        if rec["path"] in seen:
+            continue
+        path = resolve_repo_file(rec["path"])
+        if not path.is_file():
+            continue
+        seen.add(rec["path"])
+        entries.append((path, rec["path"].removeprefix("data/").lstrip("/")))
+    return entries
+
+
+def write_archive(entries: list[tuple[Path, str]]) -> Path:
+    if not entries:
+        raise ValueError("没有可下载的文件")
+    handle = tempfile.NamedTemporaryFile(
+        prefix="hub_archive_", suffix=".zip", delete=False
+    )
+    handle.close()
+    dest = Path(handle.name)
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, arcname in entries:
+            archive.write(path, arcname)
+    return dest
 
 
 def _safe_extract_zip(zip_file, destination: Path) -> None:

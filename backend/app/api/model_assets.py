@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from ..core.deps import get_current_user, require_admin
+from ..core.deps import get_current_user, require_editor, require_manage_data
 from ..database import get_db
 from ..models import ModelAsset, User
 from ..schemas import (
@@ -42,7 +42,7 @@ async def upload_asset(
     description: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_admin),
+    user: User = Depends(require_editor),
 ):
     cat = (category or "").strip().lower()
     if cat not in MODEL_ASSET_CATEGORIES:
@@ -91,7 +91,7 @@ def update_asset(
     asset_id: int,
     body: ModelAssetUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_admin),
+    user: User = Depends(require_manage_data),
 ):
     asset = db.get(ModelAsset, asset_id)
     if not asset:
@@ -134,7 +134,7 @@ def download_asset(
 def delete_asset(
     asset_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_admin),
+    user: User = Depends(require_manage_data),
 ):
     asset = db.get(ModelAsset, asset_id)
     if not asset:

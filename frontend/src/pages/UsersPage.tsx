@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import type {
@@ -8,14 +9,22 @@ import type {
   TaxonomySchemeDef,
   User,
 } from "../types";
-import { ROLE_LABEL, taxonomySchemeLabel } from "../types";
+import {
+  CAPABILITY_COLUMNS,
+  ROLE_CAPABILITIES,
+  ROLE_LABEL,
+  ROLE_OPTIONS,
+  SUPER_ROLES,
+  isSuperRole,
+  taxonomySchemeLabel,
+} from "../types";
 
 const CAPABILITY_LABEL: Record<string, string> = {
   browse: "浏览",
   download: "下载",
   upload: "上传",
   annotate: "标注",
-  edit: "编辑",
+  manage_data: "管理数据",
 };
 
 function PermissionEditor({
@@ -66,7 +75,7 @@ function PermissionEditor({
     try {
       const saved = await api.putUserPermissions(user.id, items);
       setItems(saved);
-      setMsg("权限已保存（非浏览能力会自动附带同范围的浏览权限）");
+      setMsg("权限已保存（管理数据包含同范围的浏览 / 下载 / 标注 / 上传；其它能力会自动附带浏览）");
       onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : "保存失败");
@@ -98,9 +107,11 @@ function PermissionEditor({
                   value={it.capability}
                   onChange={(e) => update(idx, { capability: e.target.value })}
                 >
-                  {Object.entries(CAPABILITY_LABEL).map(([k, label]) => (
+                  {(ROLE_CAPABILITIES[user.role] || ["browse"])
+                    .filter((k) => k !== "manage_users")
+                    .map((k) => (
                     <option key={k} value={k}>
-                      {label}
+                      {CAPABILITY_LABEL[k] || k}
                     </option>
                   ))}
                 </select>
@@ -174,18 +185,21 @@ function PermissionEditor({
 }
 
 export function UsersPage() {
-  const { isAdmin, user: me } = useAuth();
+  const { hasPerm, user: me, impersonate } = useAuth();
+  const canManageUsers = hasPerm("manage_users");
   const [users, setUsers] = useState<User[]>([]);
   const [folderPaths, setFolderPaths] = useState<string[]>([]);
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [taxNodes, setTaxNodes] = useState<TaxonomyNode[]>([]);
+  const nav = useNavigate();
   const [expanded, setExpanded] = useState<number | null>(null);
   const [error, setError] = useState("");
+  const [viewBusy, setViewBusy] = useState<number | null>(null);
 
   const reload = () => api.listUsers().then(setUsers);
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!canManageUsers) return;
     reload().catch((e) => setError(e.message));
     Promise.all([api.listFolders(), api.storageOverview()])
       .then(([folders, storage]) => {
@@ -201,9 +215,9 @@ export function UsersPage() {
       .catch(() => undefined);
     api.listTaxonomySchemes().then(setSchemes).catch(() => undefined);
     api.listTaxonomies().then(setTaxNodes).catch(() => undefined);
-  }, [isAdmin]);
+  }, [canManageUsers]);
 
-  if (!isAdmin) return <div className="page error">需要管理员权限</div>;
+  if (!canManageUsers) return <div className="page error">需要超级管理者权限</div>;
 
   const onCreate = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -227,9 +241,36 @@ export function UsersPage() {
       <div className="card stack">
         <h1>用户管理</h1>
         <p className="muted" style={{ margin: 0 }}>
-          除管理员外，浏览 / 下载 / 上传 / 标注 / 编辑等能力可针对每个用户按
-          「分类标准 + 文件夹（或分类节点）」指定适用范围。
+          普通角色的能力为「受限」：只对已分配的文件夹或分类节点生效。超级角色的对应能力为全量。
+          「管理数据」包含同范围的浏览、下载、标注、上传。只有超级管理者可以管理用户。点「进入视角」可按该用户的权限浏览界面。
         </p>
+        <div style={{ overflowX: "auto" }}>
+          <table className="table" style={{ fontSize: "0.85rem" }}>
+            <thead>
+              <tr>
+                <th>用户角色</th>
+                {CAPABILITY_COLUMNS.map((col) => (
+                  <th key={col.key}>{col.label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {ROLE_OPTIONS.map((role) => (
+                <tr key={role}>
+                  <td>{ROLE_LABEL[role]}</td>
+                  {CAPABILITY_COLUMNS.map((col) => {
+                    const has = (ROLE_CAPABILITIES[role] || []).includes(col.key);
+                    return (
+                      <td key={col.key}>
+                        {has ? (SUPER_ROLES.has(role) ? "是" : "受限") : ""}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
         {error && <div className="error">{error}</div>}
         <table className="table">
           <thead>
@@ -255,11 +296,14 @@ export function UsersPage() {
                         await reload();
                       }}
                     >
-                      {(["admin", "editor", "viewer"] as Role[]).map((r) => (
+                      {ROLE_OPTIONS.map((r) => (
                         <option key={r} value={r}>
                           {ROLE_LABEL[r]}
                         </option>
                       ))}
+                      {!ROLE_OPTIONS.includes(u.role) && (
+                        <option value={u.role}>{ROLE_LABEL[u.role] || u.role}</option>
+                      )}
                     </select>
                   </td>
                   <td>{u.is_active ? "启用" : "禁用"}</td>
@@ -274,12 +318,32 @@ export function UsersPage() {
                       >
                         {u.is_active ? "禁用" : "启用"}
                       </button>
-                      {u.role !== "admin" && (
+                      {!isSuperRole(u.role) && (
                         <button
                           className="secondary"
                           onClick={() => setExpanded(expanded === u.id ? null : u.id)}
                         >
-                          {expanded === u.id ? "收起权限" : "配置权限"}
+                          {expanded === u.id ? "收起范围" : "配置范围"}
+                        </button>
+                      )}
+                      {me?.id !== u.id && (
+                        <button
+                          className="secondary"
+                          disabled={viewBusy === u.id}
+                          onClick={async () => {
+                            setViewBusy(u.id);
+                            setError("");
+                            try {
+                              await impersonate(u.id);
+                              nav("/", { replace: true });
+                            } catch (err) {
+                              setError(err instanceof Error ? err.message : "切换视角失败");
+                            } finally {
+                              setViewBusy(null);
+                            }
+                          }}
+                        >
+                          {viewBusy === u.id ? "进入中…" : "进入视角"}
                         </button>
                       )}
                       {me?.id !== u.id && (
@@ -301,7 +365,7 @@ export function UsersPage() {
                     </span>
                   </td>
                 </tr>
-                {expanded === u.id && u.role !== "admin" && (
+                {expanded === u.id && !isSuperRole(u.role) && (
                   <tr key={`${u.id}-perm`}>
                     <td colSpan={5}>
                       <PermissionEditor
@@ -332,14 +396,16 @@ export function UsersPage() {
         </label>
         <label>
           角色
-          <select name="role" defaultValue="viewer">
-            <option value="admin">管理员</option>
-            <option value="editor">编辑者</option>
-            <option value="viewer">普通用户（按权限配置）</option>
+          <select name="role" defaultValue="visitor">
+            {ROLE_OPTIONS.map((r) => (
+              <option key={r} value={r}>
+                {ROLE_LABEL[r]}
+              </option>
+            ))}
           </select>
         </label>
         <p className="muted" style={{ margin: 0, fontSize: "0.85rem" }}>
-          创建后在列表中点「配置权限」，为浏览者 / 下载者 / 上传者 / 标注者分配能力和范围。
+          普通角色创建后请点「配置范围」，指定可访问的文件夹或分类节点。超级角色无需配置范围。
         </p>
         <button type="submit">创建</button>
       </form>

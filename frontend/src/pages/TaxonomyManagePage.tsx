@@ -8,7 +8,8 @@ import type { TaxonomyNode, TaxonomySchemeDef } from "../types";
 import { taxonomySchemeLabel } from "../types";
 
 export function TaxonomyManagePage() {
-  const { isAdmin } = useAuth();
+  const { hasPerm } = useAuth();
+  const canManageTaxonomy = hasPerm("manage_data");
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [scheme, setScheme] = useState<string>("style");
   const [nodes, setNodes] = useState<TaxonomyNode[]>([]);
@@ -47,8 +48,8 @@ export function TaxonomyManagePage() {
   const currentScheme = schemes.find((s) => s.key === scheme) || null;
   const schemeIndex = schemes.findIndex((s) => s.key === scheme);
 
-  if (!isAdmin) {
-    return <div className="page error">需要管理员权限</div>;
+  if (!canManageTaxonomy) {
+    return <div className="page error">需要管理数据权限</div>;
   }
 
   const selectScheme = (key: string) => {

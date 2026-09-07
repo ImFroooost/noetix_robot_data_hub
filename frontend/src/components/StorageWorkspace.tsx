@@ -1,15 +1,23 @@
 import { Children, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, downloadAuth, getToken } from "../api";
+import { api, downloadAuth, downloadAuthPost, getToken } from "../api";
 import { useAuth } from "../auth";
 import { AnimationFormatPreview, animationFormatOf } from "./AnimationFormatPreview";
+import { isRobotMotionCsv, RobotCsvPreview } from "./RobotCsvPreview";
 import { FolderBatchImport } from "./FolderBatchImport";
+import {
+  RobotStyleFields,
+  robotDescriptionVersions,
+  robotVersionLabel,
+} from "./RobotStyleFields";
 import { TaxonomySelect } from "./TaxonomyTree";
 import type {
+  ModelInstance,
   StorageAnnotation,
   StorageBatch,
   StorageFile,
   StorageFileDetail,
   StorageOverview,
+  StorageUploadSession,
   StorageUploader,
   StorageUnit,
   TaxonomyNode,
@@ -52,6 +60,23 @@ const uploaderLabel = (uploaders: StorageUploader[] | undefined) =>
     ? uploaders.map((item) => item.username).join("、")
     : "上传者未知";
 
+const ownedByUser = (
+  userId: number | undefined,
+  uploaders?: StorageUploader[] | null,
+  files?: StorageFile[] | null
+) => {
+  if (!userId) return false;
+  if (uploaders?.some((item) => item.id === userId)) return true;
+  return !!files?.some((file) => file.uploader?.id === userId);
+};
+
+const unitOwnedBy = (unit: StorageUnit, userId: number | undefined) =>
+  ownedByUser(userId, unit.uploaders, unit.files);
+
+const batchOwnedBy = (batch: StorageBatch, userId: number | undefined) =>
+  ownedByUser(userId, batch.uploaders) ||
+  batch.units.some((unit) => unitOwnedBy(unit, userId));
+
 const qualityLabel = (value: string) =>
   QUALITY_OPTIONS.find(([key]) => key === value)?.[1] || "未评价";
 
@@ -67,7 +92,7 @@ function Preview({ file }: { file: StorageFile | null }) {
     setUrl("");
     setText("");
     setError("");
-    if (!file || animationFormat) return;
+    if (!file || animationFormat || isRobotMotionCsv(file)) return;
     const token = getToken();
     fetch(api.storageFileUrl(file.path), {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -102,6 +127,9 @@ function Preview({ file }: { file: StorageFile | null }) {
         durationHint={file.duration_sec}
       />
     );
+  }
+  if (isRobotMotionCsv(file)) {
+    return <RobotCsvPreview file={file} />;
   }
   if (error) return <div className="storage-preview-empty">{error}</div>;
   if (text) return <pre className="storage-text-preview">{text}</pre>;
@@ -191,29 +219,69 @@ function TreeAllButton({
 function TreeToolbar({
   onCollapseAll,
   onExpandAll,
+  extra,
 }: {
   onCollapseAll: () => void;
   onExpandAll: () => void;
+  extra?: ReactNode;
 }) {
   return (
-    <div className="storage-tree-toolbar">
-      <button
-        type="button"
-        className="secondary"
-        title="展开上级目录，收起数据单元"
-        onClick={onCollapseAll}
-      >
-        全部折叠
-      </button>
-      <button
-        type="button"
-        className="secondary"
-        title="展开上级目录和数据单元"
-        onClick={onExpandAll}
-      >
-        全部展开
-      </button>
+    <div className="storage-tree-toolbar-wrap">
+      <div className="storage-tree-toolbar">
+        <button
+          type="button"
+          className="secondary"
+          title="展开上级目录，收起数据单元"
+          onClick={onCollapseAll}
+        >
+          全部折叠
+        </button>
+        <button
+          type="button"
+          className="secondary"
+          title="展开上级目录和数据单元"
+          onClick={onExpandAll}
+        >
+          全部展开
+        </button>
+      </div>
+      {extra}
     </div>
+  );
+}
+
+function TreeActions({
+  canDownload,
+  canEdit,
+  onDownload,
+  onRename,
+  onDelete,
+}: {
+  canDownload?: boolean;
+  canEdit?: boolean;
+  onDownload?: () => void;
+  onRename?: () => void;
+  onDelete?: () => void;
+}) {
+  if (!canDownload && !canEdit) return null;
+  return (
+    <span className="storage-tree-actions">
+      {canDownload && onDownload && (
+        <button type="button" className="secondary" onClick={(e) => { e.stopPropagation(); onDownload(); }}>
+          下载
+        </button>
+      )}
+      {canEdit && onRename && (
+        <button type="button" className="secondary" onClick={(e) => { e.stopPropagation(); onRename(); }}>
+          重命名
+        </button>
+      )}
+      {canEdit && onDelete && (
+        <button type="button" className="danger" onClick={(e) => { e.stopPropagation(); onDelete(); }}>
+          删除
+        </button>
+      )}
+    </span>
   );
 }
 
@@ -228,6 +296,9 @@ function TreeGroup({
   onSelect,
   children,
   nested = false,
+  checked,
+  onCheck,
+  actions,
 }: {
   open: boolean;
   selected: boolean;
@@ -239,6 +310,9 @@ function TreeGroup({
   onSelect: () => void;
   children?: ReactNode;
   nested?: boolean;
+  checked?: boolean;
+  onCheck?: (checked: boolean) => void;
+  actions?: ReactNode;
 }) {
   const activate = () => {
     onToggle();
@@ -246,18 +320,28 @@ function TreeGroup({
   };
   const body = (
     <>
-      <button
-        type="button"
-        className={`storage-tree-row ${selected ? "is-selected" : ""}`}
-        title={title}
-        aria-label={toggleLabel}
-        aria-expanded={open}
-        onClick={activate}
-      >
-        <span className="storage-tree-toggle">
+      <div className={`storage-tree-row ${selected ? "is-selected" : ""} ${checked ? "is-checked" : ""}`}>
+        {onCheck && (
+          <input
+            type="checkbox"
+            className="storage-tree-check"
+            checked={!!checked}
+            onChange={(e) => onCheck(e.target.checked)}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`选择 ${title}`}
+          />
+        )}
+        <button
+          type="button"
+          className="storage-tree-toggle"
+          title={title}
+          aria-label={toggleLabel}
+          aria-expanded={open}
+          onClick={activate}
+        >
           <ChevronIcon open={open} />
-        </span>
-        <span className="storage-tree-item">
+        </button>
+        <button type="button" className="storage-tree-item" title={title} onClick={activate}>
           <span className={`storage-tree-icon ${icon === "user" ? "is-user" : "is-folder"}`}>
             {icon === "user" ? <UserIcon /> : <FolderIcon />}
           </span>
@@ -265,8 +349,9 @@ function TreeGroup({
             <span className="storage-tree-title">{title}</span>
             <span className="storage-tree-meta">{meta}</span>
           </span>
-        </span>
-      </button>
+        </button>
+        {actions}
+      </div>
       {open && Children.toArray(children).some(Boolean) && (
         <div className="storage-tree-children">{children}</div>
       )}
@@ -281,27 +366,46 @@ function TreeUnitItem({
   meta,
   selected,
   onClick,
+  checked,
+  onCheck,
+  actions,
 }: {
   title: string;
   meta: ReactNode;
   selected: boolean;
   onClick: () => void;
+  checked?: boolean;
+  onCheck?: (checked: boolean) => void;
+  actions?: ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      title={title}
-      className={`storage-tree-item storage-tree-child ${selected ? "is-selected" : ""}`}
-      onClick={onClick}
-    >
-      <span className="storage-tree-icon is-unit">
-        <UnitIcon />
-      </span>
-      <span className="storage-tree-copy">
-        <span className="storage-tree-title">{title}</span>
-        <span className="storage-tree-meta">{meta}</span>
-      </span>
-    </button>
+    <div className={`storage-tree-unit-line ${selected ? "is-selected" : ""} ${checked ? "is-checked" : ""}`}>
+      {onCheck && (
+        <input
+          type="checkbox"
+          className="storage-tree-check"
+          checked={!!checked}
+          onChange={(e) => onCheck(e.target.checked)}
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`选择 ${title}`}
+        />
+      )}
+      <button
+        type="button"
+        title={title}
+        className={`storage-tree-item storage-tree-child ${selected ? "is-selected" : ""}`}
+        onClick={onClick}
+      >
+        <span className="storage-tree-icon is-unit">
+          <UnitIcon />
+        </span>
+        <span className="storage-tree-copy">
+          <span className="storage-tree-title">{title}</span>
+          <span className="storage-tree-meta">{meta}</span>
+        </span>
+      </button>
+      {actions}
+    </div>
   );
 }
 
@@ -311,15 +415,44 @@ function UnitTree({
   selectedBatch,
   onSelectUnit,
   onSelectBatch,
+  canEdit,
+  canDownload,
+  currentUserId,
+  onRenameBatch,
+  onRenameUnit,
+  onDelete,
+  onDownload,
 }: {
   data: StorageOverview;
   selectedUnit: string | null;
   selectedBatch: string | null;
   onSelectUnit: (unit: StorageUnit) => void;
   onSelectBatch: (batch: StorageBatch) => void;
+  canEdit?: boolean;
+  canDownload?: boolean;
+  currentUserId?: number;
+  onRenameBatch: (batch: StorageBatch) => void;
+  onRenameUnit: (unit: StorageUnit) => void;
+  onDelete: (batches: StorageBatch[], units: StorageUnit[]) => void;
+  onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [checkedBatches, setCheckedBatches] = useState<Record<string, boolean>>({});
+  const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const batchKeys = data.batches.map((batch) => batch.name);
+  const selectedBatches = data.batches.filter((batch) => checkedBatches[batch.name]);
+  const selectedUnits = data.batches.flatMap((batch) => batch.units).filter((unit) => checkedUnits[unit.key]);
+  const selectedCount = selectedBatches.length + selectedUnits.length;
+  const canDownloadAny =
+    !!canDownload || data.batches.some((batch) => batchOwnedBy(batch, currentUserId));
+  const canManage = !!(canEdit || canDownloadAny);
+
+  const toggleBatch = (name: string, value: boolean) => {
+    setCheckedBatches((current) => ({ ...current, [name]: value }));
+  };
+  const toggleUnit = (key: string, value: boolean) => {
+    setCheckedUnits((current) => ({ ...current, [key]: value }));
+  };
 
   return (
     <div className="storage-tree storage-structure-tree">
@@ -327,6 +460,57 @@ function UnitTree({
         onCollapseAll={() => setExpanded({})}
         onExpandAll={() =>
           setExpanded(Object.fromEntries(batchKeys.map((key) => [key, true])))
+        }
+        extra={
+          canManage ? (
+            <div className="storage-tree-manage">
+              <span className="muted">已选 {selectedCount} 项</span>
+              {canDownloadAny && (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={!selectedCount}
+                  onClick={() => onDownload(selectedBatches, selectedUnits)}
+                >
+                  下载
+                </button>
+              )}
+              {canEdit && (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={selectedCount !== 1}
+                  onClick={() => {
+                    if (selectedBatches.length === 1) onRenameBatch(selectedBatches[0]);
+                    else if (selectedUnits.length === 1) onRenameUnit(selectedUnits[0]);
+                  }}
+                >
+                  重命名
+                </button>
+              )}
+              {canEdit && (
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={!selectedCount}
+                  onClick={() => onDelete(selectedBatches, selectedUnits)}
+                >
+                  删除
+                </button>
+              )}
+              <button
+                type="button"
+                className="secondary"
+                disabled={!selectedCount}
+                onClick={() => {
+                  setCheckedBatches({});
+                  setCheckedUnits({});
+                }}
+              >
+                取消选择
+              </button>
+            </div>
+          ) : null
         }
       />
       {data.batches.map((batch) => {
@@ -351,6 +535,17 @@ function UnitTree({
               }))
             }
             onSelect={() => onSelectBatch(batch)}
+            checked={!!checkedBatches[batch.name]}
+            onCheck={canManage ? (value) => toggleBatch(batch.name, value) : undefined}
+            actions={
+              <TreeActions
+                canDownload={!!canDownload || batchOwnedBy(batch, currentUserId)}
+                canEdit={canEdit}
+                onDownload={() => onDownload([batch], [])}
+                onRename={() => onRenameBatch(batch)}
+                onDelete={() => onDelete([batch], [])}
+              />
+            }
           >
             {open ? (
               <>
@@ -361,6 +556,17 @@ function UnitTree({
                     meta={uploaderLabel(unit.uploaders)}
                     selected={selectedUnit === unit.key}
                     onClick={() => onSelectUnit(unit)}
+                    checked={!!checkedUnits[unit.key]}
+                    onCheck={canManage ? (value) => toggleUnit(unit.key, value) : undefined}
+                    actions={
+                      <TreeActions
+                        canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                        canEdit={canEdit}
+                        onDownload={() => onDownload([], [unit])}
+                        onRename={() => onRenameUnit(unit)}
+                        onDelete={() => onDelete([], [unit])}
+                      />
+                    }
                   />
                 ))}
                 {!batch.units.length && (
@@ -459,6 +665,143 @@ function UploaderTreePanel({
           </TreeGroup>
         );
       })}
+    </div>
+  );
+}
+
+const UPLOAD_SOURCE_LABEL: Record<string, string> = {
+  folder: "文件夹导入",
+  file: "单文件上传",
+  legacy: "历史上传",
+};
+
+function formatSessionTime(value: string) {
+  if (!value) return "未知时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function sessionUnitPaths(session: StorageUploadSession, unit: StorageUnit): string[] {
+  const unitPaths = new Set(unit.files.map((file) => file.path));
+  return session.paths.filter((path) => unitPaths.has(path));
+}
+
+function UploadSessionTree({
+  sessions,
+  units,
+  selectedSessionId,
+  selectedUnitKey,
+  canDeleteSession,
+  onSelectSession,
+  onSelectUnit,
+  onDeleteSession,
+  onDeleteSessionUnit,
+}: {
+  sessions: StorageUploadSession[];
+  units: StorageUnit[];
+  selectedSessionId: string | null;
+  selectedUnitKey: string | null;
+  canDeleteSession?: (session: StorageUploadSession) => boolean;
+  onSelectSession: (session: StorageUploadSession) => void;
+  onSelectUnit: (session: StorageUploadSession, unit: StorageUnit) => void;
+  onDeleteSession?: (session: StorageUploadSession) => void;
+  onDeleteSessionUnit?: (session: StorageUploadSession, unit: StorageUnit) => void;
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const unitsByKey = new Map(units.map((unit) => [unit.key, unit]));
+  const unitsByName = new Map<string, StorageUnit[]>();
+  units.forEach((unit) => {
+    const list = unitsByName.get(`${unit.batch}::${unit.name}`) || [];
+    list.push(unit);
+    unitsByName.set(`${unit.batch}::${unit.name}`, list);
+  });
+
+  return (
+    <div className="storage-tree storage-structure-tree">
+      <TreeToolbar
+        onCollapseAll={() =>
+          setExpanded(Object.fromEntries(sessions.map((item) => [item.id, false])))
+        }
+        onExpandAll={() =>
+          setExpanded(Object.fromEntries(sessions.map((item) => [item.id, true])))
+        }
+      />
+      {sessions.map((session) => {
+        const sessionUnits = session.unit_names
+          .map(
+            (name) =>
+              unitsByKey.get(`${session.batch}::${name}`) ||
+              unitsByName.get(`${session.batch}::${name}`)?.[0]
+          )
+          .filter((item): item is StorageUnit => !!item);
+        const open = expanded[session.id] !== false;
+        const allowDelete = !!canDeleteSession?.(session);
+        return (
+          <TreeGroup
+            key={session.id}
+            open={open}
+            selected={selectedSessionId === session.id && !selectedUnitKey}
+            title={`${formatSessionTime(session.created_at)} · ${
+              UPLOAD_SOURCE_LABEL[session.source] || "上传"
+            }`}
+            meta={
+              <>
+                <span>{session.file_count} 个文件</span>
+                <span>{session.batch || "未分批次"}</span>
+              </>
+            }
+            toggleLabel={open ? "收起上传" : "展开上传"}
+            onToggle={() =>
+              setExpanded((current) => ({
+                ...current,
+                [session.id]: !open,
+              }))
+            }
+            onSelect={() => onSelectSession(session)}
+            actions={
+              allowDelete && onDeleteSession ? (
+                <TreeActions
+                  canEdit
+                  onDelete={() => onDeleteSession(session)}
+                />
+              ) : undefined
+            }
+          >
+            {open ? (
+              <>
+                {sessionUnits.map((unit) => {
+                  const unitPaths = sessionUnitPaths(session, unit);
+                  return (
+                    <TreeUnitItem
+                      key={`${session.id}:${unit.key}`}
+                      title={unit.name}
+                      meta={`${unitPaths.length || unit.file_count} 个文件`}
+                      selected={
+                        selectedSessionId === session.id && selectedUnitKey === unit.key
+                      }
+                      onClick={() => onSelectUnit(session, unit)}
+                      actions={
+                        allowDelete && onDeleteSessionUnit && unitPaths.length ? (
+                          <TreeActions
+                            canEdit
+                            onDelete={() => onDeleteSessionUnit(session, unit)}
+                          />
+                        ) : undefined
+                      }
+                    />
+                  );
+                })}
+                {!sessionUnits.length && (
+                  <div className="muted storage-tree-empty">该次上传的文件已不在库中</div>
+                )}
+              </>
+            ) : null}
+          </TreeGroup>
+        );
+      })}
+      {!sessions.length && <div className="muted">还没有上传记录</div>}
     </div>
   );
 }
@@ -585,10 +928,11 @@ function QuickUpload({
   const [channel, setChannel] = useState("rgb");
   const [format, setFormat] = useState("");
   const [robotStyle, setRobotStyle] = useState("");
+  const [robotVersion, setRobotVersion] = useState("");
   const [personName, setPersonName] = useState("");
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
-  const [robotStyles, setRobotStyles] = useState<string[]>([]);
+  const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [replace, setReplace] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -601,11 +945,7 @@ function QuickUpload({
       .storageModels()
       .then((data) => {
         if (cancelled) return;
-        setRobotStyles(
-          data.instances
-            .filter((item) => item.ontology === "robot")
-            .map((item) => item.name)
-        );
+        setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : "机器人款式加载失败");
@@ -636,7 +976,7 @@ function QuickUpload({
         "annotation",
         JSON.stringify(
           ontology === "robot"
-            ? { robot_style: robotStyle }
+            ? { robot_style: robotStyle, robot_version: robotVersion }
             : {
                 person_name: personName.trim(),
                 gender,
@@ -695,17 +1035,15 @@ function QuickUpload({
           <input value={format} onChange={(e) => setFormat(e.target.value)} placeholder="csv / mp4 / json…" />
         </label>
         {ontology === "robot" && (
-          <label>
-            机器人款式
-            <select value={robotStyle} onChange={(e) => setRobotStyle(e.target.value)}>
-              <option value="">未选择</option>
-              {robotStyles.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <RobotStyleFields
+            instances={robotInstances}
+            style={robotStyle}
+            version={robotVersion}
+            onChange={(nextStyle, nextVersion) => {
+              setRobotStyle(nextStyle);
+              setRobotVersion(nextVersion);
+            }}
+          />
         )}
         {ontology === "human" && (
           <>
@@ -816,12 +1154,13 @@ function DetailRow({
   );
 }
 
-type DetailKind = "batch" | "unit" | "file";
+type DetailKind = "batch" | "unit" | "file" | "upload_session";
 
 const FILE_TAG_KEYS = new Set(["custom_2", "custom_3", "custom_4"]);
 const FILE_TAG_NAMES = new Set(["获取方式", "获取地点", "获取设备"]);
 
 function schemesForKind(kind: DetailKind, schemes: TaxonomySchemeDef[]) {
+  if (kind === "upload_session") return [];
   if (kind !== "file") return schemes;
   return schemes.filter(
     (scheme) => FILE_TAG_KEYS.has(scheme.key) || FILE_TAG_NAMES.has(scheme.name)
@@ -833,6 +1172,7 @@ function EntityDetailPanel({
   batch,
   unit,
   file,
+  session,
   schemes,
   nodes,
   canEdit,
@@ -846,6 +1186,7 @@ function EntityDetailPanel({
   batch: StorageBatch | null;
   unit: StorageUnit | null;
   file: StorageFile | null;
+  session: StorageUploadSession | null;
   schemes: TaxonomySchemeDef[];
   nodes: TaxonomyNode[];
   canEdit: boolean;
@@ -860,10 +1201,11 @@ function EntityDetailPanel({
   const [note, setNote] = useState("");
   const [quality, setQuality] = useState("");
   const [robotStyle, setRobotStyle] = useState("");
+  const [robotVersion, setRobotVersion] = useState("");
   const [personName, setPersonName] = useState("");
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
-  const [robotStyles, setRobotStyles] = useState<string[]>([]);
+  const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -897,7 +1239,9 @@ function EntityDetailPanel({
       ? detail?.annotation || file?.annotation || {}
       : kind === "unit"
         ? unit?.annotation || {}
-        : batch?.annotation || {};
+        : kind === "upload_session"
+          ? session?.annotation || {}
+          : batch?.annotation || {};
   const tagIds =
     kind === "file"
       ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
@@ -922,6 +1266,7 @@ function EntityDetailPanel({
     setNote(String(annotation.note || ""));
     setQuality(String(annotation.quality || ""));
     setRobotStyle(String(annotation.robot_style || ""));
+    setRobotVersion(String(annotation.robot_version || ""));
     setPersonName(String(annotation.person_name || ""));
     setGender(String(annotation.gender || ""));
     setHeight(String(annotation.height || ""));
@@ -931,16 +1276,22 @@ function EntityDetailPanel({
     batch?.name,
     unit?.key,
     file?.path,
+    session?.id,
     annotation.note,
     annotation.quality,
     annotation.robot_style,
+    annotation.robot_version,
     annotation.person_name,
     annotation.gender,
     annotation.height,
   ]);
 
   useEffect(() => {
-    if (kind !== "file" || (file?.ontology !== "robot" && detail?.ontology !== "robot")) {
+    if (
+      (kind !== "file" && kind !== "upload_session") ||
+      (kind === "file" && file?.ontology !== "robot" && detail?.ontology !== "robot") ||
+      (kind === "upload_session" && session?.ontology !== "robot")
+    ) {
       return;
     }
     let cancelled = false;
@@ -948,11 +1299,7 @@ function EntityDetailPanel({
       .storageModels()
       .then((data) => {
         if (cancelled) return;
-        setRobotStyles(
-          data.instances
-            .filter((item) => item.ontology === "robot")
-            .map((item) => item.name)
-        );
+        setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
       })
       .catch((e) => {
         if (!cancelled) onError(e instanceof Error ? e.message : "机器人款式加载失败");
@@ -960,23 +1307,35 @@ function EntityDetailPanel({
     return () => {
       cancelled = true;
     };
-  }, [kind, file?.ontology, detail?.ontology]);
+  }, [kind, file?.ontology, detail?.ontology, session?.ontology]);
+
+  const paramOntology =
+    kind === "upload_session" ? session?.ontology : viewFile?.ontology;
 
   const title =
-    kind === "batch" ? "批次详情" : kind === "unit" ? "数据单元详情" : kind === "file" ? "文件详情" : "详情";
+    kind === "batch"
+      ? "批次详情"
+      : kind === "unit"
+        ? "数据单元详情"
+        : kind === "file"
+          ? "文件详情"
+          : kind === "upload_session"
+            ? "上传记录"
+            : "详情";
 
   const saveAnnotation = async () => {
     if (!kind) return;
     setSaving(true);
     try {
       const fileAnnotation =
-        viewFile?.ontology === "robot"
-          ? { quality, note, robot_style: robotStyle }
-          : viewFile?.ontology === "human"
+        viewFile?.ontology === "robot" || session?.ontology === "robot"
+          ? { quality, note, robot_style: robotStyle, robot_version: robotVersion }
+          : viewFile?.ontology === "human" || session?.ontology === "human"
             ? { quality, note, person_name: personName.trim(), gender, height: height.trim() }
             : { quality, note };
       const body = {
-        annotation: kind === "file" ? fileAnnotation : { note },
+        annotation:
+          kind === "file" || kind === "upload_session" ? fileAnnotation : { note },
       };
       if (kind === "batch" && batch) {
         await api.storageUpdateBatch(batch.name, body);
@@ -986,9 +1345,18 @@ function EntityDetailPanel({
         await api.storageUpdateFileMeta(file.path, body);
         const row = await api.storageFileDetail(file.path);
         setDetail(row);
+      } else if (kind === "upload_session" && session) {
+        await api.storageUpdateUploadSession(session.id, {
+          ...body,
+          paths: session.paths,
+        });
       }
       setSaved(true);
-      onMessage("标签已保存");
+      onMessage(
+        kind === "upload_session"
+          ? "本次上传参数已保存，已同步到该次上传的文件"
+          : "标签已保存"
+      );
       await onReload();
     } catch (e) {
       onError(e instanceof Error ? e.message : "保存失败");
@@ -1007,7 +1375,11 @@ function EntityDetailPanel({
       } else if (kind === "file" && file) {
         await api.storageUpdateFileMeta(file.path, body);
       }
-      onMessage("分类标签已更新");
+      onMessage(
+        kind === "batch"
+          ? "分类标签已更新，已同步到该批次下的数据单元"
+          : "分类标签已更新"
+      );
       await onReload();
     } catch (e) {
       onError(e instanceof Error ? e.message : "更新失败");
@@ -1019,7 +1391,7 @@ function EntityDetailPanel({
       <h3>{title}</h3>
       {!kind && (
         <div className="storage-preview-empty">
-          点击左侧批次、数据单元或具体文件查看标签
+          点击左侧批次、数据单元、上传记录或具体文件查看标签
         </div>
       )}
       {kind === "batch" && batch && (
@@ -1028,6 +1400,27 @@ function EntityDetailPanel({
           <DetailRow label="数据单元数" value={String(batch.unit_count)} />
           <DetailRow label="文件数" value={String(batch.file_count)} />
           <DetailRow label="上传者" value={uploaderLabel(batch.uploaders)} />
+        </dl>
+      )}
+      {kind === "upload_session" && session && (
+        <dl className="storage-detail-list">
+          <DetailRow label="上传时间" value={formatSessionTime(session.created_at)} />
+          <DetailRow
+            label="上传方式"
+            value={UPLOAD_SOURCE_LABEL[session.source] || session.source}
+          />
+          <DetailRow label="数据批次" value={session.batch || "—"} />
+          <DetailRow label="文件数" value={String(session.file_count)} />
+          <DetailRow
+            label="本体"
+            value={ONTOLOGY_LABEL[session.ontology] || session.ontology || "—"}
+          />
+          <DetailRow
+            label="模态"
+            value={MODALITY_LABEL[session.modality] || session.modality || "—"}
+          />
+          <DetailRow label="格式" value={session.format || "—"} />
+          <DetailRow label="上传者" value={session.username || "—"} />
         </dl>
       )}
       {kind === "unit" && unit && (
@@ -1117,32 +1510,44 @@ function EntityDetailPanel({
               />
             );
           })}
-          {kind === "file" && viewFile?.ontology === "robot" && canEdit && (
-            <label>
-              机器人款式
-              <select
-                value={robotStyle}
-                onChange={(e) => {
-                  setRobotStyle(e.target.value);
-                  setSaved(false);
-                }}
-              >
-                <option value="">未选择</option>
-                {[...new Set([robotStyle, ...robotStyles].filter(Boolean))].map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-          {kind === "file" && viewFile?.ontology === "robot" && !canEdit && (
-            <DetailRow
-              label="机器人款式"
-              value={robotStyle || "未选择"}
+          {(kind === "file" || kind === "upload_session") &&
+            paramOntology === "robot" &&
+            canEdit && (
+            <RobotStyleFields
+              instances={robotInstances}
+              style={robotStyle}
+              version={robotVersion}
+              extraStyle={robotStyle}
+              onChange={(nextStyle, nextVersion) => {
+                setRobotStyle(nextStyle);
+                setRobotVersion(nextVersion);
+                setSaved(false);
+              }}
             />
           )}
-          {kind === "file" && viewFile?.ontology === "human" && canEdit && (
+          {(kind === "file" || kind === "upload_session") &&
+            paramOntology === "robot" &&
+            !canEdit && (
+            <>
+              <DetailRow label="机器人款式" value={robotStyle || "未选择"} />
+              {robotDescriptionVersions(
+                robotInstances.find((item) => item.name === robotStyle)
+              ).length > 1 || robotVersion ? (
+                <DetailRow
+                  label="机器人版本"
+                  value={robotVersionLabel(
+                    robotDescriptionVersions(
+                      robotInstances.find((item) => item.name === robotStyle)
+                    ),
+                    robotVersion
+                  )}
+                />
+              ) : null}
+            </>
+          )}
+          {(kind === "file" || kind === "upload_session") &&
+            paramOntology === "human" &&
+            canEdit && (
             <>
               <label>
                 姓名
@@ -1189,7 +1594,9 @@ function EntityDetailPanel({
               </label>
             </>
           )}
-          {kind === "file" && viewFile?.ontology === "human" && !canEdit && (
+          {(kind === "file" || kind === "upload_session") &&
+            paramOntology === "human" &&
+            !canEdit && (
             <>
               <DetailRow label="姓名" value={personName.trim() || "未填写"} />
               <DetailRow label="性别" value={genderLabel(gender)} />
@@ -1247,6 +1654,137 @@ function EntityDetailPanel({
       )}
       {kind === "file" && loading && <div className="muted">正在读取文件元数据…</div>}
     </aside>
+  );
+}
+
+const ONTOLOGIES = ["human", "robot"] as const;
+
+function downloadKindKey(ontology: string, modality: string) {
+  return `${ontology}:${modality}`;
+}
+
+function filesFromDownloadTargets(batches: StorageBatch[], units: StorageUnit[]) {
+  const covered = new Set(batches.map((item) => item.name));
+  const leftover = units.filter((unit) => !covered.has(unit.batch));
+  const files = [
+    ...batches.flatMap((batch) => batch.units.flatMap((unit) => unit.files)),
+    ...leftover.flatMap((unit) => unit.files),
+  ];
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    if (seen.has(file.path)) return false;
+    seen.add(file.path);
+    return true;
+  });
+}
+
+function DownloadPicker({
+  batches,
+  units,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  batches: StorageBatch[];
+  units: StorageUnit[];
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: (kinds: { ontology: string; modality: string }[]) => void;
+}) {
+  const leftover = units.filter(
+    (unit) => !batches.some((batch) => batch.name === unit.batch)
+  );
+  const files = filesFromDownloadTargets(batches, leftover);
+  const available = new Set(
+    files.map((file) => downloadKindKey(file.ontology, file.modality))
+  );
+  const [checked, setChecked] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries([...available].map((key) => [key, true]))
+  );
+  const selectedKinds = ONTOLOGIES.flatMap((ontology) =>
+    Object.keys(MODALITY_LABEL)
+      .filter((modality) => checked[downloadKindKey(ontology, modality)])
+      .map((modality) => ({ ontology, modality }))
+  );
+  const selectedCount = files.filter((file) =>
+    checked[downloadKindKey(file.ontology, file.modality)]
+  ).length;
+  const title =
+    batches.length === 1 && !leftover.length
+      ? batches[0].name
+      : leftover.length === 1 && !batches.length
+        ? `${leftover[0].batch} / ${leftover[0].name}`
+        : `${batches.length} 个批次、${leftover.length} 个单元`;
+
+  return (
+    <div className="storage-modal-backdrop" onClick={onClose}>
+      <div
+        className="storage-modal card stack storage-download-modal"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={{ margin: 0 }}>选择下载内容</h3>
+        <p className="muted" style={{ margin: 0 }}>
+          {title} · 共 {files.length} 个文件，已选 {selectedCount} 个
+        </p>
+        <div className="storage-unit-matrix">
+          {ONTOLOGIES.map((ontology) => (
+            <section key={ontology} className="storage-ontology-card">
+              <h3>{ontology === "human" ? "人体数据" : "机器人数据"}</h3>
+              {Object.entries(MODALITY_LABEL).map(([modality, label]) => {
+                const key = downloadKindKey(ontology, modality);
+                const rowFiles = files.filter(
+                  (file) => file.ontology === ontology && file.modality === modality
+                );
+                const formats = [...new Set(rowFiles.map((file) => file.format))];
+                const enabled = rowFiles.length > 0;
+                return (
+                  <label
+                    key={modality}
+                    className={`storage-download-row ${enabled ? "" : "is-empty"}`}
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={!enabled || busy}
+                      checked={enabled && !!checked[key]}
+                      onChange={(e) =>
+                        setChecked((current) => ({
+                          ...current,
+                          [key]: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span className={`storage-modality-name ${enabled ? "" : "missing"}`}>
+                      {label}
+                    </span>
+                    <span className="storage-file-pills">
+                      {enabled ? (
+                        <span className="muted">
+                          {formats.join(" / ")} · {rowFiles.length} 个文件
+                        </span>
+                      ) : (
+                        <span className="muted">缺省</span>
+                      )}
+                    </span>
+                  </label>
+                );
+              })}
+            </section>
+          ))}
+        </div>
+        <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+          <button type="button" className="secondary" disabled={busy} onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={busy || !selectedKinds.length}
+            onClick={() => onConfirm(selectedKinds)}
+          >
+            {busy ? "打包中…" : "开始下载"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1321,7 +1859,7 @@ export function StorageWorkspace({
 }: {
   variant?: WorkspaceVariant;
 }) {
-  const { user, isAdmin, hasPerm } = useAuth();
+  const { user, hasPerm } = useAuth();
   const [data, setData] = useState<StorageOverview | null>(null);
   const [classificationUnits, setClassificationUnits] = useState<StorageUnit[]>([]);
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
@@ -1346,21 +1884,28 @@ export function StorageWorkspace({
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [extraBatches, setExtraBatches] = useState<string[]>([]);
+  const [downloadPick, setDownloadPick] = useState<{
+    batches: StorageBatch[];
+    units: StorageUnit[];
+  } | null>(null);
+  const [downloadBusy, setDownloadBusy] = useState(false);
   const loadSequence = useRef(0);
   const pendingSelectBatch = useRef<string | null>(null);
+  const pendingSelectSession = useRef<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
 
-  const hasAnnotationPermission =
-    isAdmin || hasPerm("annotate") || hasPerm("edit");
+  const hasAnnotationPermission = hasPerm("annotate");
   const canUpload =
-    (variant === "manage" && isAdmin) ||
-    (variant === "upload" && (isAdmin || hasPerm("upload")));
+    (variant === "manage" && hasPerm("manage_data")) ||
+    (variant === "upload" && hasPerm("upload"));
   const canAnnotate =
     (variant === "annotate" && hasAnnotationPermission) ||
-    (variant === "manage" && isAdmin) ||
-    (variant === "upload" && (isAdmin || hasPerm("upload")));
-  const canDelete = variant === "manage" && isAdmin;
-  const canCreateTaxonomy =
-    canAnnotate && (isAdmin || hasPerm("edit"));
+    (variant === "manage" && hasPerm("manage_data")) ||
+    (variant === "upload" && hasPerm("upload"));
+  const canDelete = variant === "manage" && hasPerm("manage_data");
+  const canManageItems = hasPerm("manage_data");
+  const canDownloadItems = hasPerm("download");
+  const canCreateTaxonomy = canAnnotate && hasPerm("manage_data");
   const structureOnly = variant === "upload";
   const selectedFile = previewFiles[activePreviewIndex] || null;
 
@@ -1415,6 +1960,18 @@ export function StorageWorkspace({
       });
       if (requestId !== loadSequence.current) return;
       setData(overview);
+      setPreviewFiles((current) =>
+        current.map((file) => {
+          if (!file) return file;
+          return (
+            overview.files.find((item) => item.path === file.path) ||
+            overview.units
+              .flatMap((unit) => unit.files)
+              .find((item) => item.path === file.path) ||
+            file
+          );
+        })
+      );
       if (mode !== "folder" && mode !== "uploader" && tagId == null) {
         setClassificationUnits(overview.units);
       }
@@ -1426,7 +1983,18 @@ export function StorageWorkspace({
         ? overview.batches.find((batch) => batch.name === pendingBatchName)
         : null;
       pendingSelectBatch.current = null;
-      if (importedBatch?.units[0]) {
+      const pendingSessionId = pendingSelectSession.current;
+      pendingSelectSession.current = null;
+      const importedSession = pendingSessionId
+        ? (overview.upload_sessions || []).find((item) => item.id === pendingSessionId)
+        : null;
+      if (importedSession) {
+        setMode("upload_order");
+        setActiveSessionId(importedSession.id);
+        setFocus({ kind: "upload_session", key: importedSession.id });
+        setSelectedKey(null);
+        clearPreviews();
+      } else if (importedBatch?.units[0]) {
         setSelectedKey(importedBatch.units[0].key);
         setFocus({ kind: "unit", key: importedBatch.units[0].key });
         clearPreviews();
@@ -1507,10 +2075,29 @@ export function StorageWorkspace({
     setNodes(await api.listTaxonomies());
   };
 
+  const focusedSession = useMemo(() => {
+    const id =
+      focus?.kind === "upload_session" ? focus.key : activeSessionId;
+    if (!id) return null;
+    return (data?.upload_sessions || []).find((item) => item.id === id) || null;
+  }, [focus, activeSessionId, data]);
+
   const focusedBatch = useMemo(() => {
     if (focus?.kind !== "batch") return null;
     return displayData?.batches.find((item) => item.name === focus.key) || null;
   }, [displayData, focus]);
+
+  const ownsSelected = !!(user && selected && unitOwnedBy(selected, user.id));
+  const ownsFocusedBatch = !!(
+    user &&
+    focusedBatch &&
+    batchOwnedBy(focusedBatch, user.id)
+  );
+  const canAnnotateSelected =
+    canAnnotate ||
+    ownsSelected ||
+    ownsFocusedBatch ||
+    !!(user && focusedSession && focusedSession.user_id === user.id);
 
   const focusedFile = useMemo(() => {
     if (focus?.kind !== "file") return selectedFile;
@@ -1521,10 +2108,140 @@ export function StorageWorkspace({
     );
   }, [focus, selected, data, selectedFile]);
 
-  if (variant === "manage" && !isAdmin) {
-    return <div className="page error">只有管理员可以进入数据管理</div>;
+  const promptName = (label: string, current: string) => {
+    const next = window.prompt(label, current);
+    if (next == null) return "";
+    return next.trim();
+  };
+
+  const handleRenameBatch = async (batch: StorageBatch) => {
+    const next = promptName("新的数据批次名称", batch.name);
+    if (!next || next === batch.name) return;
+    try {
+      await api.storageRenameBatch(batch.name, next);
+      setMessage(`批次已重命名为 ${next}`);
+      setFocus({ kind: "batch", key: next });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "重命名失败");
+    }
+  };
+
+  const handleRenameUnit = async (unit: StorageUnit) => {
+    const next = promptName("新的数据单元名称", unit.name);
+    if (!next || next === unit.name) return;
+    try {
+      await api.storageRenameUnit(unit.batch, unit.name, next);
+      setMessage(`数据单元已重命名为 ${next}`);
+      setSelectedKey(`${unit.batch}::${next}`);
+      setFocus({ kind: "unit", key: `${unit.batch}::${next}` });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "重命名失败");
+    }
+  };
+
+  const handleDeleteItems = async (batches: StorageBatch[], units: StorageUnit[]) => {
+    const covered = new Set(batches.map((item) => item.name));
+    const leftover = units.filter((unit) => !covered.has(unit.batch));
+    const labels = [
+      ...batches.map((item) => `批次 ${item.name}`),
+      ...leftover.map((unit) => `单元 ${unit.batch}/${unit.name}`),
+    ];
+    if (!labels.length) return;
+    if (!window.confirm(`确认删除以下 ${labels.length} 项？\n${labels.join("\n")}`)) return;
+    try {
+      await api.storageBulkDelete({
+        batches: batches.map((item) => item.name),
+        units: leftover.map((unit) => ({ batch: unit.batch, name: unit.name })),
+      });
+      setMessage("已删除所选项目");
+      setFocus(null);
+      setSelectedKey(null);
+      clearPreviews();
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "删除失败");
+    }
+  };
+
+  const canDeleteUploadSession = (session: StorageUploadSession) =>
+    !!(user && (session.user_id === user.id || hasPerm("manage_data")));
+
+  const handleDeleteUploadSession = async (
+    session: StorageUploadSession,
+    paths?: string[],
+    confirmText?: string
+  ) => {
+    const targets = paths ?? session.paths;
+    if (!targets.length) return;
+    const whole = !paths || paths.length >= session.paths.length;
+    const text =
+      confirmText ||
+      (whole
+        ? `确认删除这次上传的 ${session.file_count} 个文件？\n${formatSessionTime(session.created_at)} · ${session.batch || "未分批次"}\n不会删除同批次其它上传。`
+        : `确认删除这次上传中的 ${targets.length} 个文件？\n不会删除同单元其它上传留下的文件。`);
+    if (!window.confirm(text)) return;
+    try {
+      await api.storageDeleteUploadSession(session.id, whole ? undefined : paths);
+      setMessage(whole ? "已删除这次上传的文件" : `已删除 ${targets.length} 个文件`);
+      if (whole) {
+        if (activeSessionId === session.id) setActiveSessionId(null);
+        if (focus?.kind === "upload_session" && focus.key === session.id) {
+          setFocus(null);
+        }
+        setSelectedKey(null);
+        clearPreviews();
+      } else if (paths) {
+        setPreviewFiles((current) =>
+          current.map((file) => (file && paths.includes(file.path) ? null : file))
+        );
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "删除失败");
+    }
+  };
+
+  const handleDownloadItems = (batches: StorageBatch[], units: StorageUnit[]) => {
+    const covered = new Set(batches.map((item) => item.name));
+    const leftover = units.filter((unit) => !covered.has(unit.batch));
+    if (!batches.length && !leftover.length) return;
+    setDownloadPick({ batches, units: leftover });
+  };
+
+  const confirmDownload = async (kinds: { ontology: string; modality: string }[]) => {
+    if (!downloadPick || !kinds.length) return;
+    const { batches, units } = downloadPick;
+    const filename =
+      batches.length === 1 && !units.length
+        ? `${batches[0].name}.zip`
+        : !batches.length && units.length === 1
+          ? `${units[0].name}.zip`
+          : "storage_selection.zip";
+    setDownloadBusy(true);
+    try {
+      await downloadAuthPost(
+        "/api/storage/archive",
+        {
+          batches: batches.map((item) => item.name),
+          units: units.map((unit) => ({ batch: unit.batch, name: unit.name })),
+          kinds,
+        },
+        filename
+      );
+      setDownloadPick(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "下载失败");
+    } finally {
+      setDownloadBusy(false);
+    }
+  };
+
+  if (variant === "manage" && !hasPerm("manage_data")) {
+    return <div className="page error">没有管理数据权限</div>;
   }
-  if (variant === "upload" && !(isAdmin || hasPerm("upload"))) {
+  if (variant === "upload" && !hasPerm("upload")) {
     return <div className="page error">没有上传权限</div>;
   }
   if (variant === "annotate" && !hasAnnotationPermission) {
@@ -1534,6 +2251,31 @@ export function StorageWorkspace({
   return (
     <div className="page storage-page stack">
       <div className="storage-toolbar card">
+        {variant === "upload" && (
+          <div className="storage-filter-line">
+            <span className="muted">分类标准：</span>
+            <button
+              type="button"
+              className={mode === "folder" ? "active" : "secondary"}
+              onClick={() => {
+                setMode("folder");
+                setTagId(null);
+              }}
+            >
+              存储结构
+            </button>
+            <button
+              type="button"
+              className={mode === "upload_order" ? "active" : "secondary"}
+              onClick={() => {
+                setMode("upload_order");
+                setTagId(null);
+              }}
+            >
+              上传顺序
+            </button>
+          </div>
+        )}
         {!structureOnly && (
           <div className="storage-filter-line">
             <span className="muted">分类标准：</span>
@@ -1602,7 +2344,7 @@ export function StorageWorkspace({
           />
           <button type="button" onClick={() => void load(false)}>搜索</button>
         </div>
-        {mode !== "folder" && mode !== "uploader" && (
+        {mode !== "folder" && mode !== "uploader" && mode !== "upload_order" && (
           <div className="storage-filter-line">
             <span className="muted">{taxonomySchemeLabel(mode, schemes)}：</span>
             <select
@@ -1627,13 +2369,20 @@ export function StorageWorkspace({
         <aside className="card storage-left-pane">
           {variant === "upload" && (
             <>
-              <h3 style={{ marginTop: 0, marginBottom: 10 }}>存储结构</h3>
+              <h3 style={{ marginTop: 0, marginBottom: 10 }}>
+                {mode === "upload_order" ? "上传顺序" : "存储结构"}
+              </h3>
               <FolderBatchImport
-                onImported={(batchName) => {
+                onImported={(batchName, sessionId) => {
                   pendingSelectBatch.current = batchName;
+                  pendingSelectSession.current = sessionId || null;
                   setExtraBatches((current) =>
                     current.includes(batchName) ? current : [...current, batchName]
                   );
+                  if (sessionId && mode !== "upload_order") {
+                    setMode("upload_order");
+                    return;
+                  }
                   void load(true);
                 }}
                 onError={setError}
@@ -1641,7 +2390,7 @@ export function StorageWorkspace({
               />
             </>
           )}
-          {mode !== "folder" && mode !== "uploader" && (
+          {mode !== "folder" && mode !== "uploader" && mode !== "upload_order" && (
             <>
               <h3 style={{ marginTop: 0 }}>
                 {taxonomySchemeLabel(mode, schemes)}分类树
@@ -1677,19 +2426,84 @@ export function StorageWorkspace({
               />
             </>
           )}
+          {mode === "upload_order" && (
+            <UploadSessionTree
+              sessions={(data?.upload_sessions || [])
+                .filter((session) => {
+                  if (!query.trim()) return true;
+                  const needle = query.trim().toLowerCase();
+                  return (
+                    session.batch.toLowerCase().includes(needle) ||
+                    session.unit_names.some((name) =>
+                      name.toLowerCase().includes(needle)
+                    ) ||
+                    formatSessionTime(session.created_at).includes(needle)
+                  );
+                })
+                .slice()
+                .sort((left, right) => {
+                  if (sortMode === "created_asc") {
+                    return left.created_at.localeCompare(right.created_at);
+                  }
+                  if (sortMode === "name_asc") {
+                    return left.batch.localeCompare(right.batch, "zh");
+                  }
+                  if (sortMode === "name_desc") {
+                    return right.batch.localeCompare(left.batch, "zh");
+                  }
+                  return right.created_at.localeCompare(left.created_at);
+                })}
+              units={data?.units || []}
+              selectedSessionId={activeSessionId}
+              selectedUnitKey={
+                focus?.kind === "unit" || focus?.kind === "file" ? selectedKey : null
+              }
+              canDeleteSession={canDeleteUploadSession}
+              onSelectSession={(session) => {
+                setActiveSessionId(session.id);
+                setFocus({ kind: "upload_session", key: session.id });
+                setSelectedKey(null);
+                clearPreviews();
+              }}
+              onSelectUnit={(session, unit) => {
+                setActiveSessionId(session.id);
+                setFocus({ kind: "unit", key: unit.key });
+                setSelectedKey(unit.key);
+                clearPreviews();
+              }}
+              onDeleteSession={(session) => void handleDeleteUploadSession(session)}
+              onDeleteSessionUnit={(session, unit) => {
+                const paths = sessionUnitPaths(session, unit);
+                void handleDeleteUploadSession(
+                  session,
+                  paths,
+                  `确认删除这次上传到「${unit.name}」的 ${paths.length} 个文件？\n不会删除该单元里其它上传留下的文件。`
+                );
+              }}
+            />
+          )}
           {mode === "folder" && (
             <UnitTree
               data={displayData || { updated_at: "", modalities: [], ontologies: [], uploaders: [], batches: [], units: [], files: [] }}
               selectedUnit={focus?.kind === "unit" || focus?.kind === "file" ? selectedKey : null}
               selectedBatch={focus?.kind === "batch" ? focus.key : selected?.batch || null}
               onSelectUnit={(unit) => {
+                setActiveSessionId(null);
                 setSelectedKey(unit.key);
                 setFocus({ kind: "unit", key: unit.key });
                 clearPreviews();
               }}
               onSelectBatch={(batch) => {
+                setActiveSessionId(null);
                 setFocus({ kind: "batch", key: batch.name });
               }}
+              canEdit={canManageItems}
+              canDownload={canDownloadItems}
+              currentUserId={user?.id}
+              onRenameBatch={(batch) => void handleRenameBatch(batch)}
+              onRenameUnit={(unit) => void handleRenameUnit(unit)}
+              onDelete={(batches, units) => void handleDeleteItems(batches, units)}
+              onDownload={(batches, units) => void handleDownloadItems(batches, units)}
             />
           )}
         </aside>
@@ -1709,10 +2523,38 @@ export function StorageWorkspace({
               </div>
             </>
           )}
-          {focus?.kind !== "batch" && !selected && (
-            <div className="storage-preview-empty">请选择一个数据批次或数据单元</div>
+          {focus?.kind === "upload_session" && focusedSession && (
+            <>
+              <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
+                <div>
+                  <h2 style={{ margin: 0 }}>
+                    {formatSessionTime(focusedSession.created_at)} ·{" "}
+                    {UPLOAD_SOURCE_LABEL[focusedSession.source] || "上传"}
+                  </h2>
+                  <span className="muted">
+                    {focusedSession.batch || "未分批次"} · {focusedSession.file_count} 个文件 ·{" "}
+                    {focusedSession.username || "上传者未知"}
+                  </span>
+                </div>
+                {canDeleteUploadSession(focusedSession) && (
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => void handleDeleteUploadSession(focusedSession)}
+                  >
+                    删除本次上传
+                  </button>
+                )}
+              </div>
+              <div className="storage-preview-empty">
+                这是一次独立上传记录，不会和同批次的其它上传合并。请在右侧修改本次上传时设置的款式、姓名等参数，保存后只作用于这次上传的文件。也可从左侧展开后选择其中的数据单元。
+              </div>
+            </>
           )}
-          {focus?.kind !== "batch" && selected && (
+          {focus?.kind !== "batch" && focus?.kind !== "upload_session" && !selected && (
+            <div className="storage-preview-empty">请选择一个数据批次、上传记录或数据单元</div>
+          )}
+          {focus?.kind !== "batch" && focus?.kind !== "upload_session" && selected && (
             <>
               <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
                 <div>
@@ -1723,7 +2565,8 @@ export function StorageWorkspace({
                   </span>
                 </div>
                 <div className="row" style={{ gap: 8 }}>
-                  {selectedFile && (
+                  {selectedFile &&
+                    (canDownloadItems || selectedFile.uploader?.id === user?.id) && (
                     <button
                       type="button"
                       className="secondary"
@@ -1737,15 +2580,34 @@ export function StorageWorkspace({
                       下载当前文件
                     </button>
                   )}
-                  {selectedFile && canDelete && (
+                  {selectedFile &&
+                    (canDelete ||
+                      !!(
+                        focusedSession &&
+                        canDeleteUploadSession(focusedSession) &&
+                        focusedSession.paths.includes(selectedFile.path)
+                      )) && (
                     <button
                       type="button"
                       className="danger"
                       onClick={async () => {
                         if (!confirm(`确认删除 ${selectedFile.name}？`)) return;
-                        await api.storageDeleteFile(selectedFile.path);
-                        removePreviewFile(activePreviewIndex);
-                        await load();
+                        try {
+                          if (
+                            focusedSession &&
+                            focusedSession.paths.includes(selectedFile.path)
+                          ) {
+                            await api.storageDeleteUploadSession(focusedSession.id, [
+                              selectedFile.path,
+                            ]);
+                          } else {
+                            await api.storageDeleteFile(selectedFile.path);
+                          }
+                          removePreviewFile(activePreviewIndex);
+                          await load();
+                        } catch (e) {
+                          setError(e instanceof Error ? e.message : "删除失败");
+                        }
                       }}
                     >
                       删除当前文件
@@ -1827,9 +2689,10 @@ export function StorageWorkspace({
           }
           unit={selected}
           file={focus?.kind === "file" ? focusedFile : null}
+          session={focusedSession}
           schemes={schemes}
           nodes={nodes}
-          canEdit={canAnnotate}
+          canEdit={canAnnotateSelected}
           canCreate={canCreateTaxonomy}
           onReload={async () => {
             await load(true);
@@ -1840,6 +2703,17 @@ export function StorageWorkspace({
         />
       </div>
 
+      {downloadPick && (
+        <DownloadPicker
+          batches={downloadPick.batches}
+          units={downloadPick.units}
+          busy={downloadBusy}
+          onClose={() => {
+            if (!downloadBusy) setDownloadPick(null);
+          }}
+          onConfirm={(kinds) => void confirmDownload(kinds)}
+        />
+      )}
       {selected && quickPreset && (
         <QuickUpload
           unit={selected}

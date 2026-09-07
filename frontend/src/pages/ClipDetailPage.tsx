@@ -40,7 +40,7 @@ function ReviewCell({
 export function ClipDetailPage() {
   const { id } = useParams();
   const clipId = Number(id);
-  const { canEdit } = useAuth();
+  const { hasPerm } = useAuth();
   const nav = useNavigate();
   const [clip, setClip] = useState<Clip | null>(null);
   const [models, setModels] = useState<RobotModel[]>([]);
@@ -169,9 +169,9 @@ export function ClipDetailPage() {
     return <div className="page muted">{error || "加载中…"}</div>;
   }
 
-  const canAnn = !!clip.can_annotate || !!clip.can_edit || canEdit;
-  const canEditClip = !!clip.can_edit || canEdit;
-  const canUpload = !!clip.can_upload || canEdit;
+  const canAnn = !!clip.can_annotate || hasPerm("annotate");
+  const canEditClip = !!clip.can_edit || hasPerm("manage_data");
+  const canUpload = !!clip.can_upload || hasPerm("upload");
   const humanVideos = (clip.real_videos || []).filter((v) => (v.kind || "human") === "human");
   const robotVideos = (clip.real_videos || []).filter((v) => (v.kind || "human") !== "human");
   const sharedTexts = clip.shared_texts || [];

@@ -17,14 +17,16 @@ import {
 function ModelAssetSection({
   category,
   assets,
-  isAdmin,
+  canUpload,
+  canManage,
   busy,
   onChanged,
   onError,
 }: {
   category: "human" | "robot";
   assets: ModelAsset[];
-  isAdmin: boolean;
+  canUpload: boolean;
+  canManage: boolean;
   busy: boolean;
   onChanged: () => void;
   onError: (msg: string) => void;
@@ -73,7 +75,7 @@ function ModelAssetSection({
                     >
                       下载
                     </button>
-                    {isAdmin && (
+                    {canManage && (
                       <>
                         <button
                           className="secondary"
@@ -115,7 +117,7 @@ function ModelAssetSection({
           </tbody>
         </table>
       )}
-      {isAdmin && (
+      {canUpload && (
         <form
           className="row"
           style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}
@@ -150,7 +152,9 @@ function ModelAssetSection({
 }
 
 export function RobotModelsPage() {
-  const { canEdit, isAdmin } = useAuth();
+  const { hasPerm } = useAuth();
+  const canUpload = hasPerm("upload");
+  const canManage = hasPerm("manage_data");
   const [models, setModels] = useState<RobotModel[]>([]);
   const [assets, setAssets] = useState<ModelAsset[]>([]);
   const [error, setError] = useState("");
@@ -264,7 +268,8 @@ export function RobotModelsPage() {
       <ModelAssetSection
         category="human"
         assets={assets}
-        isAdmin={isAdmin}
+        canUpload={canUpload}
+        canManage={canManage}
         busy={busy}
         onChanged={() => void reload()}
         onError={setError}
@@ -272,7 +277,8 @@ export function RobotModelsPage() {
       <ModelAssetSection
         category="robot"
         assets={assets}
-        isAdmin={isAdmin}
+        canUpload={canUpload}
+        canManage={canManage}
         busy={busy}
         onChanged={() => void reload()}
         onError={setError}
@@ -307,7 +313,7 @@ export function RobotModelsPage() {
         </table>
       </div>
 
-      {canEdit && (
+      {canUpload && (
         <>
           <form className="card stack" style={{ maxWidth: 720 }} onSubmit={onUploadFolder}>
             <h2>方式一：拖拽 / 选择文件夹</h2>

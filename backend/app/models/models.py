@@ -28,7 +28,9 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(128))
-    role: Mapped[UserRole] = mapped_column(Enum(UserRole), default=UserRole.viewer)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, native_enum=False, length=32), default=UserRole.visitor
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -72,7 +74,9 @@ class UserPermission(Base):
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    capability: Mapped[Capability] = mapped_column(Enum(Capability), index=True)
+    capability: Mapped[Capability] = mapped_column(
+        Enum(Capability, native_enum=False, length=32), index=True
+    )
     # ""=按文件夹树；否则为分类标准 key（atomic/intent/style/custom...）
     scheme: Mapped[str] = mapped_column(String(64), default="", index=True)
     path_prefix: Mapped[str] = mapped_column(String(1024), default="/")

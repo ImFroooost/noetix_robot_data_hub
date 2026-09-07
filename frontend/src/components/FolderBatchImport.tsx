@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
-import type { StorageFolderUploadResult, StorageOverview } from "../types";
+import { RobotStyleFields } from "./RobotStyleFields";
+import type {
+  ModelInstance,
+  StorageFolderUploadResult,
+  StorageOverview,
+} from "../types";
 import {
   filesFromDataTransfer,
   filesFromFileList,
@@ -31,6 +36,7 @@ type FolderImportDraft = {
   channel: string;
   format: string;
   robotStyle: string;
+  robotVersion: string;
   personName: string;
   gender: string;
   height: string;
@@ -41,6 +47,26 @@ const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 
 function fileUnitName(file: RelFile) {
   return file.file.name.replace(/\.[^.]+$/, "") || file.file.name;
+}
+
+function stemsSameUnit(left: string, right: string) {
+  if (left === right) return true;
+  const [short, long] = left.length <= right.length ? [left, right] : [right, left];
+  if (!long.startsWith(short)) return false;
+  const extra = long.slice(short.length);
+  if (!extra || !/^[-_]/.test(extra) || extra.length > 32) return false;
+  const segs = extra.split(/[-_]+/).filter(Boolean);
+  return segs.length >= 1 && segs.length <= 3;
+}
+
+function matchExistingUnit<T extends { name: string }>(
+  unitName: string,
+  units: T[]
+) {
+  return (
+    units.find((unit) => unit.name === unitName) ||
+    units.find((unit) => stemsSameUnit(unit.name, unitName))
+  );
 }
 
 function fileExtension(file: RelFile) {
@@ -60,7 +86,7 @@ export function FolderBatchImport({
   onError,
   onMessage,
 }: {
-  onImported: (batchName: string) => void;
+  onImported: (batchName: string, sessionId?: string) => void;
   onError: (message: string) => void;
   onMessage: (message: string) => void;
 }) {
@@ -70,7 +96,7 @@ export function FolderBatchImport({
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderError, setFolderError] = useState("");
   const [draggingFolder, setDraggingFolder] = useState(false);
-  const [robotStyles, setRobotStyles] = useState<string[]>([]);
+  const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
   const needRobotStyles = !!folderDraft && folderDraft.ontology === "robot";
@@ -82,11 +108,7 @@ export function FolderBatchImport({
       .storageModels()
       .then((data) => {
         if (cancelled) return;
-        setRobotStyles(
-          data.instances
-            .filter((item) => item.ontology === "robot")
-            .map((item) => item.name)
-        );
+        setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
       })
       .catch((e) => {
         if (!cancelled) setFolderError(e instanceof Error ? e.message : "机器人款式加载失败");
@@ -138,6 +160,7 @@ export function FolderBatchImport({
       channel: "rgb",
       format: extensions.length === 1 ? extensions[0] : "csv",
       robotStyle: "",
+      robotVersion: "",
       personName: "",
       gender: "",
       height: "",
@@ -178,10 +201,11 @@ export function FolderBatchImport({
     const seenUnits = new Set<string>();
     return folderDraft.files.map((relFile) => {
       const unitName = fileUnitName(relFile);
-      const duplicate = seenUnits.has(unitName);
-      seenUnits.add(unitName);
-      const existingConflict = existingUnits
-        .find((unit) => unit.name === unitName)
+      const matchedName =
+        [...seenUnits].find((name) => stemsSameUnit(name, unitName)) || unitName;
+      const duplicate = seenUnits.has(matchedName);
+      seenUnits.add(matchedName);
+      const existingConflict = matchExistingUnit(unitName, existingUnits)
         ?.files.some(
           (item) =>
             item.ontology === folderDraft.ontology &&
@@ -230,13 +254,6 @@ export function FolderBatchImport({
       setFolderError("批次名称和格式不能为空");
       return;
     }
-    if (
-      folderDraft.batchChoice === "new" &&
-      (overview?.batches || []).some((item) => item.name === targetBatch)
-    ) {
-      setFolderError("新批次名称已存在，请在文件夹名称基础上继续修改");
-      return;
-    }
 
     setFolderBusy(true);
     setFolderError("");
@@ -256,7 +273,10 @@ export function FolderBatchImport({
         "annotation",
         JSON.stringify(
           folderDraft.ontology === "robot"
-            ? { robot_style: folderDraft.robotStyle }
+            ? {
+                robot_style: folderDraft.robotStyle,
+                robot_version: folderDraft.robotVersion,
+              }
             : {
                 person_name: folderDraft.personName.trim(),
                 gender: folderDraft.gender,
@@ -269,7 +289,7 @@ export function FolderBatchImport({
       );
       const result = await api.storageUploadFolder(form);
       setFolderResult(result);
-      onImported(targetBatch);
+      onImported(targetBatch, result.upload_session_id || undefined);
       if (!result.failed) {
         onMessage(
           `文件夹导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
@@ -410,6 +430,13 @@ export function FolderBatchImport({
                     })
                   }
                 />
+                {(overview?.batches || []).some(
+                  (item) => item.name === folderDraft.batchName.trim()
+                ) && (
+                  <span className="muted">
+                    名称「{folderDraft.batchName.trim()}」已存在，将添加到该批次
+                  </span>
+                )}
               </label>
             )}
 
@@ -478,22 +505,14 @@ export function FolderBatchImport({
                 />
               </label>
               {folderDraft.ontology === "robot" && (
-                <label>
-                  机器人款式
-                  <select
-                    value={folderDraft.robotStyle}
-                    onChange={(event) =>
-                      updateFolderDraft({ robotStyle: event.target.value })
-                    }
-                  >
-                    <option value="">未选择</option>
-                    {robotStyles.map((name) => (
-                      <option key={name} value={name}>
-                        {name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <RobotStyleFields
+                  instances={robotInstances}
+                  style={folderDraft.robotStyle}
+                  version={folderDraft.robotVersion}
+                  onChange={(robotStyle, robotVersion) =>
+                    updateFolderDraft({ robotStyle, robotVersion })
+                  }
+                />
               )}
               {folderDraft.ontology === "human" && (
                 <>
@@ -629,7 +648,14 @@ export function FolderBatchImport({
                   }
                   onClick={() => void submitFolderImport()}
                 >
-                  {folderBusy ? "正在导入…" : "开始导入"}
+                  {folderBusy
+                    ? "正在导入…"
+                    : folderDraft.batchChoice === "new" &&
+                        (overview?.batches || []).some(
+                          (item) => item.name === folderDraft.batchName.trim()
+                        )
+                      ? "添加到现有批次"
+                      : "开始导入"}
                 </button>
               )}
             </div>

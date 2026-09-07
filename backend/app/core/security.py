@@ -18,7 +18,12 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def create_access_token(user_id: int, username: str, role: UserRole) -> str:
+def create_access_token(
+    user_id: int,
+    username: str,
+    role: UserRole,
+    impersonator_id: int | None = None,
+) -> str:
     expire = datetime.now(timezone.utc) + timedelta(hours=settings.token_expire_hours)
     payload = {
         "sub": str(user_id),
@@ -26,6 +31,8 @@ def create_access_token(user_id: int, username: str, role: UserRole) -> str:
         "role": role.value,
         "exp": expire,
     }
+    if impersonator_id is not None:
+        payload["impersonator_id"] = impersonator_id
     return jwt.encode(payload, settings.secret_key, algorithm="HS256")
 
 

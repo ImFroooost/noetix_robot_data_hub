@@ -5,6 +5,7 @@ from ..core.deps import require_admin
 from ..core.security import hash_password
 from ..database import get_db
 from ..models import AuditLog, MotionClip, User, UserRole
+from ..models.enums import canonical_role, is_super_manager_role, is_super_role
 from ..schemas import (
     PermissionItem,
     UserCreate,
@@ -16,6 +17,16 @@ from ..services.audit import write_audit
 from ..services.permissions import permission_summary, set_user_permissions
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+def _active_super_manager_count(db: Session, exclude_id: int | None = None) -> int:
+    q = db.query(User).filter(
+        User.role.in_([UserRole.super_manager, UserRole.admin]),
+        User.is_active.is_(True),
+    )
+    if exclude_id is not None:
+        q = q.filter(User.id != exclude_id)
+    return q.count()
 
 
 def _user_out(db: Session, user: User) -> UserOut:
@@ -46,14 +57,15 @@ def create_user(
 ):
     if db.query(User).filter(User.username == body.username).first():
         raise HTTPException(status_code=400, detail="用户名已存在")
+    role = canonical_role(body.role)
     user = User(
         username=body.username,
         password_hash=hash_password(body.password),
-        role=body.role,
+        role=role,
     )
     db.add(user)
     db.flush()
-    if body.role != UserRole.admin and body.permissions:
+    if not is_super_role(role) and body.permissions:
         set_user_permissions(
             db,
             user,
@@ -85,8 +97,19 @@ def update_user(
     if body.password is not None:
         user.password_hash = hash_password(body.password)
     if body.role is not None:
-        user.role = body.role
+        new_role = canonical_role(body.role)
+        if is_super_manager_role(user.role) and not is_super_manager_role(new_role):
+            if _active_super_manager_count(db, exclude_id=user.id) == 0:
+                raise HTTPException(status_code=400, detail="不能取消最后一个启用的超级管理者")
+        user.role = new_role
     if body.is_active is not None:
+        if (
+            is_super_manager_role(user.role)
+            and user.is_active
+            and body.is_active is False
+            and _active_super_manager_count(db, exclude_id=user.id) == 0
+        ):
+            raise HTTPException(status_code=400, detail="不能禁用最后一个启用的超级管理者")
         user.is_active = body.is_active
     write_audit(
         db,
@@ -112,18 +135,9 @@ def delete_user(
         raise HTTPException(status_code=404, detail="用户不存在")
     if user.id == admin.id:
         raise HTTPException(status_code=400, detail="不能删除当前登录账号")
-    if user.role == UserRole.admin and user.is_active:
-        other_admins = (
-            db.query(User)
-            .filter(
-                User.id != user.id,
-                User.role == UserRole.admin,
-                User.is_active.is_(True),
-            )
-            .count()
-        )
-        if other_admins == 0:
-            raise HTTPException(status_code=400, detail="不能删除最后一个启用的管理员")
+    if is_super_manager_role(user.role) and user.is_active:
+        if _active_super_manager_count(db, exclude_id=user.id) == 0:
+            raise HTTPException(status_code=400, detail="不能删除最后一个启用的超级管理者")
 
     # Preserve clips/audit history; drop FK to the removed user.
     db.query(MotionClip).filter(MotionClip.created_by == user.id).update(
@@ -173,8 +187,8 @@ def put_permissions(
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
-    if user.role == UserRole.admin:
-        raise HTTPException(status_code=400, detail="管理员默认拥有全部权限，无需配置")
+    if is_super_role(user.role):
+        raise HTTPException(status_code=400, detail="超级角色拥有对应能力的全部范围，无需按路径配置")
     set_user_permissions(db, user, [p.model_dump() for p in body.permissions])
     write_audit(
         db,

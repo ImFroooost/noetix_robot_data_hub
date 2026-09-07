@@ -49,9 +49,8 @@ function ResultThumb({ clipId }: { clipId: number }) {
  * 完整浏览：左侧文件夹/分类标准树（到条目），中部筛选，右侧列表或详情可视化。
  */
 export function SearchPage() {
-  const { user, isAdmin } = useAuth();
-  const canManageFolders =
-    isAdmin || !!(user?.capabilities?.edit && user.capabilities.edit.length > 0);
+  const { hasPerm } = useAuth();
+  const canManageFolders = hasPerm("manage_data");
 
   const [browseMode, setBrowseMode] = useState<BrowseMode>("folder");
   const [folders, setFolders] = useState<Folder[]>([]);

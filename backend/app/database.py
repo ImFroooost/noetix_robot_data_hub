@@ -216,6 +216,34 @@ def _migrate_schema(conn):
             "UNIQUE (clip_id, robot_model_id, stage, format, label)",
         )
 
+    # users.role / user_permissions.capability: enum -> varchar for new roles
+    for table, column, length in (
+        ("users", "role", 32),
+        ("user_permissions", "capability", 32),
+    ):
+        if not _column_exists(conn, table, column):
+            continue
+        row = conn.execute(
+            text(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = :t AND column_name = :c
+                """
+            ),
+            {"t": table, "c": column},
+        ).first()
+        if row and row[0] == "USER-DEFINED":
+            conn.execute(
+                text(
+                    f"ALTER TABLE {table} "
+                    f"ALTER COLUMN {column} TYPE VARCHAR({length}) USING {column}::text"
+                )
+            )
+    for typ in ("userrole", "user_role", "capability"):
+        _exec_optional(conn, f"DROP TYPE IF EXISTS {typ}")
+
     # user_permissions: scheme-aware unique constraint
     _exec_optional(
         conn,
@@ -232,8 +260,8 @@ def _migrate_schema(conn):
 
 def _migrate_data(db):
     from .models import Capability, Folder, MotionClip, User, UserPermission, UserRole
+    from .models.enums import ROLE_ALIASES, is_super_role
     from .services.permissions import (
-        ALL_CAPABILITIES,
         ensure_trash_folder,
         ensure_unclassified_folder,
         get_or_create_folder_by_path,
@@ -278,25 +306,19 @@ def _migrate_data(db):
         except Exception:
             clip.folder_id = unclassified.id
 
-    # Migrate legacy roles to path permissions once (users with zero perms)
+    # Legacy admin/editor/viewer → 超级管理者 / 超级上传者 / 游客
     users = db.query(User).all()
     for user in users:
+        mapped = ROLE_ALIASES.get(user.role)
+        if mapped:
+            user.role = mapped
         count = (
             db.query(UserPermission).filter(UserPermission.user_id == user.id).count()
         )
-        if count > 0 or user.role == UserRole.admin:
+        if count > 0 or is_super_role(user.role):
             continue
-        if user.role == UserRole.editor:
-            set_user_permissions(
-                db,
-                user,
-                [
-                    {"capability": c, "path_prefix": "/", "recursive": True}
-                    for c in ALL_CAPABILITIES
-                ],
-            )
-        else:
-            # viewer and others: browse only on /
+        # 仅给刚从旧 viewer 迁过来、且从未配过范围的账号默认浏览全部
+        if mapped == UserRole.visitor:
             set_user_permissions(
                 db,
                 user,

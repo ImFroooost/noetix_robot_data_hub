@@ -5,12 +5,28 @@ from __future__ import annotations
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from ..models import Capability, Folder, MotionClip, User, UserPermission, UserRole
+from ..models import Capability, Folder, MotionClip, User, UserPermission
+from ..models.enums import (
+    alias_capability,
+    is_super_manager_role,
+    is_super_role,
+    role_capabilities,
+)
 
 ALL_CAPABILITIES = (
     Capability.browse,
     Capability.download,
+    Capability.annotate,
+    Capability.upload,
+    Capability.manage_data,
+    Capability.manage_users,
     Capability.edit,
+)
+
+# 管理数据覆盖同范围内的浏览 / 下载 / 标注 / 上传
+MANAGE_DATA_IMPLIES = (
+    Capability.browse,
+    Capability.download,
     Capability.annotate,
     Capability.upload,
 )
@@ -56,7 +72,37 @@ def folder_path_of_clip(db: Session, clip: MotionClip) -> str:
 
 
 def is_admin(user: User) -> bool:
-    return user.role == UserRole.admin
+    """超级管理者（含旧 admin）可管理用户。"""
+    return is_super_manager_role(user.role)
+
+
+def has_role_capability(user: User, capability: Capability) -> bool:
+    return alias_capability(capability) in role_capabilities(user.role)
+
+
+def capability_query_values(capability: Capability) -> list[Capability]:
+    cap = alias_capability(capability)
+    if cap == Capability.manage_data:
+        return [Capability.manage_data, Capability.edit]
+    if cap in MANAGE_DATA_IMPLIES:
+        return [cap, Capability.manage_data, Capability.edit]
+    return [cap]
+
+
+def user_has_any_capability(db: Session, user: User, capability: Capability) -> bool:
+    if not has_role_capability(user, capability):
+        return False
+    if is_super_role(user.role):
+        return True
+    return (
+        db.query(UserPermission)
+        .filter(
+            UserPermission.user_id == user.id,
+            UserPermission.capability.in_(capability_query_values(capability)),
+        )
+        .first()
+        is not None
+    )
 
 
 def list_user_permissions(db: Session, user: User) -> list[UserPermission]:
@@ -70,14 +116,16 @@ def list_user_permissions(db: Session, user: User) -> list[UserPermission]:
 
 def user_has_capability(db: Session, user: User, capability: Capability, folder_path: str) -> bool:
     """Folder-tree scoped check (permissions with scheme=='')."""
-    if is_admin(user):
+    if not has_role_capability(user, capability):
+        return False
+    if is_super_role(user.role):
         return True
     folder_path = normalize_path(folder_path)
     perms = (
         db.query(UserPermission)
         .filter(
             UserPermission.user_id == user.id,
-            UserPermission.capability == capability,
+            UserPermission.capability.in_(capability_query_values(capability)),
             UserPermission.scheme == "",
         )
         .all()
@@ -105,13 +153,25 @@ def user_has_clip_capability(
     db: Session, user: User, capability: Capability, clip: MotionClip
 ) -> bool:
     """Clip-level check: folder-tree perms OR taxonomy-scheme perms."""
-    if is_admin(user):
+    if (
+        capability
+        in (
+            Capability.browse,
+            Capability.download,
+            Capability.annotate,
+        )
+        and clip.created_by == user.id
+    ):
+        return True
+    if not has_role_capability(user, capability):
+        return False
+    if is_super_role(user.role):
         return True
     perms = (
         db.query(UserPermission)
         .filter(
             UserPermission.user_id == user.id,
-            UserPermission.capability == capability,
+            UserPermission.capability.in_(capability_query_values(capability)),
         )
         .all()
     )
@@ -171,14 +231,14 @@ def ensure_clip_capability(
 
 
 def browse_path_prefixes(db: Session, user: User) -> list[str] | None:
-    """Folder-tree browse prefixes, or None if admin (no filter)."""
-    if is_admin(user):
+    """Folder-tree browse prefixes, or None if unrestricted browse."""
+    if is_super_role(user.role) and has_role_capability(user, Capability.browse):
         return None
     rows = (
         db.query(UserPermission)
         .filter(
             UserPermission.user_id == user.id,
-            UserPermission.capability == Capability.browse,
+            UserPermission.capability.in_(capability_query_values(Capability.browse)),
             UserPermission.scheme == "",
         )
         .all()
@@ -191,7 +251,7 @@ def _scheme_browse_perms(db: Session, user: User) -> list[UserPermission]:
         db.query(UserPermission)
         .filter(
             UserPermission.user_id == user.id,
-            UserPermission.capability == Capability.browse,
+            UserPermission.capability.in_(capability_query_values(Capability.browse)),
             UserPermission.scheme != "",
         )
         .all()
@@ -206,8 +266,9 @@ def apply_browse_filter(query, db: Session, user: User):
     if prefixes is None:
         return query
     scheme_perms = _scheme_browse_perms(db, user)
+    owner_clause = MotionClip.created_by == user.id
     if not prefixes and not scheme_perms:
-        return query.filter(False)
+        return query.filter(owner_clause)
     # join folder; clips without folder treated as /未分类/
     query = query.outerjoin(Folder, MotionClip.folder_id == Folder.id)
     clauses = []
@@ -231,11 +292,12 @@ def apply_browse_filter(query, db: Session, user: User):
             )
         )
         clauses.append(MotionClip.id.in_(tagged))
+    clauses.append(owner_clause)
     return query.filter(or_(*clauses))
 
 
 def folder_visible(db: Session, user: User, folder: Folder) -> bool:
-    if is_admin(user):
+    if is_super_role(user.role) and has_role_capability(user, Capability.browse):
         return True
     path = normalize_path(folder.path)
     # visible if any browse prefix covers this folder, or this folder is ancestor of a granted prefix
@@ -251,11 +313,21 @@ def folder_visible(db: Session, user: User, folder: Folder) -> bool:
     return False
 
 
+def _granted_caps_for_role(user: User) -> list[Capability]:
+    allowed = role_capabilities(user.role)
+    out: list[Capability] = []
+    for cap in ALL_CAPABILITIES:
+        if alias_capability(cap) in allowed:
+            out.append(cap)
+    return out
+
+
 def permission_summary(db: Session, user: User) -> dict:
-    if is_admin(user):
+    granted = _granted_caps_for_role(user)
+    if is_super_role(user.role):
         return {
-            "is_admin": True,
-            "capabilities": {c.value: ["/"] for c in ALL_CAPABILITIES},
+            "is_admin": is_admin(user),
+            "capabilities": {c.value: ["/"] for c in granted},
             "permissions": [
                 {
                     "capability": c.value,
@@ -263,19 +335,34 @@ def permission_summary(db: Session, user: User) -> dict:
                     "path_prefix": "/",
                     "recursive": True,
                 }
-                for c in ALL_CAPABILITIES
+                for c in granted
+                if c != Capability.edit
             ],
         }
     rows = list_user_permissions(db, user)
     caps: dict[str, list[str]] = {c.value: [] for c in ALL_CAPABILITIES}
     perms_out = []
+    allowed = role_capabilities(user.role)
     for r in rows:
         scheme = getattr(r, "scheme", "") or ""
         pref = normalize_path(r.path_prefix)
-        caps[r.capability.value].append(f"{scheme}:{pref}" if scheme else pref)
+        raw = r.capability.value
+        aliased = alias_capability(r.capability)
+        if aliased not in allowed:
+            continue
+        token = f"{scheme}:{pref}" if scheme else pref
+        caps[raw].append(token)
+        if aliased == Capability.manage_data:
+            if token not in caps[Capability.manage_data.value]:
+                caps[Capability.manage_data.value].append(token)
+            if token not in caps[Capability.edit.value]:
+                caps[Capability.edit.value].append(token)
+            for implied in MANAGE_DATA_IMPLIES:
+                if implied in allowed and token not in caps[implied.value]:
+                    caps[implied.value].append(token)
         perms_out.append(
             {
-                "capability": r.capability.value,
+                "capability": raw,
                 "scheme": scheme,
                 "path_prefix": pref,
                 "recursive": r.recursive,
@@ -291,11 +378,15 @@ def set_user_permissions(
 ) -> list[UserPermission]:
     """Replace all permissions. Auto-add browse for non-browse capabilities."""
     db.query(UserPermission).filter(UserPermission.user_id == user.id).delete()
+    allowed = role_capabilities(user.role)
     # normalize + auto browse
     seen: set[tuple[str, str, str]] = set()
     expanded: list[tuple[Capability, str, str, bool]] = []
     for item in items:
         cap = item["capability"] if isinstance(item["capability"], Capability) else Capability(item["capability"])
+        cap = alias_capability(cap)
+        if cap not in allowed or cap == Capability.manage_users:
+            continue
         scheme = (item.get("scheme") or "").strip()
         prefix = normalize_path(item.get("path_prefix") or "/")
         recursive = bool(item.get("recursive", True))
@@ -304,7 +395,7 @@ def set_user_permissions(
             continue
         seen.add(key)
         expanded.append((cap, scheme, prefix, recursive))
-        if cap != Capability.browse:
+        if cap != Capability.browse and Capability.browse in allowed:
             bkey = (Capability.browse.value, scheme, prefix)
             if bkey not in seen:
                 seen.add(bkey)

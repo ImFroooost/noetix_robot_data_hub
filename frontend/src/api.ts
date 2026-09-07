@@ -1,4 +1,5 @@
 const TOKEN_KEY = "motion_token";
+const ACTOR_TOKEN_KEY = "motion_actor_token";
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -7,6 +8,15 @@ export function getToken(): string | null {
 export function setToken(token: string | null) {
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
+}
+
+export function getActorToken(): string | null {
+  return localStorage.getItem(ACTOR_TOKEN_KEY);
+}
+
+export function setActorToken(token: string | null) {
+  if (token) localStorage.setItem(ACTOR_TOKEN_KEY, token);
+  else localStorage.removeItem(ACTOR_TOKEN_KEY);
 }
 
 function chineseHttpError(status: number, detail: string): string {
@@ -35,7 +45,15 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     );
   }
   if (res.status === 401) {
+    const actor = getActorToken();
     setToken(null);
+    if (actor && actor !== token && !path.includes("/auth/login")) {
+      setToken(actor);
+      setActorToken(null);
+      window.location.href = "/users";
+      throw new Error("视角会话已失效，已回到超级管理者");
+    }
+    setActorToken(null);
     if (!path.includes("/auth/login")) {
       window.location.href = "/login";
     }
@@ -64,6 +82,18 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   me: () => request<import("./types").User>("/api/auth/me"),
+  impersonate: (userId: number) =>
+    request<{ access_token: string; role: string; username: string }>(
+      `/api/auth/impersonate/${userId}`,
+      { method: "POST" }
+    ),
+  stopImpersonate: () =>
+    request<{ access_token: string; role: string; username: string }>(
+      "/api/auth/stop-impersonate",
+      { method: "POST" }
+    ),
+  impersonationTargets: () =>
+    request<import("./types").User[]>("/api/auth/impersonation-targets"),
   search: (params: Record<string, string | number | boolean | undefined | null>) => {
     const q = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => {
@@ -256,6 +286,22 @@ export const api = {
       `/api/storage/file-meta?path=${encodeURIComponent(path)}`,
       { method: "PATCH", body: JSON.stringify(body) }
     ),
+  storageUpdateUploadSession: (
+    sessionId: string,
+    body: Record<string, unknown>
+  ) =>
+    request<import("./types").StorageUploadSession>(
+      `/api/storage/upload-sessions/${encodeURIComponent(sessionId)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    ),
+  storageDeleteUploadSession: (sessionId: string, paths?: string[]) =>
+    request<{ ok: boolean; removed: string[]; session_id: string }>(
+      `/api/storage/upload-sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "DELETE",
+        body: JSON.stringify(paths ? { paths } : {}),
+      }
+    ),
   storageUpdateUnit: (
     batch: string,
     unitName: string,
@@ -264,6 +310,38 @@ export const api = {
     request<import("./types").StorageUnit>(
       `/api/storage/units/${encodeURIComponent(batch)}/${encodeURIComponent(unitName)}`,
       { method: "PATCH", body: JSON.stringify(body) }
+    ),
+  storageRenameBatch: (name: string, next: string) =>
+    request<import("./types").StorageBatch>(
+      `/api/storage/batches/${encodeURIComponent(name)}/rename`,
+      { method: "POST", body: JSON.stringify({ name: next }) }
+    ),
+  storageDeleteBatch: (name: string) =>
+    request<{ ok: boolean }>(
+      `/api/storage/batches/${encodeURIComponent(name)}`,
+      { method: "DELETE" }
+    ),
+  storageDownloadBatchUrl: (name: string) =>
+    `/api/storage/batches/${encodeURIComponent(name)}/download`,
+  storageRenameUnit: (batch: string, unitName: string, next: string) =>
+    request<import("./types").StorageUnit>(
+      `/api/storage/units/${encodeURIComponent(batch)}/${encodeURIComponent(unitName)}/rename`,
+      { method: "POST", body: JSON.stringify({ name: next }) }
+    ),
+  storageDeleteUnit: (batch: string, unitName: string) =>
+    request<{ ok: boolean }>(
+      `/api/storage/units/${encodeURIComponent(batch)}/${encodeURIComponent(unitName)}`,
+      { method: "DELETE" }
+    ),
+  storageDownloadUnitUrl: (batch: string, unitName: string) =>
+    `/api/storage/units/${encodeURIComponent(batch)}/${encodeURIComponent(unitName)}/download`,
+  storageBulkDelete: (body: {
+    batches: string[];
+    units: { batch: string; name: string }[];
+  }) =>
+    request<{ ok: boolean; batches: string[]; units: string[] }>(
+      "/api/storage/bulk-delete",
+      { method: "POST", body: JSON.stringify(body) }
     ),
   storageUpload: (form: FormData) =>
     request<import("./types").StorageFile>("/api/storage/data/upload", {
@@ -374,6 +452,30 @@ export async function downloadAuth(url: string, filename?: string) {
   const token = getToken();
   const res = await fetch(url, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) throw new Error("下载失败");
+  const blob = await res.blob();
+  const obj = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = obj;
+  a.download = filename || "download";
+  a.click();
+  URL.revokeObjectURL(obj);
+}
+
+export async function downloadAuthPost(
+  url: string,
+  body: unknown,
+  filename?: string
+) {
+  const token = getToken();
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error("下载失败");
   const blob = await res.blob();

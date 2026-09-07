@@ -5,7 +5,14 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import Capability, MotionClip, User, UserRole
-from ..services.permissions import ensure_capability, ensure_clip_capability, folder_path_of_clip
+from ..models.enums import is_super_manager_role
+from ..services.permissions import (
+    ensure_capability,
+    ensure_clip_capability,
+    folder_path_of_clip,
+    is_admin,
+    user_has_any_capability,
+)
 from .security import decode_access_token
 
 bearer = HTTPBearer(auto_error=False)
@@ -15,12 +22,23 @@ def _user_from_token(db: Session, token: str) -> User:
     try:
         payload = decode_access_token(token)
         user_id = int(payload["sub"])
-    except (PyJWTError, KeyError, ValueError):
+        impersonator_id = payload.get("impersonator_id")
+        if impersonator_id is not None:
+            impersonator_id = int(impersonator_id)
+    except (PyJWTError, KeyError, ValueError, TypeError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效令牌")
     user = db.get(User, user_id)
-    if not user or not user.is_active:
+    if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不可用")
+    if not user.is_active and impersonator_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不可用")
+    user.impersonated_by_id = impersonator_id
     return user
+
+
+def impersonator_id_of(user: User) -> int | None:
+    raw = getattr(user, "impersonated_by_id", None)
+    return int(raw) if raw is not None else None
 
 
 def get_current_user(
@@ -44,9 +62,25 @@ def get_current_user_bearer_or_query(
     return _user_from_token(db, raw)
 
 
+def get_acting_super_manager(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """当前超级管理者，或视角令牌背后的超级管理者。"""
+    actor_id = impersonator_id_of(user)
+    actor = user if actor_id is None else db.get(User, actor_id)
+    if (
+        not actor
+        or not actor.is_active
+        or not is_super_manager_role(actor.role)
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要超级管理者权限")
+    return actor
+
+
 def require_admin(user: User = Depends(get_current_user)) -> User:
-    if user.role != UserRole.admin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员权限")
+    if not is_super_manager_role(user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要超级管理者权限")
     return user
 
 
@@ -54,37 +88,27 @@ def require_roles(*roles: UserRole):
     """Legacy helper; prefer capability checks."""
 
     def checker(user: User = Depends(get_current_user)) -> User:
-        if user.role == UserRole.admin or user.role in roles:
+        if is_super_manager_role(user.role) or user.role in roles:
             return user
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="权限不足")
 
     return checker
 
 
-# Kept for robot model management: admin or anyone with edit somewhere
 def require_editor(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
-    from ..services.permissions import is_admin, user_has_capability
+    if is_admin(user) or user_has_any_capability(db, user, Capability.upload):
+        return user
+    if user_has_any_capability(db, user, Capability.manage_data):
+        return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要上传或管理数据权限")
 
-    if is_admin(user):
-        return user
-    if user_has_capability(db, user, Capability.edit, "/") or user_has_capability(
-        db, user, Capability.upload, "/"
-    ):
-        return user
-    # any edit/upload on any path
-    from ..models import UserPermission
 
-    has = (
-        db.query(UserPermission)
-        .filter(
-            UserPermission.user_id == user.id,
-            UserPermission.capability.in_([Capability.edit, Capability.upload]),
-        )
-        .first()
-    )
-    if has:
+def require_manage_data(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> User:
+    if user_has_any_capability(db, user, Capability.manage_data):
         return user
-    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要编辑或上传权限")
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理数据权限")
 
 
 def get_clip_or_404(clip_id: int, db: Session) -> MotionClip:

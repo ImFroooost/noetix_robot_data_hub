@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -20,27 +20,47 @@ from ..services.disk_repository import (
     MODEL_KINDS,
     MODALITIES,
     ONTOLOGIES,
+    collect_archive_entries,
+    apply_batch_taxonomy_to_new_units,
+    assemble_upload_sessions,
     create_batch,
     create_model_instance,
+    delete_batches,
+    delete_upload_session_files,
     delete_model_instance,
     delete_repo_file,
+    delete_units,
     inspect_data_file,
     probe_data_file,
     read_metadata,
     rebuild_catalog,
+    record_upload_session,
+    rename_batch,
+    rename_unit,
     resolve_repo_file,
     save_data_file,
+    write_archive,
     save_model_upload,
     scan_data,
     scan_models,
     set_file_uploaders,
+    stems_same_unit,
     unit_key,
     update_batch_metadata,
+    update_upload_session,
     update_file_metadata,
     update_files_annotation,
     update_unit_metadata,
 )
-from ..services.permissions import ensure_capability, is_admin, path_matches
+from ..models.enums import is_super_role
+from ..services.permissions import (
+    capability_query_values,
+    ensure_capability,
+    has_role_capability,
+    path_matches,
+    user_has_any_capability,
+    user_has_capability,
+)
 
 router = APIRouter(prefix="/storage", tags=["storage-repository"])
 
@@ -58,6 +78,35 @@ class UnitMetadataIn(BaseModel):
 class ModelInstanceIn(BaseModel):
     ontology: str
     name: str = Field(min_length=1, max_length=256)
+
+
+class RenameIn(BaseModel):
+    name: str = Field(min_length=1, max_length=256)
+
+
+class UploadSessionIn(BaseModel):
+    annotation: dict[str, Any] | None = None
+    paths: list[str] | None = None
+
+
+class UploadSessionDeleteIn(BaseModel):
+    paths: list[str] | None = None
+
+
+class UnitRefIn(BaseModel):
+    batch: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+
+
+class DataKindIn(BaseModel):
+    ontology: str
+    modality: str
+
+
+class StorageSelectionIn(BaseModel):
+    batches: list[str] = Field(default_factory=list)
+    units: list[UnitRefIn] = Field(default_factory=list)
+    kinds: list[DataKindIn] = Field(default_factory=list)
 
 
 def _parse_annotation_form(raw: str) -> dict[str, Any]:
@@ -81,19 +130,67 @@ def _unit_path(unit: dict[str, Any]) -> str:
     return f"/{unit['batch']}/{unit['name']}/"
 
 
-def _unit_allowed(
+def _batch_path(batch: dict[str, Any] | str) -> str:
+    name = batch if isinstance(batch, str) else batch["name"]
+    return f"/{name}/"
+
+
+def _can_see_empty_batch(db: Session, user: User, batch: dict[str, Any]) -> bool:
+    """空批次：超级角色可见；受限角色仅当文件夹浏览范围覆盖该批次。"""
+    if is_super_role(user.role) and has_role_capability(user, Capability.browse):
+        return True
+    return user_has_capability(db, user, Capability.browse, _batch_path(batch))
+
+
+OWNER_CAPABILITIES = frozenset(
+    {Capability.browse, Capability.download, Capability.annotate}
+)
+
+
+def _as_user_id(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_uploader(user: User, payload: dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    return _as_user_id(payload.get("id")) == user.id
+
+
+def _user_uploaded_file(user: User, file: dict[str, Any]) -> bool:
+    return _is_uploader(user, file.get("uploader"))
+
+
+def _user_uploaded_in_unit(user: User, unit: dict[str, Any]) -> bool:
+    if any(_is_uploader(user, item) for item in unit.get("uploaders") or []):
+        return True
+    return any(_user_uploaded_file(user, item) for item in unit.get("files") or [])
+
+
+def _user_uploaded_in_batch(user: User, batch: dict[str, Any]) -> bool:
+    if any(_is_uploader(user, item) for item in batch.get("uploaders") or []):
+        return True
+    return any(_user_uploaded_in_unit(user, unit) for unit in batch.get("units") or [])
+
+
+def _unit_allowed_scoped(
     db: Session,
     user: User,
     capability: Capability,
     unit: dict[str, Any],
 ) -> bool:
-    if is_admin(user):
+    if not has_role_capability(user, capability):
+        return False
+    if is_super_role(user.role):
         return True
     rows = (
         db.query(UserPermission)
         .filter(
             UserPermission.user_id == user.id,
-            UserPermission.capability == capability,
+            UserPermission.capability.in_(capability_query_values(capability)),
         )
         .all()
     )
@@ -112,6 +209,17 @@ def _unit_allowed(
     return False
 
 
+def _unit_allowed(
+    db: Session,
+    user: User,
+    capability: Capability,
+    unit: dict[str, Any],
+) -> bool:
+    if capability in OWNER_CAPABILITIES and _user_uploaded_in_unit(user, unit):
+        return True
+    return _unit_allowed_scoped(db, user, capability, unit)
+
+
 def _require_unit(
     db: Session,
     user: User,
@@ -127,6 +235,44 @@ def _require_unit(
         db, user, Capability.browse, unit
     ):
         raise HTTPException(status_code=403, detail=f"缺少浏览权限：{_unit_path(unit)}")
+
+
+def _require_batch_capability(
+    db: Session,
+    user: User,
+    capability: Capability,
+    batch: dict[str, Any],
+) -> None:
+    units = batch.get("units") or []
+    if not units:
+        if is_super_role(user.role) and has_role_capability(user, capability):
+            return
+        ensure_capability(db, user, capability, f"/{batch['name']}/")
+        return
+    if capability in OWNER_CAPABILITIES and any(
+        _unit_allowed(db, user, capability, unit) for unit in units
+    ):
+        return
+    for unit in units:
+        _require_unit(db, user, capability, unit)
+
+
+def _archive_response(
+    entries: list[tuple[Path, str]],
+    filename: str,
+    background: BackgroundTasks,
+) -> FileResponse:
+    try:
+        archive = write_archive(entries)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    background.add_task(lambda path=archive: path.unlink(missing_ok=True))
+    return FileResponse(
+        archive,
+        filename=filename,
+        media_type="application/zip",
+        content_disposition_type="attachment",
+    )
 
 
 def _has_capability_on_unit(
@@ -147,10 +293,17 @@ def _require_tag_edit(
     unit: dict[str, Any] | None = None,
     path: str,
 ) -> None:
-    if is_admin(user):
+    if is_super_role(user.role) and (
+        has_role_capability(user, Capability.annotate)
+        or has_role_capability(user, Capability.manage_data)
+        or has_role_capability(user, Capability.upload)
+    ):
         return
-    caps = (Capability.annotate, Capability.edit, Capability.upload)
-    if unit and _has_capability_on_unit(db, user, unit, *caps):
+    caps = (Capability.annotate, Capability.manage_data, Capability.edit, Capability.upload)
+    if unit and (
+        _user_uploaded_in_unit(user, unit)
+        or _has_capability_on_unit(db, user, unit, *caps)
+    ):
         return
     if not unit:
         for capability in caps:
@@ -177,17 +330,36 @@ def _require_file_owner(user: User, file: dict[str, Any]) -> None:
 
 
 def _find_unit(snapshot: dict[str, Any], batch: str, name: str) -> dict[str, Any] | None:
-    return next(
+    exact = next(
         (unit for unit in snapshot["units"] if unit["batch"] == batch and unit["name"] == name),
+        None,
+    )
+    if exact:
+        return exact
+    return next(
+        (
+            unit
+            for unit in snapshot["units"]
+            if unit["batch"] == batch and stems_same_unit(unit["name"], name)
+        ),
         None,
     )
 
 
 def _unit_for_file(snapshot: dict[str, Any], path: str) -> dict[str, Any] | None:
     file = next((item for item in snapshot["files"] if item["path"] == path), None)
-    if not file:
-        return None
-    return _find_unit(snapshot, file["batch"], file["unit_name"])
+    if file:
+        unit = _find_unit(snapshot, file["batch"], file["unit_name"])
+        if unit:
+            return unit
+    return next(
+        (
+            unit
+            for unit in snapshot["units"]
+            if any(item.get("path") == path for item in unit.get("files") or [])
+        ),
+        None,
+    )
 
 
 def _taxonomy_briefs(db: Session, ids: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -324,12 +496,15 @@ def _decorate_and_filter(
         if batch and item["name"] != batch:
             continue
         visible_units = [u for u in units if u["batch"] == item["name"]]
-        if (
-            q_norm
-            or (taxonomy_scheme and tag_id is not None)
-            or uploader_id is not None
-        ) and not visible_units:
-            continue
+        if not visible_units:
+            if (
+                q_norm
+                or (taxonomy_scheme and tag_id is not None)
+                or uploader_id is not None
+            ):
+                continue
+            if not _can_see_empty_batch(db, user, item):
+                continue
         batches.append(
             {
                 **item,
@@ -370,6 +545,14 @@ def _decorate_and_filter(
             if unit["key"] in visible_keys
             for file in unit.get("files", [])
         ],
+        "upload_sessions": assemble_upload_sessions(
+            [
+                file
+                for unit in units
+                if unit["key"] in visible_keys
+                for file in unit.get("files", [])
+            ]
+        ),
     }
 
 
@@ -384,8 +567,8 @@ def overview(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if include_empty and not is_admin(user):
-        raise HTTPException(status_code=403, detail="只有管理员可以查看空目录")
+    if include_empty and not user_has_any_capability(db, user, Capability.manage_data):
+        raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以查看空目录")
     return _decorate_and_filter(
         scan_data(include_empty=include_empty),
         db,
@@ -403,6 +586,114 @@ def rescan(
     _: User = Depends(get_current_user),
 ):
     return rebuild_catalog()
+
+
+@router.patch("/upload-sessions/{session_id}")
+def patch_upload_session(
+    session_id: str,
+    body: UploadSessionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = _decorate_and_filter(
+        scan_data(),
+        db,
+        user,
+        batch=None,
+        q=None,
+        taxonomy_scheme=None,
+        tag_id=None,
+        uploader_id=None,
+    )
+    current = next(
+        (
+            item
+            for item in snapshot.get("upload_sessions") or []
+            if item.get("id") == session_id
+        ),
+        None,
+    )
+    if current is None:
+        raise HTTPException(status_code=404, detail="上传记录不存在")
+    if int(current.get("user_id") or 0) != user.id and not user_has_any_capability(
+        db, user, Capability.manage_data
+    ):
+        raise HTTPException(status_code=403, detail="只能修改自己的上传记录")
+    if body.annotation is None:
+        return current
+    try:
+        result = update_upload_session(
+            session_id,
+            annotation=body.annotation,
+            paths=body.paths or current.get("paths") or [],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="annotate",
+        entity_type="upload_session",
+        detail={"session_id": session_id, **body.model_dump(exclude_none=True)},
+    )
+    db.commit()
+    return result
+
+
+@router.delete("/upload-sessions/{session_id}")
+def remove_upload_session(
+    session_id: str,
+    body: UploadSessionDeleteIn = Body(default=UploadSessionDeleteIn()),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = _decorate_and_filter(
+        scan_data(),
+        db,
+        user,
+        batch=None,
+        q=None,
+        taxonomy_scheme=None,
+        tag_id=None,
+        uploader_id=None,
+    )
+    current = next(
+        (
+            item
+            for item in snapshot.get("upload_sessions") or []
+            if item.get("id") == session_id
+        ),
+        None,
+    )
+    if current is None:
+        raise HTTPException(status_code=404, detail="上传记录不存在")
+    if int(current.get("user_id") or 0) != user.id and not user_has_any_capability(
+        db, user, Capability.manage_data
+    ):
+        raise HTTPException(status_code=403, detail="只能删除自己的上传记录")
+    allowed = set(current.get("paths") or [])
+    requested = body.paths
+    selected = [path for path in (requested or []) if path in allowed] if requested is not None else None
+    if requested is not None and not selected:
+        raise HTTPException(status_code=400, detail="没有可删除的文件")
+    try:
+        result = delete_upload_session_files(
+            session_id,
+            paths=selected if selected is not None else list(current.get("paths") or []),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="上传记录不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="delete",
+        entity_type="upload_session",
+        detail={"session_id": session_id, "removed": result.get("removed") or []},
+    )
+    db.commit()
+    return result
 
 
 @router.post("/batches")
@@ -425,6 +716,250 @@ def add_batch(
     return result
 
 
+@router.post("/batches/{name}/rename")
+def rename_batch_api(
+    name: str,
+    body: RenameIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
+    batch = next((item for item in snapshot["batches"] if item["name"] == name), None)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="数据批次不存在")
+    _require_batch_capability(db, user, Capability.edit, batch)
+    try:
+        result = rename_batch(name, body.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="数据批次不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="rename",
+        entity_type="storage_batch",
+        detail={"batch": name, "name": body.name},
+    )
+    db.commit()
+    return result
+
+
+@router.delete("/batches/{name}")
+def remove_batch(
+    name: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
+    batch = next((item for item in snapshot["batches"] if item["name"] == name), None)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="数据批次不存在")
+    _require_batch_capability(db, user, Capability.edit, batch)
+    delete_batches([name])
+    write_audit(
+        db,
+        user_id=user.id,
+        action="delete",
+        entity_type="storage_batch",
+        detail={"batch": name},
+    )
+    db.commit()
+    return {"ok": True, "removed": [name]}
+
+
+@router.get("/batches/{name}/download")
+def download_batch(
+    name: str,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
+    batch = next((item for item in snapshot["batches"] if item["name"] == name), None)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="数据批次不存在")
+    _require_batch_capability(db, user, Capability.download, batch)
+    return _archive_response(
+        collect_archive_entries(batches=[name]),
+        f"{name}.zip",
+        background,
+    )
+
+
+@router.post("/units/{batch}/{unit_name}/rename")
+def rename_unit_api(
+    batch: str,
+    unit_name: str,
+    body: RenameIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data()
+    unit = _find_unit(snapshot, batch, unit_name)
+    if not unit:
+        raise HTTPException(status_code=404, detail="数据单元不存在")
+    _require_unit(db, user, Capability.edit, unit)
+    try:
+        result = rename_unit(batch, unit["name"], body.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="数据单元不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="rename",
+        entity_type="storage_unit",
+        detail={"batch": batch, "unit_name": unit_name, "name": body.name},
+    )
+    db.commit()
+    return result
+
+
+@router.delete("/units/{batch}/{unit_name}")
+def remove_unit(
+    batch: str,
+    unit_name: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data()
+    unit = _find_unit(snapshot, batch, unit_name)
+    if not unit:
+        raise HTTPException(status_code=404, detail="数据单元不存在")
+    _require_unit(db, user, Capability.edit, unit)
+    delete_units([(batch, unit["name"])])
+    write_audit(
+        db,
+        user_id=user.id,
+        action="delete",
+        entity_type="storage_unit",
+        detail={"batch": batch, "unit_name": unit_name},
+    )
+    db.commit()
+    return {"ok": True, "removed": [f"{batch}::{unit_name}"]}
+
+
+@router.get("/units/{batch}/{unit_name}/download")
+def download_unit(
+    batch: str,
+    unit_name: str,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data()
+    unit = _find_unit(snapshot, batch, unit_name)
+    if not unit:
+        raise HTTPException(status_code=404, detail="数据单元不存在")
+    _require_unit(db, user, Capability.download, unit)
+    return _archive_response(
+        collect_archive_entries(units=[(batch, unit["name"])]),
+        f"{unit['name']}.zip",
+        background,
+    )
+
+
+@router.post("/bulk-delete")
+def bulk_delete(
+    body: StorageSelectionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
+    batches_by_name = {item["name"]: item for item in snapshot["batches"]}
+    removed_batches: list[str] = []
+    removed_units: list[tuple[str, str]] = []
+    for name in body.batches:
+        batch = batches_by_name.get(name)
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"数据批次不存在：{name}")
+        _require_batch_capability(db, user, Capability.edit, batch)
+        removed_batches.append(name)
+    covered = set(removed_batches)
+    for item in body.units:
+        if item.batch in covered:
+            continue
+        unit = _find_unit(snapshot, item.batch, item.name)
+        if not unit:
+            raise HTTPException(status_code=404, detail=f"数据单元不存在：{item.batch}/{item.name}")
+        _require_unit(db, user, Capability.edit, unit)
+        removed_units.append((item.batch, item.name))
+    if removed_units:
+        delete_units(removed_units)
+    if removed_batches:
+        delete_batches(removed_batches)
+    write_audit(
+        db,
+        user_id=user.id,
+        action="bulk_delete",
+        entity_type="storage",
+        detail={
+            "batches": removed_batches,
+            "units": [{"batch": batch, "name": name} for batch, name in removed_units],
+        },
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "batches": removed_batches,
+        "units": [f"{batch}::{name}" for batch, name in removed_units],
+    }
+
+
+@router.post("/archive")
+def archive_selection(
+    body: StorageSelectionIn,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
+    batches_by_name = {item["name"]: item for item in snapshot["batches"]}
+    batches: list[str] = []
+    units: list[tuple[str, str]] = []
+    for name in body.batches:
+        batch = batches_by_name.get(name)
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"数据批次不存在：{name}")
+        _require_batch_capability(db, user, Capability.download, batch)
+        batches.append(name)
+    covered = set(batches)
+    for item in body.units:
+        if item.batch in covered:
+            continue
+        unit = _find_unit(snapshot, item.batch, item.name)
+        if not unit:
+            raise HTTPException(status_code=404, detail=f"数据单元不存在：{item.batch}/{item.name}")
+        _require_unit(db, user, Capability.download, unit)
+        units.append((item.batch, item.name))
+    if len(batches) == 1 and not units:
+        filename = f"{batches[0]}.zip"
+    elif len(units) == 1 and not batches:
+        filename = f"{units[0][1]}.zip"
+    else:
+        filename = "storage_selection.zip"
+    kinds = [(item.ontology, item.modality) for item in body.kinds]
+
+    def accept(record: dict[str, Any]) -> bool:
+        unit = _find_unit(snapshot, record["batch"], record["unit_name"])
+        if unit and _unit_allowed_scoped(db, user, Capability.download, unit):
+            return True
+        return _user_uploaded_file(user, record)
+
+    return _archive_response(
+        collect_archive_entries(
+            batches=batches,
+            units=units,
+            kinds=kinds or None,
+            accept=accept,
+        ),
+        filename,
+        background,
+    )
+
+
 @router.patch("/batches/{name}")
 def patch_batch(
     name: str,
@@ -432,7 +967,7 @@ def patch_batch(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    snapshot = scan_data(include_empty=is_admin(user))
+    snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
     batch = next((item for item in snapshot["batches"] if item["name"] == name), None)
     units = (batch or {}).get("units") or []
     allowed_unit = next(
@@ -494,7 +1029,7 @@ def patch_unit(
         _validate_taxonomy_ids(db, body.taxonomy_tag_ids)
     result = update_unit_metadata(
         batch,
-        unit_name,
+        current["name"] if current else unit_name,
         taxonomy_tag_ids=body.taxonomy_tag_ids,
         annotation=body.annotation,
         meta=body.meta,
@@ -529,8 +1064,8 @@ async def upload_data(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if manage_override and not is_admin(user):
-        raise HTTPException(status_code=403, detail="只有管理员可以覆盖其他用户的数据")
+    if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
+        raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
     current = _find_unit(scan_data(), batch, unit_name)
     if current:
         _require_unit(db, user, Capability.upload, current)
@@ -573,10 +1108,27 @@ async def upload_data(
         set_file_uploaders(
             [result["path"]], user_id=user.id, username=user.username
         )
-        update_files_annotation([result["path"]], _parse_annotation_form(annotation))
+        parsed_annotation = _parse_annotation_form(annotation)
+        update_files_annotation([result["path"]], parsed_annotation)
         create_batch(batch)
+        apply_batch_taxonomy_to_new_units(batch, [unit_name])
+        session = record_upload_session(
+            user_id=user.id,
+            username=user.username,
+            source="file",
+            batch=batch,
+            ontology=ontology.strip().lower(),
+            modality=modality.strip().lower(),
+            channel=channel.strip().lower(),
+            fmt=format.strip().lower(),
+            annotation=parsed_annotation,
+            paths=[result["path"]],
+            unit_names=[unit_name],
+            uploaded=1,
+        )
         rebuild_catalog()
         result["uploader"] = uploader
+        result["upload_session_id"] = session["id"]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     write_audit(
@@ -640,6 +1192,16 @@ async def upload_data_folder(
             continue
         try:
             current = current_units.get((batch, raw_unit_name))
+            if not current:
+                current = next(
+                    (
+                        item
+                        for item in snapshot.get("units", [])
+                        if item["batch"] == batch
+                        and stems_same_unit(item["name"], raw_unit_name)
+                    ),
+                    None,
+                )
             if current:
                 _require_unit(db, user, Capability.upload, current)
             else:
@@ -687,12 +1249,35 @@ async def upload_data_folder(
             row.update({"status": "failed", "detail": f"写入文件失败：{exc}"})
         results.append(row)
 
+    session = None
     if saved:
         set_file_uploaders(
             saved_paths, user_id=user.id, username=user.username
         )
-        update_files_annotation(saved_paths, _parse_annotation_form(annotation))
+        parsed_annotation = _parse_annotation_form(annotation)
+        update_files_annotation(saved_paths, parsed_annotation)
         create_batch(batch)
+        unit_names = [
+            str(item.get("unit_name") or "")
+            for item in results
+            if item.get("status") in {"uploaded", "replaced"}
+        ]
+        apply_batch_taxonomy_to_new_units(batch, unit_names)
+        session = record_upload_session(
+            user_id=user.id,
+            username=user.username,
+            source="folder",
+            batch=batch,
+            ontology=ontology,
+            modality=modality,
+            channel=channel,
+            fmt=fmt,
+            annotation=parsed_annotation,
+            paths=saved_paths,
+            unit_names=unit_names,
+            uploaded=sum(item["status"] == "uploaded" for item in results),
+            replaced=sum(item["status"] == "replaced" for item in results),
+        )
         rebuild_catalog()
     summary = {
         "batch": batch,
@@ -702,6 +1287,7 @@ async def upload_data_folder(
         "skipped": sum(item["status"] == "skip" for item in results),
         "failed": sum(item["status"] == "failed" for item in results),
         "items": results,
+        "upload_session_id": session["id"] if session else None,
     }
     write_audit(
         db,
@@ -816,15 +1402,19 @@ def get_file(
     user: User = Depends(get_current_user),
 ):
     if path.startswith("data/"):
-        unit = _unit_for_file(scan_data(), path)
+        snapshot = scan_data()
+        file = next((item for item in snapshot["files"] if item["path"] == path), None)
+        unit = _unit_for_file(snapshot, path)
         if not unit:
             raise HTTPException(status_code=404, detail="文件未纳入数据单元")
-        _require_unit(
-            db,
-            user,
-            Capability.download if download else Capability.browse,
-            unit,
-        )
+        if download:
+            if not (
+                (file and _user_uploaded_file(user, file))
+                or _unit_allowed_scoped(db, user, Capability.download, unit)
+            ):
+                raise HTTPException(status_code=403, detail=f"缺少权限：download @ {_unit_path(unit)}")
+        else:
+            _require_unit(db, user, Capability.browse, unit)
     try:
         file_path = resolve_repo_file(path)
     except ValueError as exc:

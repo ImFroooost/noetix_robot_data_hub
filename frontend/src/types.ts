@@ -1,4 +1,17 @@
-export type Role = "admin" | "editor" | "viewer";
+export type Role =
+  | "visitor"
+  | "downloader"
+  | "annotator"
+  | "uploader"
+  | "manager"
+  | "super_visitor"
+  | "super_downloader"
+  | "super_annotator"
+  | "super_uploader"
+  | "super_manager"
+  | "admin"
+  | "editor"
+  | "viewer";
 export type Quality = "high" | "medium" | "low";
 export type RobotStage = "retarget" | "polish" | "refine" | "real";
 export type TaxonomyScheme = string;
@@ -27,6 +40,7 @@ export interface User {
   is_admin?: boolean;
   capabilities?: Record<string, string[]>;
   permissions?: PermissionItem[];
+  impersonated_by?: { id: number; username: string } | null;
 }
 
 export interface Folder {
@@ -183,6 +197,7 @@ export interface StorageAnnotation {
   note?: string;
   status?: string;
   robot_style?: string;
+  robot_version?: string;
   person_name?: string;
   gender?: string;
   height?: string;
@@ -230,6 +245,26 @@ export interface StorageBatch {
   annotation?: StorageAnnotation;
 }
 
+export interface StorageUploadSession {
+  id: string;
+  created_at: string;
+  user_id: number;
+  username: string;
+  source: "folder" | "file" | "legacy" | string;
+  legacy?: boolean;
+  batch: string;
+  ontology: string;
+  modality: string;
+  channel: string;
+  format: string;
+  annotation: StorageAnnotation;
+  paths: string[];
+  unit_names: string[];
+  file_count: number;
+  uploaded: number;
+  replaced: number;
+}
+
 export interface StorageOverview {
   updated_at: string;
   modalities: string[];
@@ -238,6 +273,7 @@ export interface StorageOverview {
   batches: StorageBatch[];
   units: StorageUnit[];
   files: StorageFile[];
+  upload_sessions?: StorageUploadSession[];
 }
 
 export type StorageFolderUploadStatus =
@@ -262,6 +298,7 @@ export interface StorageFolderUploadResult {
   skipped: number;
   failed: number;
   items: StorageFolderUploadItem[];
+  upload_session_id?: string | null;
 }
 
 export interface ModelInstanceFile {
@@ -426,10 +463,82 @@ export const STAGE_LABEL: Record<RobotStage, string> = {
 };
 
 export const ROLE_LABEL: Record<Role, string> = {
-  admin: "管理员",
-  editor: "编辑者",
-  viewer: "只读",
+  visitor: "游客",
+  downloader: "下载者",
+  annotator: "标注者",
+  uploader: "上传者",
+  manager: "管理者",
+  super_visitor: "超级游客",
+  super_downloader: "超级下载者",
+  super_annotator: "超级标注者",
+  super_uploader: "超级上传者",
+  super_manager: "超级管理者",
+  admin: "超级管理者",
+  editor: "超级上传者",
+  viewer: "游客",
 };
+
+export const ROLE_OPTIONS: Role[] = [
+  "visitor",
+  "downloader",
+  "annotator",
+  "uploader",
+  "manager",
+  "super_visitor",
+  "super_downloader",
+  "super_annotator",
+  "super_uploader",
+  "super_manager",
+];
+
+export const SUPER_ROLES = new Set<Role>([
+  "super_visitor",
+  "super_downloader",
+  "super_annotator",
+  "super_uploader",
+  "super_manager",
+  "admin",
+]);
+
+export const ROLE_CAPABILITIES: Record<Role, string[]> = {
+  visitor: ["browse"],
+  downloader: ["browse", "download"],
+  annotator: ["browse", "annotate"],
+  uploader: ["browse", "download", "annotate", "upload"],
+  manager: ["browse", "download", "annotate", "upload", "manage_data"],
+  super_visitor: ["browse"],
+  super_downloader: ["browse", "download"],
+  super_annotator: ["browse", "annotate"],
+  super_uploader: ["browse", "download", "annotate", "upload"],
+  super_manager: [
+    "browse",
+    "download",
+    "annotate",
+    "upload",
+    "manage_data",
+    "manage_users",
+  ],
+  admin: ["browse", "download", "annotate", "upload", "manage_data", "manage_users"],
+  editor: ["browse", "download", "annotate", "upload"],
+  viewer: ["browse"],
+};
+
+export const CAPABILITY_COLUMNS = [
+  { key: "browse", label: "可浏览" },
+  { key: "download", label: "可下载" },
+  { key: "annotate", label: "可标注" },
+  { key: "upload", label: "可上传" },
+  { key: "manage_data", label: "可管理数据" },
+  { key: "manage_users", label: "可管理用户" },
+] as const;
+
+export function isSuperRole(role: Role | string | undefined): boolean {
+  return !!role && SUPER_ROLES.has(role as Role);
+}
+
+export function isSuperManager(role: Role | string | undefined): boolean {
+  return role === "super_manager" || role === "admin";
+}
 
 export const PROCESS_STATUS_LABEL: Record<string, string> = {
   pending: "处理中",

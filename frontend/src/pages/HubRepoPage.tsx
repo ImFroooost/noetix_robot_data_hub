@@ -245,9 +245,9 @@ function groupPackActions(files: RepoFile[]): PackAction[] {
 }
 
 export function HubRepoPage() {
-  const { isAdmin, hasPerm } = useAuth();
-  const canManage = isAdmin || hasPerm("edit");
-  const canCreateTax = isAdmin || hasPerm("edit");
+  const { hasPerm } = useAuth();
+  const canManage = hasPerm("manage_data");
+  const canCreateTax = hasPerm("manage_data");
 
   const [tree, setTree] = useState<Tree>({});
   const [modality, setModality] = useState("");
