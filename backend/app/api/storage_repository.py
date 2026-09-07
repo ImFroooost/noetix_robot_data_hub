@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ from ..services.disk_repository import (
     MODALITIES,
     ONTOLOGIES,
     collect_archive_entries,
-    apply_batch_taxonomy_to_new_units,
+    apply_upload_taxonomy,
     assemble_upload_sessions,
     create_batch,
     create_model_instance,
@@ -31,10 +33,13 @@ from ..services.disk_repository import (
     delete_repo_file,
     delete_units,
     inspect_data_file,
+    normalize_unit_stem,
+    parent_taxonomy_ids,
     probe_data_file,
     read_metadata,
     rebuild_catalog,
     record_upload_session,
+    resolve_import_zip,
     rename_batch,
     rename_unit,
     resolve_repo_file,
@@ -53,6 +58,11 @@ from ..services.disk_repository import (
     update_unit_metadata,
 )
 from ..models.enums import is_super_role
+from ..services.human_zip import (
+    extract_and_group_zip,
+    folder_name_from_zip_filename,
+    human_format_from_filename,
+)
 from ..services.permissions import (
     capability_query_values,
     ensure_capability,
@@ -67,6 +77,7 @@ router = APIRouter(prefix="/storage", tags=["storage-repository"])
 
 class BatchCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=256)
+    taxonomy_tag_ids: dict[str, int | None] | None = None
 
 
 class UnitMetadataIn(BaseModel):
@@ -86,6 +97,7 @@ class RenameIn(BaseModel):
 
 class UploadSessionIn(BaseModel):
     annotation: dict[str, Any] | None = None
+    taxonomy_tag_ids: dict[str, int | None] | None = None
     paths: list[str] | None = None
 
 
@@ -124,6 +136,36 @@ def _parse_annotation_form(raw: str) -> dict[str, Any]:
         for key, value in payload.items()
         if value not in (None, "")
     }
+
+
+def _parse_taxonomy_form(raw: str) -> dict[str, int | None] | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="分类标签无效") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="分类标签须为对象")
+    parsed: dict[str, int | None] = {}
+    for scheme, value in payload.items():
+        if value in (None, ""):
+            continue
+        try:
+            parsed[str(scheme)] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"分类标签 {scheme} 无效"
+            ) from exc
+    return parsed or None
+
+
+def _format_from_upload(filename: str, fallback: str = "") -> str:
+    fmt = human_format_from_filename(filename) or str(fallback or "").strip().lower().lstrip(".")
+    if not fmt:
+        raise HTTPException(status_code=400, detail="无法从文件名判断格式，请填写格式")
+    return fmt
 
 
 def _unit_path(unit: dict[str, Any]) -> str:
@@ -363,22 +405,44 @@ def _unit_for_file(snapshot: dict[str, Any], path: str) -> dict[str, Any] | None
 
 
 def _taxonomy_briefs(db: Session, ids: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    out: dict[str, dict[str, Any]] = {}
-    for scheme, raw_id in (ids or {}).items():
-        try:
-            node_id = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        node = db.get(TaxonomyNode, node_id)
-        if node and str(node.scheme) == scheme:
-            out[scheme] = {
-                "id": node.id,
-                "scheme": scheme,
-                "code": node.code or "",
-                "name": node.name,
-                "path": node.path,
-            }
-    return out
+    return _taxonomy_brief_loader(db, [ids])(ids)
+
+
+def _taxonomy_brief_loader(db: Session, id_maps: list[dict[str, Any] | None]):
+    wanted: set[int] = set()
+    for ids in id_maps:
+        for raw_id in (ids or {}).values():
+            try:
+                wanted.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+    nodes = (
+        {
+            node.id: node
+            for node in db.query(TaxonomyNode).filter(TaxonomyNode.id.in_(wanted)).all()
+        }
+        if wanted
+        else {}
+    )
+
+    def briefs(ids: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for scheme, raw_id in (ids or {}).items():
+            try:
+                node = nodes.get(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+            if node and str(node.scheme) == scheme:
+                out[scheme] = {
+                    "id": node.id,
+                    "scheme": scheme,
+                    "code": node.code or "",
+                    "name": node.name,
+                    "path": node.path,
+                }
+        return out
+
+    return briefs
 
 
 def _validate_taxonomy_ids(db: Session, ids: dict[str, int | None] | None) -> None:
@@ -419,6 +483,21 @@ def _decorate_and_filter(
                 )
                 .all()
             }
+
+    brief_ids = [
+        unit.get("taxonomy_tag_ids") or {}
+        for unit in snapshot.get("units") or []
+    ]
+    brief_ids.extend(
+        item.get("taxonomy_tag_ids") or {}
+        for item in snapshot.get("batches") or []
+    )
+    brief_ids.extend(
+        file.get("taxonomy_tag_ids") or {}
+        for unit in snapshot.get("units") or []
+        for file in unit.get("files") or []
+    )
+    briefs = _taxonomy_brief_loader(db, brief_ids)
 
     units = []
     uploader_options: dict[int, dict[str, Any]] = {}
@@ -469,13 +548,7 @@ def _decorate_and_filter(
                     if file.get("uploader")
                 }.values()
             )
-        unit["taxonomy_tags"] = _taxonomy_briefs(
-            db, unit.get("taxonomy_tag_ids") or {}
-        )
-        for file in unit.get("files", []):
-            file["taxonomy_tags"] = _taxonomy_briefs(
-                db, file.get("taxonomy_tag_ids") or {}
-            )
+        unit["taxonomy_tags"] = briefs(unit.get("taxonomy_tag_ids") or {})
         if batch and unit["batch"] != batch:
             continue
         if q_norm and q_norm not in unit["batch"].lower() and q_norm not in unit["name"].lower():
@@ -508,9 +581,7 @@ def _decorate_and_filter(
         batches.append(
             {
                 **item,
-                "taxonomy_tags": _taxonomy_briefs(
-                    db, item.get("taxonomy_tag_ids") or {}
-                ),
+                "taxonomy_tags": briefs(item.get("taxonomy_tag_ids") or {}),
                 "units": visible_units,
                 "unit_count": len(visible_units),
                 "file_count": sum(u["file_count"] for u in visible_units),
@@ -534,26 +605,63 @@ def _decorate_and_filter(
                 "file_count": unknown_file_count,
             }
         )
+    visible_files = [
+        file
+        for unit in units
+        if unit["key"] in visible_keys
+        for file in unit.get("files", [])
+    ]
     return {
-        **snapshot,
+        "updated_at": snapshot.get("updated_at"),
+        "index_updated_at": snapshot.get("index_updated_at") or snapshot.get("updated_at"),
+        "modalities": snapshot.get("modalities") or [],
+        "ontologies": snapshot.get("ontologies") or [],
         "uploaders": uploaders,
-        "units": units,
         "batches": batches,
-        "files": [
-            file
-            for unit in units
-            if unit["key"] in visible_keys
-            for file in unit.get("files", [])
-        ],
-        "upload_sessions": assemble_upload_sessions(
-            [
-                file
-                for unit in units
-                if unit["key"] in visible_keys
-                for file in unit.get("files", [])
-            ]
+        "units": [],
+        "files": [],
+        "upload_sessions": _attach_session_taxonomy(
+            assemble_upload_sessions(visible_files),
+            units,
+            db,
         ),
     }
+
+
+def _attach_session_taxonomy(
+    sessions: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    db: Session,
+) -> list[dict[str, Any]]:
+    unit_by_key = {item["key"]: item for item in units}
+    out: list[dict[str, Any]] = []
+    for session in sessions:
+        tags = dict(session.get("taxonomy_tag_ids") or {})
+        if not tags:
+            batch = str(session.get("batch") or "")
+            for name in session.get("unit_names") or []:
+                unit = unit_by_key.get(f"{batch}::{name}")
+                if not unit:
+                    unit = next(
+                        (
+                            item
+                            for item in units
+                            if item.get("batch") == batch
+                            and stems_same_unit(str(item.get("name") or ""), str(name))
+                        ),
+                        None,
+                    )
+                if not unit:
+                    continue
+                for scheme, node_id in (unit.get("taxonomy_tag_ids") or {}).items():
+                    tags.setdefault(scheme, node_id)
+        session = {
+            **session,
+            "taxonomy_tag_ids": tags,
+            "taxonomy_tags": _taxonomy_briefs(db, tags),
+        }
+        out.append(session)
+    return out
 
 
 @router.get("/overview")
@@ -619,12 +727,15 @@ def patch_upload_session(
         db, user, Capability.manage_data
     ):
         raise HTTPException(status_code=403, detail="只能修改自己的上传记录")
-    if body.annotation is None:
+    if body.annotation is None and body.taxonomy_tag_ids is None:
         return current
+    if body.taxonomy_tag_ids is not None:
+        _validate_taxonomy_ids(db, body.taxonomy_tag_ids)
     try:
         result = update_upload_session(
             session_id,
             annotation=body.annotation,
+            taxonomy_tag_ids=body.taxonomy_tag_ids,
             paths=body.paths or current.get("paths") or [],
         )
     except ValueError as exc:
@@ -704,7 +815,11 @@ def add_batch(
 ):
     ensure_capability(db, user, Capability.upload, "/")
     result = create_batch(body.name)
-    rebuild_catalog()
+    if body.taxonomy_tag_ids:
+        _validate_taxonomy_ids(db, body.taxonomy_tag_ids)
+        result = update_batch_metadata(
+            body.name, taxonomy_tag_ids=body.taxonomy_tag_ids
+        )
     write_audit(
         db,
         user_id=user.id,
@@ -997,7 +1112,6 @@ def patch_batch(
     result["taxonomy_tags"] = _taxonomy_briefs(
         db, result.get("taxonomy_tag_ids") or {}
     )
-    rebuild_catalog()
     write_audit(
         db,
         user_id=user.id,
@@ -1037,7 +1151,6 @@ def patch_unit(
     result["taxonomy_tags"] = _taxonomy_briefs(
         db, result.get("taxonomy_tag_ids") or {}
     )
-    rebuild_catalog()
     write_audit(
         db,
         user_id=user.id,
@@ -1060,6 +1173,7 @@ async def upload_data(
     replace: bool = Form(False),
     manage_override: bool = Form(False),
     annotation: str = Form(""),
+    taxonomy_tag_ids: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1071,8 +1185,9 @@ async def upload_data(
         _require_unit(db, user, Capability.upload, current)
     else:
         ensure_capability(db, user, Capability.upload, f"/{batch}/{unit_name}/")
+    resolved_fmt = _format_from_upload(file.filename or "", format)
     if replace and current:
-        suffix = Path(file.filename or "").suffix or f".{format.lstrip('.')}"
+        suffix = Path(file.filename or "").suffix or f".{resolved_fmt.lstrip('.')}"
         target_name = f"{unit_name}{suffix}"
         existing = next(
             (
@@ -1081,7 +1196,7 @@ async def upload_data(
                 if item["ontology"] == ontology.strip().lower()
                 and item["modality"] == modality.strip().lower()
                 and item["channel"] == channel.strip().lower()
-                and item["format"] == format.strip().lower().lstrip(".")
+                and item["format"] == resolved_fmt
                 and item["name"] == target_name
             ),
             None,
@@ -1094,10 +1209,10 @@ async def upload_data(
             ontology=ontology.strip().lower(),
             modality=modality.strip().lower(),
             channel=channel.strip().lower(),
-            fmt=format.strip().lower(),
+            fmt=resolved_fmt,
             batch=batch,
             unit_name=unit_name,
-            original_name=file.filename or f"{unit_name}.{format}",
+            original_name=file.filename or f"{unit_name}.{resolved_fmt}",
             replace=replace,
             update_index=False,
         )
@@ -1111,7 +1226,12 @@ async def upload_data(
         parsed_annotation = _parse_annotation_form(annotation)
         update_files_annotation([result["path"]], parsed_annotation)
         create_batch(batch)
-        apply_batch_taxonomy_to_new_units(batch, [unit_name])
+        parsed_tags = _parse_taxonomy_form(taxonomy_tag_ids)
+        if parsed_tags:
+            _validate_taxonomy_ids(db, parsed_tags)
+        apply_upload_taxonomy(
+            batch, [unit_name], parsed_tags, file_paths=[result["path"]]
+        )
         session = record_upload_session(
             user_id=user.id,
             username=user.username,
@@ -1120,8 +1240,9 @@ async def upload_data(
             ontology=ontology.strip().lower(),
             modality=modality.strip().lower(),
             channel=channel.strip().lower(),
-            fmt=format.strip().lower(),
+            fmt=resolved_fmt,
             annotation=parsed_annotation,
+            taxonomy_tag_ids=parsed_tags,
             paths=[result["path"]],
             unit_names=[unit_name],
             uploaded=1,
@@ -1151,6 +1272,7 @@ async def upload_data_folder(
     batch: str = Form(...),
     actions: str = Form("[]"),
     annotation: str = Form(""),
+    taxonomy_tag_ids: str = Form(""),
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1170,7 +1292,7 @@ async def upload_data_folder(
     ontology = ontology.strip().lower()
     modality = modality.strip().lower()
     channel = channel.strip().lower()
-    fmt = format.strip().lower()
+    fallback_fmt = format.strip().lower().lstrip(".")
     snapshot = scan_data()
     current_units = {
         (item["batch"], item["name"]): item for item in snapshot.get("units", [])
@@ -1178,10 +1300,13 @@ async def upload_data_folder(
     results: list[dict[str, Any]] = []
     saved = 0
     saved_paths: list[str] = []
+    formats: list[str] = []
 
     for file, action in zip(files, raw_actions):
         original_name = Path(file.filename or "").name
-        raw_unit_name = Path(original_name).stem
+        raw_unit_name = normalize_unit_stem(Path(original_name).stem) or Path(
+            original_name
+        ).stem
         row: dict[str, Any] = {
             "name": original_name,
             "unit_name": raw_unit_name,
@@ -1191,6 +1316,8 @@ async def upload_data_folder(
             results.append(row)
             continue
         try:
+            file_fmt = _format_from_upload(original_name, fallback_fmt)
+            row["format"] = file_fmt
             current = current_units.get((batch, raw_unit_name))
             if not current:
                 current = next(
@@ -1216,7 +1343,7 @@ async def upload_data_folder(
                         if item["ontology"] == ontology
                         and item["modality"] == modality
                         and item["channel"] == channel
-                        and item["format"] == fmt.lstrip(".")
+                        and item["format"] == file_fmt
                         and item["name"] == original_name
                     ),
                     None,
@@ -1228,10 +1355,10 @@ async def upload_data_folder(
                 ontology=ontology,
                 modality=modality,
                 channel=channel,
-                fmt=fmt,
+                fmt=file_fmt,
                 batch=batch,
                 unit_name=raw_unit_name,
-                original_name=original_name or f"{raw_unit_name}.{fmt}",
+                original_name=original_name or f"{raw_unit_name}.{file_fmt}",
                 replace=action == "replace",
                 update_index=False,
             )
@@ -1242,6 +1369,7 @@ async def upload_data_folder(
             row.update({"status": "replaced" if action == "replace" else "uploaded", "file": result})
             saved += 1
             saved_paths.append(result["path"])
+            formats.append(file_fmt)
         except (ValueError, HTTPException) as exc:
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
             row.update({"status": "failed", "detail": detail})
@@ -1262,7 +1390,10 @@ async def upload_data_folder(
             for item in results
             if item.get("status") in {"uploaded", "replaced"}
         ]
-        apply_batch_taxonomy_to_new_units(batch, unit_names)
+        parsed_tags = _parse_taxonomy_form(taxonomy_tag_ids)
+        if parsed_tags:
+            _validate_taxonomy_ids(db, parsed_tags)
+        apply_upload_taxonomy(batch, unit_names, parsed_tags, file_paths=saved_paths)
         session = record_upload_session(
             user_id=user.id,
             username=user.username,
@@ -1271,8 +1402,9 @@ async def upload_data_folder(
             ontology=ontology,
             modality=modality,
             channel=channel,
-            fmt=fmt,
+            fmt=",".join(dict.fromkeys(formats)),
             annotation=parsed_annotation,
+            taxonomy_tag_ids=parsed_tags,
             paths=saved_paths,
             unit_names=unit_names,
             uploaded=sum(item["status"] == "uploaded" for item in results),
@@ -1304,6 +1436,218 @@ async def upload_data_folder(
     return summary
 
 
+@router.post("/data/upload-zip")
+async def upload_data_zip(
+    ontology: str = Form(...),
+    modality: str = Form(...),
+    channel: str = Form(""),
+    batch: str = Form(""),
+    replace: bool = Form(False),
+    manage_override: bool = Form(False),
+    annotation: str = Form(""),
+    taxonomy_tag_ids: str = Form(""),
+    local_path: str = Form(""),
+    file: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Import a motion zip (bvh/csv/fbx/tak in one archive) as one storage batch."""
+    if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
+        raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
+    filename = file.filename if file and file.filename else Path(local_path).name
+    if not str(filename).lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="请上传 .zip 文件")
+    batch = (batch or "").strip() or folder_name_from_zip_filename(filename)
+    ontology = ontology.strip().lower()
+    modality = modality.strip().lower()
+    channel = channel.strip().lower()
+    parsed_annotation = _parse_annotation_form(annotation)
+    ensure_capability(db, user, Capability.upload, f"/{batch}/")
+
+    staging = Path(
+        tempfile.mkdtemp(prefix="storage_zip_", dir=Path("/tmp"))
+    )
+    zip_path = staging / "upload.zip"
+    work_dir = staging / "extracted"
+    try:
+        if local_path.strip():
+            try:
+                source = resolve_import_zip(local_path.strip())
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            shutil.copy2(source, zip_path)
+        elif file is not None:
+            with zip_path.open("wb") as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        else:
+            raise HTTPException(status_code=400, detail="请选择 zip 或填写服务器路径")
+
+        try:
+            groups, warnings = extract_and_group_zip(zip_path, work_dir)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"无法解压 ZIP：{exc}") from exc
+        if not groups:
+            raise HTTPException(
+                status_code=400,
+                detail="ZIP 中未找到可导入文件（按后缀识别格式，未知后缀会作为新格式入库）",
+            )
+
+        snapshot = scan_data()
+        current_units = {
+            (item["batch"], item["name"]): item for item in snapshot.get("units", [])
+        }
+        results: list[dict[str, Any]] = []
+        saved_paths: list[str] = []
+        formats: list[str] = []
+
+        for group in groups:
+            raw_unit_name = normalize_unit_stem(group.display_stem) or group.display_stem
+            current = current_units.get((batch, raw_unit_name))
+            if not current:
+                current = next(
+                    (
+                        item
+                        for item in snapshot.get("units", [])
+                        if item["batch"] == batch
+                        and stems_same_unit(item["name"], raw_unit_name)
+                    ),
+                    None,
+                )
+            if current:
+                _require_unit(db, user, Capability.upload, current)
+            else:
+                ensure_capability(db, user, Capability.upload, f"/{batch}/{raw_unit_name}/")
+
+            for fmt, path in sorted(group.files.items()):
+                original_name = path.name
+                row: dict[str, Any] = {
+                    "name": original_name,
+                    "unit_name": raw_unit_name,
+                    "status": "upload",
+                }
+                existing = None
+                if current:
+                    existing = next(
+                        (
+                            item
+                            for item in current.get("files", [])
+                            if item["ontology"] == ontology
+                            and item["modality"] == modality
+                            and item["channel"] == channel
+                            and item["format"] == str(fmt).lstrip(".")
+                            and (
+                                item["name"] == original_name
+                                or Path(item["name"]).stem == raw_unit_name
+                            )
+                        ),
+                        None,
+                    )
+                if existing and not replace:
+                    row["status"] = "skip"
+                    results.append(row)
+                    continue
+                if existing and not manage_override:
+                    try:
+                        _require_file_owner(user, existing)
+                    except HTTPException as exc:
+                        row.update({"status": "failed", "detail": exc.detail})
+                        results.append(row)
+                        continue
+                try:
+                    with path.open("rb") as handle:
+                        result = save_data_file(
+                            handle,
+                            ontology=ontology,
+                            modality=modality,
+                            channel=channel,
+                            fmt=str(fmt).lstrip("."),
+                            batch=batch,
+                            unit_name=raw_unit_name,
+                            original_name=original_name,
+                            replace=bool(existing and replace),
+                            update_index=False,
+                        )
+                    result["uploader"] = {"id": user.id, "username": user.username}
+                    row.update(
+                        {
+                            "status": "replaced" if existing and replace else "uploaded",
+                            "file": result,
+                        }
+                    )
+                    saved_paths.append(result["path"])
+                    formats.append(str(fmt).lstrip("."))
+                except (ValueError, OSError) as exc:
+                    row.update({"status": "failed", "detail": str(exc)})
+                results.append(row)
+
+        session = None
+        if saved_paths:
+            set_file_uploaders(saved_paths, user_id=user.id, username=user.username)
+            csv_paths = [path for path in saved_paths if path.lower().endswith(".csv")]
+            if parsed_annotation:
+                update_files_annotation(
+                    csv_paths if "fps" in parsed_annotation and csv_paths else saved_paths,
+                    parsed_annotation,
+                )
+            create_batch(batch)
+            unit_names = [
+                str(item.get("unit_name") or "")
+                for item in results
+                if item.get("status") in {"uploaded", "replaced"}
+            ]
+            parsed_tags = _parse_taxonomy_form(taxonomy_tag_ids)
+            if parsed_tags:
+                _validate_taxonomy_ids(db, parsed_tags)
+            apply_upload_taxonomy(
+                batch, unit_names, parsed_tags, file_paths=saved_paths
+            )
+            unique_formats = list(dict.fromkeys(formats))
+            session = record_upload_session(
+                user_id=user.id,
+                username=user.username,
+                source="zip",
+                batch=batch,
+                ontology=ontology,
+                modality=modality,
+                channel=channel,
+                fmt=",".join(unique_formats),
+                annotation=parsed_annotation,
+                taxonomy_tag_ids=parsed_tags,
+                paths=saved_paths,
+                unit_names=unit_names,
+                uploaded=sum(item["status"] == "uploaded" for item in results),
+                replaced=sum(item["status"] == "replaced" for item in results),
+            )
+            rebuild_catalog()
+
+        summary = {
+            "batch": batch,
+            "total": len(results),
+            "uploaded": sum(item["status"] == "uploaded" for item in results),
+            "replaced": sum(item["status"] == "replaced" for item in results),
+            "skipped": sum(item["status"] == "skip" for item in results),
+            "failed": sum(item["status"] == "failed" for item in results),
+            "items": results,
+            "warnings": warnings,
+            "upload_session_id": session["id"] if session else None,
+        }
+        write_audit(
+            db,
+            user_id=user.id,
+            action="upload_zip",
+            entity_type="storage_batch",
+            detail={key: value for key, value in summary.items() if key != "items"},
+        )
+        db.commit()
+        return summary
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 @router.get("/file-detail")
 def file_detail(
     path: str = Query(...),
@@ -1322,10 +1666,13 @@ def file_detail(
     key = unit_key(record["batch"], record["unit_name"])
     unit_meta = dict((metadata.get("units") or {}).get(key) or {})
     batch_meta = dict((metadata.get("batches") or {}).get(record["batch"]) or {})
+    batch_tag_ids, unit_tag_ids = parent_taxonomy_ids(
+        record["batch"], record["unit_name"], metadata
+    )
     unit = {
         "batch": record["batch"],
         "name": record["unit_name"],
-        "taxonomy_tag_ids": unit_meta.get("taxonomy_tag_ids") or {},
+        "taxonomy_tag_ids": unit_tag_ids or unit_meta.get("taxonomy_tag_ids") or {},
         "annotation": unit_meta.get("annotation") or {},
     }
     _require_unit(db, user, Capability.browse, unit)
@@ -1338,10 +1685,10 @@ def file_detail(
         "unit_taxonomy_tag_ids": unit["taxonomy_tag_ids"],
         "unit_taxonomy_tags": _taxonomy_briefs(db, unit["taxonomy_tag_ids"]),
         "unit_annotation": unit["annotation"],
-        "batch_taxonomy_tag_ids": batch_meta.get("taxonomy_tag_ids") or {},
-        "batch_taxonomy_tags": _taxonomy_briefs(
-            db, batch_meta.get("taxonomy_tag_ids") or {}
-        ),
+        "batch_taxonomy_tag_ids": batch_tag_ids
+        or batch_meta.get("taxonomy_tag_ids")
+        or {},
+        "batch_taxonomy_tags": _taxonomy_briefs(db, batch_tag_ids or {}),
         "batch_annotation": batch_meta.get("annotation") or {},
     }
 

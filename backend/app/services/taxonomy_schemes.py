@@ -203,8 +203,18 @@ def ensure_default_custom_schemes(db: Session) -> None:
                 if children:
                     _ensure(node, children)
 
-        tree = DEFAULT_CUSTOM_TREES.get(key) or {}
-        _ensure(root, tree)
+        child_count = (
+            db.query(TaxonomyNode)
+            .filter(
+                TaxonomyNode.scheme == key,
+                TaxonomyNode.parent_id.isnot(None),
+            )
+            .count()
+        )
+        # 只在该标准还没有任何子节点时种默认树；用户删掉的节点不要刷新后又长回来
+        if child_count == 0:
+            tree = DEFAULT_CUSTOM_TREES.get(key) or {}
+            _ensure(root, tree)
     db.flush()
 
 

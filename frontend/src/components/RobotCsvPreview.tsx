@@ -11,6 +11,7 @@ import {
   robotDescriptionVersions,
 } from "./RobotStyleFields";
 import type { ModelInstance, StorageFile } from "../types";
+import { parseCsvFps } from "../types";
 
 const ROOT_COLS = 7;
 const FLOATING_JOINT = /floor_2_base|floating_base|floatingbase|root_joint|base_joint|world_to_/i;
@@ -154,7 +155,7 @@ function RobotCsvScene({
 
         const model = loader.parse(urdfText);
         applyFrame(model, parsed.frames[0], jointNames);
-        const fps = parsed.fps || fpsHint || 30;
+        const fps = fpsHint || parsed.fps || 30;
         const duration =
           durationHint && durationHint > 0
             ? durationHint
@@ -229,7 +230,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
   const [instances, setInstances] = useState<ModelInstance[]>([]);
   const [modelsError, setModelsError] = useState("");
   const [time, setTime] = useState(0);
-  const [playing, setPlaying] = useState(false);
+  const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [note, setNote] = useState("");
@@ -264,7 +265,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
 
   useEffect(() => {
     setTime(0);
-    setPlaying(false);
+    setPlaying(true);
     setMediaDuration(0);
     setNote("");
   }, [file.path, style, version]);
@@ -318,12 +319,12 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
             <directionalLight position={[3, 5, 2]} intensity={1.15} />
             <Grid args={[10, 10]} cellColor="#334" sectionColor="#556" fadeDistance={20} />
             <RobotCsvScene
-              key={`${file.path}:${urdfFile.path}`}
+              key={`${file.path}:${urdfFile.path}:${parseCsvFps(file.annotation?.fps ?? file.fps)}`}
               csvUrl={api.storageFileUrl(file.path)}
               urdfPath={urdfFile.path}
               packageRoot={packageRoot}
-              fpsHint={file.fps}
-              durationHint={file.duration_sec}
+              fpsHint={parseCsvFps(file.annotation?.fps ?? file.fps)}
+              durationHint={null}
               time={time}
               onReady={handleReady}
               onError={() => undefined}

@@ -34,6 +34,7 @@ from ..services.taxonomy_schemes import (
     scheme_key_from_name,
     unique_scheme_key,
 )
+from ..services.taxonomy_seed import ROOTS, restore_builtin_scheme_tree
 
 router = APIRouter(prefix="/taxonomies", tags=["taxonomies"])
 
@@ -458,6 +459,31 @@ def update_scheme(
     db.commit()
     db.refresh(row)
     return _scheme_out(db, row)
+
+
+@router.post("/schemes/{key}/restore")
+def restore_scheme_tree(
+    key: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_manage_data),
+):
+    _require_registered_scheme(db, key)
+    if key not in ROOTS:
+        raise HTTPException(status_code=400, detail="只有内置分类标准可以恢复标准结构")
+    try:
+        result = restore_builtin_scheme_tree(db, key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_audit(
+        db,
+        user_id=admin.id,
+        action="restore",
+        entity_type="taxonomy_scheme",
+        entity_id=None,
+        detail=result,
+    )
+    db.commit()
+    return result
 
 
 @router.put("/schemes/reorder", response_model=list[TaxonomySchemeOut])

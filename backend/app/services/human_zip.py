@@ -22,11 +22,12 @@ def folder_name_from_zip_filename(filename: str | None) -> str:
 HUMAN_EXTS = frozenset(
     {"bvh", "csv", "fbx", "tak", "smpl", "npz", "npy", "pkl", "txt", "ser.pkl"}
 )
+_SKIP_EXTS = frozenset({"", "zip", "ds_store"})
 
-# BVH exports often append _Skeleton while CSV/FBX/TAK share the same base name.
+# BVH exports often append _Skeleton0 / .bvh_Skeleton0 / " Skeleton 001".
 _STRIP_SUFFIXES = (
-    re.compile(r"_Skeleton$", re.I),
-    re.compile(r"_skeleton$", re.I),
+    re.compile(r"(?:\.[A-Za-z0-9]{1,8})?[\s_]+Skeleton(?:[\s._-]?\d+)?$", re.I),
+    re.compile(r"[\s_]*Skeleton(?:\s+\d+)?$", re.I),
 )
 
 _IGNORE_NAMES = re.compile(r"^(?:\.DS_Store|Thumbs\.db|desktop\.ini)$", re.I)
@@ -54,7 +55,7 @@ def infer_human_format(ext: str) -> str:
         return "smpl"
     if e in ("ser.pkl", "ser_pkl"):
         return "ser.pkl"
-    return e or "bvh"
+    return e
 
 
 def human_format_from_filename(filename: str) -> str:
@@ -63,6 +64,13 @@ def human_format_from_filename(filename: str) -> str:
     if name.endswith(".ser.pkl"):
         return "ser.pkl"
     return infer_human_format(Path(filename).suffix)
+
+
+def is_importable_filename(filename: str) -> bool:
+    if _is_ignored(Path(filename)):
+        return False
+    fmt = human_format_from_filename(filename)
+    return bool(fmt) and fmt not in _SKIP_EXTS
 
 
 def _is_ignored(path: Path) -> bool:
@@ -84,7 +92,7 @@ def group_human_files(paths: list[Path]) -> tuple[list[GroupedMotion], list[str]
             ext = "ser.pkl"
         else:
             ext = path.suffix.lower().lstrip(".")
-        if ext not in HUMAN_EXTS:
+        if not is_importable_filename(path.name):
             continue
         key = normalize_motion_stem(path.name).lower()
         if not key:
@@ -123,8 +131,7 @@ def iter_zip_human_members(zf: zipfile.ZipFile) -> list[str]:
         base = Path(name).name
         if _is_ignored(Path(base)):
             continue
-        ext = Path(base).suffix.lower().lstrip(".")
-        if ext in HUMAN_EXTS:
+        if is_importable_filename(base):
             out.append(name)
     return out
 
@@ -156,7 +163,7 @@ def extract_and_group_zip(zip_path: Path, work_dir: Path) -> tuple[list[GroupedM
     with zipfile.ZipFile(zip_path) as zf:
         members = iter_zip_human_members(zf)
         if not members:
-            return [], ["ZIP 中未找到人体数据文件（bvh/csv/fbx/tak 等）"]
+            return [], ["ZIP 中未找到可导入文件（按后缀识别格式，如 bvh/csv/fbx/tak 或新后缀）"]
         for member in members:
             try:
                 extracted.append(safe_extract_member(zf, member, work_dir))

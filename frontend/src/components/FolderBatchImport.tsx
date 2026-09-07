@@ -1,15 +1,27 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
+import { fetchStorageOverview, invalidateStorageOverview } from "../storageOverviewCache";
 import { RobotStyleFields } from "./RobotStyleFields";
+import { TaxonomySelect } from "./TaxonomyTree";
 import type {
   ModelInstance,
   StorageFolderUploadResult,
   StorageOverview,
+  TaxonomyNode,
+  TaxonomySchemeDef,
+} from "../types";
+import {
+  compactTaxonomyTagIds,
+  needsManualCsvFps,
+  parseCsvFps,
+  taxonomySchemeLabel,
 } from "../types";
 import {
   filesFromDataTransfer,
   filesFromFileList,
+  folderNameFromZip,
+  formatFromFileName,
   guessFolderName,
   type RelFile,
 } from "../utils/folderUpload";
@@ -26,6 +38,24 @@ const MODALITIES = [
 type FolderAction = "upload" | "replace" | "skip";
 type BatchChoice = "new" | "existing" | "";
 
+type ZipImportDraft = {
+  file: File | null;
+  localPath: string;
+  folderName: string;
+  batchChoice: BatchChoice;
+  batchName: string;
+  ontology: string;
+  modality: string;
+  channel: string;
+  robotStyle: string;
+  robotVersion: string;
+  personName: string;
+  gender: string;
+  height: string;
+  fps: string;
+  replace: boolean;
+};
+
 type FolderImportDraft = {
   files: RelFile[];
   folderName: string;
@@ -40,22 +70,34 @@ type FolderImportDraft = {
   personName: string;
   gender: string;
   height: string;
+  fps: string;
   actions: Record<string, FolderAction>;
 };
 
 const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 
+function normalizeUnitStem(name: string) {
+  const cleaned = name.replace(
+    /(?:\.[A-Za-z0-9]{1,8})?[\s_]+Skeleton(?:[\s._-]?\d+)?$/i,
+    ""
+  ).replace(/[ .\t_]+$/, "");
+  return cleaned || name;
+}
+
 function fileUnitName(file: RelFile) {
-  return file.file.name.replace(/\.[^.]+$/, "") || file.file.name;
+  const stem = file.file.name.replace(/\.[^.]+$/, "") || file.file.name;
+  return normalizeUnitStem(stem);
 }
 
 function stemsSameUnit(left: string, right: string) {
-  if (left === right) return true;
-  const [short, long] = left.length <= right.length ? [left, right] : [right, left];
+  const a = normalizeUnitStem(left);
+  const b = normalizeUnitStem(right);
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
   if (!long.startsWith(short)) return false;
   const extra = long.slice(short.length);
-  if (!extra || !/^[-_]/.test(extra) || extra.length > 32) return false;
-  const segs = extra.split(/[-_]+/).filter(Boolean);
+  if (!extra || !/^[-_.]/.test(extra) || extra.length > 32) return false;
+  const segs = extra.split(/[-_.]+/).filter(Boolean);
   return segs.length >= 1 && segs.length <= 3;
 }
 
@@ -70,8 +112,68 @@ function matchExistingUnit<T extends { name: string }>(
 }
 
 function fileExtension(file: RelFile) {
-  const match = file.file.name.match(/\.([^.]+)$/);
-  return match?.[1]?.toLowerCase() || "";
+  return formatFromFileName(file.file.name);
+}
+
+export function UploadTaxonomyFields({
+  schemes,
+  nodes,
+  value,
+  onChange,
+  canCreate,
+  onNodesReload,
+  disabled,
+}: {
+  schemes: TaxonomySchemeDef[];
+  nodes: TaxonomyNode[];
+  value: Record<string, number | "">;
+  onChange: (next: Record<string, number | "">) => void;
+  canCreate?: boolean;
+  onNodesReload?: () => Promise<void> | void;
+  disabled?: boolean;
+}) {
+  if (!schemes.length) {
+    return <div className="muted">分类标准加载中…</div>;
+  }
+  const selected = schemes
+    .map((scheme) => {
+      const id = value[scheme.key];
+      const node = typeof id === "number" ? nodes.find((item) => item.id === id) : null;
+      return node
+        ? `${taxonomySchemeLabel(scheme.key, schemes)}：${node.path}`
+        : null;
+    })
+    .filter(Boolean);
+  return (
+    <section className="storage-upload-taxonomy">
+      {selected.length ? (
+        <div className="storage-upload-taxonomy-picks">
+          {selected.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      ) : (
+        <span className="muted">尚未选择分类标签</span>
+      )}
+      {schemes.map((scheme) => (
+        <div className="storage-upload-taxonomy-row" key={scheme.key}>
+          <span title={taxonomySchemeLabel(scheme.key, schemes)}>
+            {taxonomySchemeLabel(scheme.key, schemes)}
+          </span>
+          <TaxonomySelect
+            scheme={scheme.key}
+            compact
+            nodes={nodes.filter((node) => node.scheme === scheme.key)}
+            value={value[scheme.key] ?? ""}
+            canCreate={canCreate}
+            onNodesReload={onNodesReload}
+            disabled={disabled}
+            onChange={(id) => onChange({ ...value, [scheme.key]: id })}
+          />
+        </div>
+      ))}
+    </section>
+  );
 }
 
 function usableFolderFiles(files: RelFile[]) {
@@ -82,24 +184,44 @@ function usableFolderFiles(files: RelFile[]) {
 }
 
 export function FolderBatchImport({
+  schemes,
+  nodes,
+  canCreateTaxonomy,
+  onNodesReload,
+  taxonomyTagIds,
+  onTaxonomyTagIdsChange,
+  showInlinePreset = false,
   onImported,
   onError,
   onMessage,
 }: {
+  schemes: TaxonomySchemeDef[];
+  nodes: TaxonomyNode[];
+  canCreateTaxonomy?: boolean;
+  onNodesReload?: () => Promise<void> | void;
+  taxonomyTagIds: Record<string, number | "">;
+  onTaxonomyTagIdsChange: (next: Record<string, number | "">) => void;
+  showInlinePreset?: boolean;
   onImported: (batchName: string, sessionId?: string) => void;
   onError: (message: string) => void;
   onMessage: (message: string) => void;
 }) {
   const [overview, setOverview] = useState<StorageOverview | null>(null);
   const [folderDraft, setFolderDraft] = useState<FolderImportDraft | null>(null);
+  const [zipDraft, setZipDraft] = useState<ZipImportDraft | null>(null);
   const [folderResult, setFolderResult] = useState<StorageFolderUploadResult | null>(null);
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderError, setFolderError] = useState("");
+  const [localZipPath, setLocalZipPath] = useState("");
   const [draggingFolder, setDraggingFolder] = useState(false);
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const zipInputRef = useRef<HTMLInputElement>(null);
+  const taxonomyPayload = compactTaxonomyTagIds(taxonomyTagIds);
 
-  const needRobotStyles = !!folderDraft && folderDraft.ontology === "robot";
+  const needRobotStyles =
+    (!!folderDraft && folderDraft.ontology === "robot") ||
+    (!!zipDraft && zipDraft.ontology === "robot");
 
   useEffect(() => {
     if (!needRobotStyles) return;
@@ -126,6 +248,36 @@ export function FolderBatchImport({
     return `${base}_${index}`;
   };
 
+  const openZipImport = async (file: File | null, localPath = "") => {
+    const folderName = folderNameFromZip(file?.name || localPath);
+    if (!folderName) {
+      onError("请选择 zip 或填写服务器路径");
+      return;
+    }
+    const storage = await fetchStorageOverview();
+    setOverview(storage);
+    const batchExists = storage.batches.some((item) => item.name === folderName);
+    setFolderResult(null);
+    setFolderError("");
+    setZipDraft({
+      file,
+      localPath,
+      folderName,
+      batchChoice: batchExists ? "" : "new",
+      batchName: batchExists ? nextAvailableBatchName(folderName, storage.batches) : folderName,
+      ontology: "human",
+      modality: "motion",
+      channel: "rgb",
+      robotStyle: "",
+      robotVersion: "",
+      personName: "",
+      gender: "",
+      height: "",
+      fps: "30",
+      replace: false,
+    });
+  };
+
   const openFolderImport = async (rawFiles: RelFile[]) => {
     const roots = new Set(
       rawFiles
@@ -141,7 +293,7 @@ export function FolderBatchImport({
       onError("文件夹为空，或仅包含隐藏文件和空文件");
       return;
     }
-    const storage = await api.storageOverview();
+    const storage = await fetchStorageOverview();
     setOverview(storage);
     const folderName = guessFolderName(rawFiles);
     const batchExists = storage.batches.some((item) => item.name === folderName);
@@ -158,12 +310,13 @@ export function FolderBatchImport({
       ontology: "human",
       modality: "motion",
       channel: "rgb",
-      format: extensions.length === 1 ? extensions[0] : "csv",
+      format: "",
       robotStyle: "",
       robotVersion: "",
       personName: "",
       gender: "",
       height: "",
+      fps: "30",
       actions: {},
     });
   };
@@ -172,8 +325,11 @@ export function FolderBatchImport({
     const name = prompt("新数据批次名称：");
     if (!name?.trim()) return;
     try {
-      await api.storageCreateBatch(name.trim());
+      await api.storageCreateBatch(name.trim(), {
+        taxonomy_tag_ids: taxonomyPayload,
+      });
       onMessage(`已创建批次 ${name.trim()}`);
+      invalidateStorageOverview();
       onImported(name.trim());
     } catch (e) {
       onError(e instanceof Error ? e.message : "创建失败");
@@ -184,9 +340,85 @@ export function FolderBatchImport({
     event.preventDefault();
     setDraggingFolder(false);
     try {
+      const dropped = Array.from(event.dataTransfer.files || []);
+      const zips = dropped.filter((item) => /\.zip$/i.test(item.name));
+      if (zips.length === 1 && dropped.length === 1) {
+        await openZipImport(zips[0]);
+        return;
+      }
       await openFolderImport(await filesFromDataTransfer(event.dataTransfer));
     } catch (e) {
-      onError(e instanceof Error ? e.message : "无法读取拖入的文件夹");
+      onError(e instanceof Error ? e.message : "无法读取拖入的文件夹或 zip");
+    }
+  };
+
+  const updateZipDraft = (patch: Partial<ZipImportDraft>) => {
+    setZipDraft((current) => (current ? { ...current, ...patch } : current));
+  };
+
+  const submitZipImport = async () => {
+    if (!zipDraft) return;
+    const targetBatch =
+      zipDraft.batchChoice === "existing"
+        ? zipDraft.folderName
+        : zipDraft.batchName.trim();
+    if (!zipDraft.batchChoice) {
+      setFolderError("请选择修改名称创建新批次，或添加至现有批次");
+      return;
+    }
+    if (!targetBatch) {
+      setFolderError("批次名称不能为空");
+      return;
+    }
+    setFolderBusy(true);
+    setFolderError("");
+    setFolderResult(null);
+    try {
+      const form = new FormData();
+      form.set("ontology", zipDraft.ontology);
+      form.set("modality", zipDraft.modality);
+      form.set("channel", zipDraft.modality === "fpv_video" ? zipDraft.channel : "");
+      form.set("batch", targetBatch);
+      form.set("replace", String(zipDraft.replace));
+      form.set(
+        "annotation",
+        JSON.stringify({
+          ...(zipDraft.ontology === "robot"
+            ? {
+                robot_style: zipDraft.robotStyle,
+                robot_version: zipDraft.robotVersion,
+              }
+            : {
+                person_name: zipDraft.personName.trim(),
+                gender: zipDraft.gender,
+                height: zipDraft.height.trim(),
+              }),
+          ...(zipDraft.ontology === "robot" ? { fps: parseCsvFps(zipDraft.fps) } : {}),
+        })
+      );
+      form.set("taxonomy_tag_ids", JSON.stringify(taxonomyPayload));
+      if (zipDraft.localPath.trim()) {
+        form.set("local_path", zipDraft.localPath.trim());
+      } else if (zipDraft.file) {
+        form.set("file", zipDraft.file);
+      } else {
+        setFolderError("请选择 zip 或填写服务器路径");
+        setFolderBusy(false);
+        return;
+      }
+      const result = await api.storageUploadZip(form);
+      setFolderResult(result);
+      invalidateStorageOverview();
+      onImported(targetBatch, result.upload_session_id || undefined);
+      if (!result.failed) {
+        onMessage(
+          `Zip 导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
+        );
+      }
+    } catch (e) {
+      setFolderError(e instanceof Error ? e.message : "Zip 导入失败");
+    } finally {
+      setFolderBusy(false);
     }
   };
 
@@ -212,7 +444,7 @@ export function FolderBatchImport({
             item.modality === folderDraft.modality &&
             item.channel ===
               (folderDraft.modality === "fpv_video" ? folderDraft.channel : "") &&
-            item.format === folderDraft.format &&
+            item.format === (fileExtension(relFile) || folderDraft.format) &&
             item.name === relFile.file.name
         );
       const defaultAction: FolderAction = duplicate || existingConflict ? "skip" : "upload";
@@ -250,8 +482,8 @@ export function FolderBatchImport({
       setFolderError("请选择修改名称创建新批次，或添加至现有批次");
       return;
     }
-    if (!targetBatch || !folderDraft.format.trim()) {
-      setFolderError("批次名称和格式不能为空");
+    if (!targetBatch) {
+      setFolderError("批次名称不能为空");
       return;
     }
 
@@ -271,8 +503,8 @@ export function FolderBatchImport({
       form.set("actions", JSON.stringify(folderRows.map((row) => row.action)));
       form.set(
         "annotation",
-        JSON.stringify(
-          folderDraft.ontology === "robot"
+        JSON.stringify({
+          ...(folderDraft.ontology === "robot"
             ? {
                 robot_style: folderDraft.robotStyle,
                 robot_version: folderDraft.robotVersion,
@@ -281,14 +513,22 @@ export function FolderBatchImport({
                 person_name: folderDraft.personName.trim(),
                 gender: folderDraft.gender,
                 height: folderDraft.height.trim(),
-              }
-        )
+              }),
+          ...(needsManualCsvFps(
+            folderDraft.ontology,
+            folderDraft.format || (folderExtensions.includes("csv") ? "csv" : "")
+          )
+            ? { fps: parseCsvFps(folderDraft.fps) }
+            : {}),
+        })
       );
+      form.set("taxonomy_tag_ids", JSON.stringify(taxonomyPayload));
       folderRows.forEach((row) =>
         form.append("files", row.relFile.file, row.relFile.file.name)
       );
       const result = await api.storageUploadFolder(form);
       setFolderResult(result);
+      invalidateStorageOverview();
       onImported(targetBatch, result.upload_session_id || undefined);
       if (!result.failed) {
         onMessage(
@@ -302,8 +542,31 @@ export function FolderBatchImport({
     }
   };
 
+  const taxonomyEditor = (disabled?: boolean) => (
+    <UploadTaxonomyFields
+      schemes={schemes}
+      nodes={nodes}
+      value={taxonomyTagIds}
+      onChange={onTaxonomyTagIdsChange}
+      canCreate={canCreateTaxonomy}
+      onNodesReload={onNodesReload}
+      disabled={disabled}
+    />
+  );
+
   return (
     <>
+      {showInlinePreset && (
+        <section className="storage-upload-preset card-soft">
+          <div>
+            <strong>预设分类标签</strong>
+            <p className="muted" style={{ margin: "2px 0 0", fontSize: "0.78rem" }}>
+              先选标签再拖入；弹窗和导入后都还能改。
+            </p>
+          </div>
+          {taxonomyEditor()}
+        </section>
+      )}
       <div
         className={`storage-batch-drop ${draggingFolder ? "dragging" : ""}`}
         onDragEnter={(event) => {
@@ -326,14 +589,40 @@ export function FolderBatchImport({
           <strong>＋ 新建批次</strong>
           <span>点击创建空批次</span>
         </button>
-        <div className="storage-batch-drop-hint">或将文件夹拖到这里批量导入</div>
-        <button
-          type="button"
-          className="storage-batch-folder-pick secondary"
-          onClick={() => folderInputRef.current?.click()}
-        >
-          选择文件夹
-        </button>
+        <div className="storage-batch-drop-hint">
+          或将文件夹 / zip 拖到这里批量导入（如 260902.zip）
+        </div>
+        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="storage-batch-folder-pick secondary"
+            onClick={() => folderInputRef.current?.click()}
+          >
+            选择文件夹
+          </button>
+          <button
+            type="button"
+            className="storage-batch-folder-pick secondary"
+            onClick={() => zipInputRef.current?.click()}
+          >
+            选择 zip
+          </button>
+        </div>
+        <div className="row" style={{ gap: 8, flexWrap: "wrap", width: "100%" }}>
+          <input
+            value={localZipPath}
+            placeholder="/home/noetix/Downloads/260902.zip"
+            onChange={(event) => setLocalZipPath(event.target.value)}
+            style={{ flex: "1 1 240px" }}
+          />
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void openZipImport(null, localZipPath.trim())}
+          >
+            从服务器路径导入
+          </button>
+        </div>
         <input
           ref={folderInputRef}
           type="file"
@@ -342,6 +631,17 @@ export function FolderBatchImport({
           {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
           onChange={(event) => {
             void openFolderImport(filesFromFileList(event.target.files));
+            event.target.value = "";
+          }}
+        />
+        <input
+          ref={zipInputRef}
+          type="file"
+          accept=".zip,application/zip"
+          hidden
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void openZipImport(file);
             event.target.value = "";
           }}
         />
@@ -492,7 +792,7 @@ export function FolderBatchImport({
                 </label>
               )}
               <label>
-                格式
+                格式（可选覆盖）
                 <input
                   value={folderDraft.format}
                   onChange={(event) =>
@@ -501,9 +801,28 @@ export function FolderBatchImport({
                       actions: {},
                     })
                   }
-                  placeholder="csv / mp4 / json…"
+                  placeholder="留空则按每个文件的后缀入库"
                 />
               </label>
+              {needsManualCsvFps(
+                folderDraft.ontology,
+                folderDraft.format || (folderExtensions.includes("csv") ? "csv" : "")
+              ) && (
+                <label>
+                  帧率（Hz，机器人 CSV）
+                  <input
+                    type="number"
+                    min="1"
+                    max="10000"
+                    step="0.1"
+                    value={folderDraft.fps}
+                    placeholder="默认 30"
+                    onChange={(event) =>
+                      updateFolderDraft({ fps: event.target.value })
+                    }
+                  />
+                </label>
+              )}
               {folderDraft.ontology === "robot" && (
                 <RobotStyleFields
                   instances={robotInstances}
@@ -556,10 +875,18 @@ export function FolderBatchImport({
                 </>
               )}
             </div>
-            {folderExtensions.length > 1 && (
+            <div className="storage-upload-taxonomy-block">
+              <strong>分类标签</strong>
+              <p className="muted" style={{ margin: "4px 0 8px" }}>
+                沿用上方预设，导入前仍可修改
+              </p>
+              {taxonomyEditor(folderBusy)}
+            </div>
+            {folderExtensions.length > 0 && (
               <div className="storage-folder-format-warning">
-                检测到多种扩展名：{folderExtensions.join("、")}。这些文件将统一按“
-                {folderDraft.format || "未填写"}”格式归档。
+                {folderDraft.format.trim()
+                  ? `无后缀的文件将按“${folderDraft.format.trim()}”归档；有后缀的文件仍按各自后缀入库（${folderExtensions.join("、")}）。`
+                  : `将按文件后缀分别入库：${folderExtensions.join("、")}。遇到尚未出现过的后缀会自动作为新格式。`}
               </div>
             )}
 
@@ -663,6 +990,202 @@ export function FolderBatchImport({
         </div>,
         document.body
       )}
+
+      {zipDraft &&
+        createPortal(
+          <div
+            className="storage-modal-backdrop"
+            onClick={() => {
+              if (!folderBusy) setZipDraft(null);
+            }}
+          >
+            <div
+              className={`storage-modal storage-folder-import-modal card stack ${
+                folderResult ? "completed" : ""
+              }`}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="storage-folder-import-title">
+                <div>
+                  <h3>导入 Zip 批次</h3>
+                  <span className="muted">
+                    {zipDraft.file?.name || zipDraft.localPath} · 将按扩展名分别入库（bvh / csv
+                    / fbx / tak 等），同名动作归入同一数据单元
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={folderBusy}
+                  onClick={() => setZipDraft(null)}
+                >
+                  关闭
+                </button>
+              </div>
+              {(overview?.batches || []).some((item) => item.name === zipDraft.folderName) && (
+                <div className="storage-folder-format-warning">
+                  <strong>批次“{zipDraft.folderName}”已存在</strong>
+                  <label className="row" style={{ gap: 8 }}>
+                    <input
+                      type="radio"
+                      checked={zipDraft.batchChoice === "new"}
+                      onChange={() =>
+                        updateZipDraft({
+                          batchChoice: "new",
+                          batchName: nextAvailableBatchName(
+                            zipDraft.folderName,
+                            overview?.batches || []
+                          ),
+                        })
+                      }
+                    />
+                    改名新建批次
+                  </label>
+                  <label className="row" style={{ gap: 8 }}>
+                    <input
+                      type="radio"
+                      checked={zipDraft.batchChoice === "existing"}
+                      onChange={() => updateZipDraft({ batchChoice: "existing" })}
+                    />
+                    添加到现有批次
+                  </label>
+                </div>
+              )}
+              {zipDraft.batchChoice === "new" && (
+                <label>
+                  新批次名称
+                  <input
+                    value={zipDraft.batchName}
+                    onChange={(event) => updateZipDraft({ batchName: event.target.value })}
+                  />
+                </label>
+              )}
+              <div className="grid-2">
+                <label>
+                  本体
+                  <select
+                    value={zipDraft.ontology}
+                    onChange={(event) => updateZipDraft({ ontology: event.target.value })}
+                  >
+                    <option value="human">人体</option>
+                    <option value="robot">机器人</option>
+                  </select>
+                </label>
+                <label>
+                  模态
+                  <select
+                    value={zipDraft.modality}
+                    onChange={(event) => updateZipDraft({ modality: event.target.value })}
+                  >
+                    {MODALITIES.map(([key, label]) => (
+                      <option key={key} value={key}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              {zipDraft.ontology === "robot" && (
+                <RobotStyleFields
+                  instances={robotInstances}
+                  style={zipDraft.robotStyle}
+                  version={zipDraft.robotVersion}
+                  onChange={(robotStyle, robotVersion) =>
+                    updateZipDraft({ robotStyle, robotVersion })
+                  }
+                />
+              )}
+              {zipDraft.ontology === "human" && (
+                <>
+                  <label>
+                    姓名
+                    <input
+                      value={zipDraft.personName}
+                      onChange={(event) => updateZipDraft({ personName: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    性别
+                    <select
+                      value={zipDraft.gender}
+                      onChange={(event) => updateZipDraft({ gender: event.target.value })}
+                    >
+                      <option value="">未填写</option>
+                      <option value="男">男</option>
+                      <option value="女">女</option>
+                    </select>
+                  </label>
+                </>
+              )}
+              {zipDraft.ontology === "robot" && (
+                <label>
+                  帧率（Hz，机器人 CSV）
+                  <input
+                    type="number"
+                    min="1"
+                    max="10000"
+                    step="0.1"
+                    value={zipDraft.fps}
+                    placeholder="默认 30"
+                    onChange={(event) => updateZipDraft({ fps: event.target.value })}
+                  />
+                </label>
+              )}
+              <div className="storage-upload-taxonomy-block">
+                <strong>分类标签</strong>
+                <p className="muted" style={{ margin: "4px 0 8px" }}>
+                  沿用上方预设，导入前仍可修改
+                </p>
+                {taxonomyEditor(folderBusy)}
+              </div>
+              <label className="row" style={{ gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={zipDraft.replace}
+                  onChange={(event) => updateZipDraft({ replace: event.target.checked })}
+                />
+                同路径文件已存在则替换
+              </label>
+              {folderBusy && (
+                <div className="stack">
+                  <span>正在解压并导入 zip，请勿关闭…</span>
+                  <progress className="storage-folder-progress" />
+                </div>
+              )}
+              {folderError && <div className="error">{folderError}</div>}
+              {folderResult && (
+                <div
+                  className={`storage-folder-result ${
+                    folderResult.failed ? "error" : "success"
+                  }`}
+                >
+                  上传 {folderResult.uploaded}，替换 {folderResult.replaced}，跳过{" "}
+                  {folderResult.skipped}，失败 {folderResult.failed}
+                </div>
+              )}
+              <div className="row storage-folder-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={folderBusy}
+                  onClick={() => setZipDraft(null)}
+                >
+                  {folderResult ? "完成" : "取消"}
+                </button>
+                {!folderResult && (
+                  <button
+                    type="button"
+                    disabled={folderBusy || !zipDraft.batchChoice}
+                    onClick={() => void submitZipImport()}
+                  >
+                    {folderBusy ? "正在导入…" : "开始导入"}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </>
   );
 }

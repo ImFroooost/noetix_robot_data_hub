@@ -102,8 +102,6 @@ def _probe_bvh(path: Path) -> dict[str, Any]:
 def _probe_csv(path: Path) -> dict[str, Any]:
     fps = None
     headers: list[str] | None = None
-    first_time = None
-    second_time = None
     rows = 0
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -120,22 +118,8 @@ def _probe_csv(path: Path) -> dict[str, Any]:
                     headers = [item.strip() for item in line.split(",")]
                     continue
                 rows += 1
-                if first_time is None or second_time is None:
-                    first = line.split(",", 1)[0].strip()
-                    try:
-                        value = float(first)
-                    except ValueError:
-                        continue
-                    if first_time is None:
-                        first_time = value
-                    elif second_time is None and value != first_time:
-                        second_time = value
     except OSError:
         return {}
-    if fps is None and first_time is not None and second_time is not None:
-        delta = abs(second_time - first_time)
-        if 0 < delta < 10:
-            fps = 1.0 / delta
     return {
         "fps": fps,
         "frame_count": rows or None,

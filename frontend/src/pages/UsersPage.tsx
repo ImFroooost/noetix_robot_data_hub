@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { fetchStorageOverview } from "../storageOverviewCache";
 import { useAuth } from "../auth";
 import type {
   PermissionItem,
@@ -201,7 +202,7 @@ export function UsersPage() {
   useEffect(() => {
     if (!canManageUsers) return;
     reload().catch((e) => setError(e.message));
-    Promise.all([api.listFolders(), api.storageOverview()])
+    Promise.all([api.listFolders(), fetchStorageOverview()])
       .then(([folders, storage]) => {
         const paths = [
           ...folders.map((folder) => folder.path),

@@ -498,6 +498,7 @@ export function TaxonomySelect({
   allowEmpty = true,
   scheme,
   canCreate = false,
+  compact = false,
   onNodesReload,
 }: {
   nodes: TaxonomyNode[];
@@ -507,6 +508,7 @@ export function TaxonomySelect({
   allowEmpty?: boolean;
   scheme?: TaxonomyScheme;
   canCreate?: boolean;
+  compact?: boolean;
   /** 新建成功后刷新节点列表 */
   onNodesReload?: () => Promise<void> | void;
 }) {
@@ -632,7 +634,11 @@ export function TaxonomySelect({
   }
 
   return (
-    <div className={`taxonomy-cascade ${disabled ? "is-disabled" : ""}`}>
+    <div
+      className={`taxonomy-cascade ${disabled ? "is-disabled" : ""} ${
+        compact ? "is-compact" : ""
+      }`}
+    >
       <div className="taxonomy-cascade-levels">
         {levels.map((level, depth) => (
           <div key={depth} className="taxonomy-cascade-level">
@@ -715,35 +721,43 @@ export function TaxonomySelect({
 
       {localError && <div className="error">{localError}</div>}
 
-      <div className="taxonomy-cascade-footer">
-        {current ? (
-          <span className="muted taxonomy-cascade-current" title={current.path}>
-            已选：{optionLabel(current)}
-            <span className="taxonomy-cascade-path"> {current.path}</span>
-          </span>
-        ) : (
-          <span className="muted">未选择</span>
-        )}
-        {allowEmpty && current && !disabled && (
+      {compact ? (
+        allowEmpty && current && !disabled ? (
           <button type="button" className="secondary" onClick={() => onChange("")}>
             清除
           </button>
-        )}
-        {canCreate && current && !disabled && (
-          <button
-            type="button"
-            className="secondary"
-            disabled={busy}
-            onClick={() => {
-              setLocalError("");
-              setNewName("");
-              setAddingParentId(current.id);
-            }}
-          >
-            在已选下新建
-          </button>
-        )}
-      </div>
+        ) : null
+      ) : (
+        <div className="taxonomy-cascade-footer">
+          {current ? (
+            <span className="muted taxonomy-cascade-current" title={current.path}>
+              已选：{optionLabel(current)}
+              <span className="taxonomy-cascade-path"> {current.path}</span>
+            </span>
+          ) : (
+            <span className="muted">未选择</span>
+          )}
+          {allowEmpty && current && !disabled && (
+            <button type="button" className="secondary" onClick={() => onChange("")}>
+              清除
+            </button>
+          )}
+          {canCreate && current && !disabled && (
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy}
+              onClick={() => {
+                setLocalError("");
+                setNewName("");
+                setAddingParentId(current.id);
+              }}
+            >
+              在已选下新建
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -110,3 +110,11 @@ export function folderNameFromZip(filename: string): string {
   const base = filename.split(/[/\\]/).filter(Boolean).pop() || "upload";
   return base.replace(/\.zip$/i, "").trim() || "upload";
 }
+
+export function formatFromFileName(filename: string): string {
+  const name = (filename || "").toLowerCase();
+  if (name.endsWith(".ser.pkl")) return "ser.pkl";
+  if (name.endsWith(".npz") || name.endsWith(".npy")) return "smpl";
+  const match = name.match(/\.([^.]+)$/);
+  return match?.[1] || "";
+}

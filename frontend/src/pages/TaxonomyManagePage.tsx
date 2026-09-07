@@ -59,6 +59,30 @@ export function TaxonomyManagePage() {
     setRenameValue(cur?.name || "");
   };
 
+  const onRestoreScheme = async () => {
+    if (!currentScheme?.builtin) return;
+    const ok = window.confirm(
+      `把「${currentScheme.name}」恢复成内置标准树？\n会按标准结构改回父子层级和编码，已有节点和已打标签会保留。`
+    );
+    if (!ok) return;
+    setBusy(true);
+    setError("");
+    setMsg("");
+    try {
+      const result = await api.restoreTaxonomyScheme(currentScheme.key);
+      await load();
+      setMsg(
+        result.missing.length
+          ? `已恢复标准结构，调整 ${result.moved} 个节点；标准中缺少：${result.missing.join("、")}`
+          : `已恢复标准结构，调整 ${result.moved} 个节点`
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "恢复失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onRenameScheme = async () => {
     if (!currentScheme) return;
     const name = renameValue.trim();
@@ -217,6 +241,17 @@ export function TaxonomyManagePage() {
           >
             右移 →
           </button>
+          {currentScheme.builtin && (
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy}
+              title="按内置标准树恢复父子层级和编码，已有节点和标签不会删除"
+              onClick={() => void onRestoreScheme()}
+            >
+              恢复标准结构
+            </button>
+          )}
           <span
             className="muted"
             style={{ fontSize: "0.85rem" }}
@@ -379,6 +414,52 @@ export function TaxonomyManagePage() {
                 <div className="muted">子节点数</div>
                 <div>{selected.child_count}</div>
               </div>
+              {selected.parent_id != null ||
+              schemeNodes.filter((n) => n.parent_id == null).length > 1 ? (
+                <label>
+                  上级节点
+                  <select
+                    value={selected.parent_id ?? ""}
+                    onChange={async (e) => {
+                      const raw = e.target.value;
+                      const parentId = raw === "" ? null : Number(raw);
+                      if (parentId === selected.parent_id) return;
+                      setError("");
+                      setMsg("");
+                      try {
+                        await api.updateTaxonomyNode(selected.id, {
+                          parent_id: parentId,
+                        });
+                        await load();
+                        setMsg("已调整层级（序号已重编）");
+                      } catch (err) {
+                        setError(err instanceof Error ? err.message : "移动失败");
+                      }
+                    }}
+                  >
+                    <option value="">顶级（与根节点同级）</option>
+                    {schemeNodes
+                      .filter((n) => {
+                        if (n.id === selected.id) return false;
+                        if (n.path.startsWith(selected.path)) return false;
+                        return true;
+                      })
+                      .sort(
+                        (a, b) =>
+                          a.path.localeCompare(b.path, "zh") ||
+                          a.sort_order - b.sort_order
+                      )
+                      .map((n) => (
+                        <option key={n.id} value={n.id}>
+                          {n.code ? `${n.code} ${n.name}` : n.name}
+                        </option>
+                      ))}
+                  </select>
+                  <small className="muted">
+                    拖乱后在这里选回正确的上级即可，不必再拖拽
+                  </small>
+                </label>
+              ) : null}
               <label>
                 修改编码
                 <input

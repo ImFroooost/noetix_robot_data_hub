@@ -473,14 +473,14 @@ export function AnimationFormatPreview({
   durationHint?: number | null;
 }) {
   const [time, setTime] = useState(0);
-  const [playing, setPlaying] = useState(false);
+  const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [mediaDuration, setMediaDuration] = useState(0);
   const duration = mediaDuration || durationHint || 1;
 
   useEffect(() => {
     setTime(0);
-    setPlaying(false);
+    setPlaying(true);
     setMediaDuration(0);
   }, [url]);
 

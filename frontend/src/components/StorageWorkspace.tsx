@@ -1,15 +1,17 @@
 import { Children, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, downloadAuth, downloadAuthPost, getToken } from "../api";
+import { api, downloadAuth, downloadAuthPost } from "../api";
 import { useAuth } from "../auth";
-import { AnimationFormatPreview, animationFormatOf } from "./AnimationFormatPreview";
-import { isRobotMotionCsv, RobotCsvPreview } from "./RobotCsvPreview";
-import { FolderBatchImport } from "./FolderBatchImport";
+import { usePreview } from "../preview/PreviewContext";
+import { FilePreviewDock } from "./FilePreviewDock";
+import { FolderBatchImport, UploadTaxonomyFields } from "./FolderBatchImport";
 import {
   RobotStyleFields,
   robotDescriptionVersions,
   robotVersionLabel,
 } from "./RobotStyleFields";
 import { TaxonomySelect } from "./TaxonomyTree";
+import { fetchStorageOverview } from "../storageOverviewCache";
+import { formatFromFileName } from "../utils/folderUpload";
 import type {
   ModelInstance,
   StorageAnnotation,
@@ -23,7 +25,7 @@ import type {
   TaxonomyNode,
   TaxonomySchemeDef,
 } from "../types";
-import { taxonomySchemeLabel } from "../types";
+import { needsManualCsvFps, parseCsvFps, taxonomySchemeLabel } from "../types";
 
 const MODALITY_LABEL: Record<string, string> = {
   tpv_video: "第三视角视频",
@@ -79,78 +81,6 @@ const batchOwnedBy = (batch: StorageBatch, userId: number | undefined) =>
 
 const qualityLabel = (value: string) =>
   QUALITY_OPTIONS.find(([key]) => key === value)?.[1] || "未评价";
-
-function Preview({ file }: { file: StorageFile | null }) {
-  const [url, setUrl] = useState("");
-  const [text, setText] = useState("");
-  const [error, setError] = useState("");
-  const animationFormat = file ? animationFormatOf(file) : null;
-
-  useEffect(() => {
-    let objectUrl = "";
-    let cancelled = false;
-    setUrl("");
-    setText("");
-    setError("");
-    if (!file || animationFormat || isRobotMotionCsv(file)) return;
-    const token = getToken();
-    fetch(api.storageFileUrl(file.path), {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
-      .then(async (res) => {
-        if (!res.ok) throw new Error("预览加载失败");
-        if (file.modality === "text" || ["json", "txt", "csv", "xml", "urdf"].includes(file.format)) {
-          const content = await res.text();
-          if (!cancelled) setText(content.slice(0, 12000));
-          return;
-        }
-        const blob = await res.blob();
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setUrl(objectUrl);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : "预览失败");
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [file?.path, animationFormat]);
-
-  if (!file) return <div className="storage-preview-empty">选择右上方文件后在这里预览</div>;
-  if (animationFormat) {
-    return (
-      <AnimationFormatPreview
-        url={api.storageFileUrl(file.path)}
-        format={animationFormat}
-        durationHint={file.duration_sec}
-      />
-    );
-  }
-  if (isRobotMotionCsv(file)) {
-    return <RobotCsvPreview file={file} />;
-  }
-  if (error) return <div className="storage-preview-empty">{error}</div>;
-  if (text) return <pre className="storage-text-preview">{text}</pre>;
-  if (!url) return <div className="storage-preview-empty">正在加载 {file.name}…</div>;
-  if (file.modality.includes("video")) {
-    return <video controls src={url} className="storage-media-preview" />;
-  }
-  if (file.modality === "audio") {
-    return <audio controls src={url} style={{ width: "90%" }} />;
-  }
-  if (["png", "jpg", "jpeg", "webp", "gif"].includes(file.format)) {
-    return <img src={url} alt={file.name} className="storage-media-preview" />;
-  }
-  return (
-    <div className="storage-preview-empty">
-      {file.name}
-      <br />
-      此格式暂不支持浏览器内预览，可下载查看
-    </div>
-  );
-}
 
 function ChevronIcon({ open }: { open: boolean }) {
   return (
@@ -672,6 +602,7 @@ function UploaderTreePanel({
 const UPLOAD_SOURCE_LABEL: Record<string, string> = {
   folder: "文件夹导入",
   file: "单文件上传",
+  zip: "Zip 导入",
   legacy: "历史上传",
 };
 
@@ -736,7 +667,7 @@ function UploadSessionTree({
               unitsByName.get(`${session.batch}::${name}`)?.[0]
           )
           .filter((item): item is StorageUnit => !!item);
-        const open = expanded[session.id] !== false;
+        const open = expanded[session.id] === true;
         const allowDelete = !!canDeleteSession?.(session);
         return (
           <TreeGroup
@@ -932,6 +863,7 @@ function QuickUpload({
   const [personName, setPersonName] = useState("");
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
+  const [fps, setFps] = useState("30");
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [replace, setReplace] = useState(false);
@@ -956,8 +888,13 @@ function QuickUpload({
   }, [ontology]);
 
   const submit = async () => {
-    if (!file || !format.trim()) {
-      setError("请选择文件并填写格式");
+    if (!file) {
+      setError("请选择文件");
+      return;
+    }
+    const resolvedFormat = format.trim() || formatFromFileName(file.name);
+    if (!resolvedFormat) {
+      setError("无法从文件名判断格式，请填写格式");
       return;
     }
     setBusy(true);
@@ -967,22 +904,23 @@ function QuickUpload({
       form.set("ontology", ontology);
       form.set("modality", modality);
       form.set("channel", modality === "fpv_video" ? channel : "");
-      form.set("format", format.trim());
+      form.set("format", resolvedFormat);
       form.set("batch", unit.batch);
       form.set("unit_name", unit.name);
       form.set("replace", String(replace));
       form.set("manage_override", String(manageOverride));
       form.set(
         "annotation",
-        JSON.stringify(
-          ontology === "robot"
+        JSON.stringify({
+          ...(ontology === "robot"
             ? { robot_style: robotStyle, robot_version: robotVersion }
             : {
                 person_name: personName.trim(),
                 gender,
                 height: height.trim(),
-              }
-        )
+              }),
+          ...(needsManualCsvFps(ontology, resolvedFormat) ? { fps: parseCsvFps(fps) } : {}),
+        })
       );
       form.set("file", file);
       await api.storageUpload(form);
@@ -1032,8 +970,26 @@ function QuickUpload({
         )}
         <label>
           格式
-          <input value={format} onChange={(e) => setFormat(e.target.value)} placeholder="csv / mp4 / json…" />
+          <input
+            value={format}
+            onChange={(e) => setFormat(e.target.value)}
+            placeholder="选文件后自动用后缀，也可改"
+          />
         </label>
+        {needsManualCsvFps(ontology, format) && (
+          <label>
+            帧率（Hz，机器人 CSV）
+            <input
+              type="number"
+              min="1"
+              max="10000"
+              step="0.1"
+              value={fps}
+              placeholder="默认 30"
+              onChange={(e) => setFps(e.target.value)}
+            />
+          </label>
+        )}
         {ontology === "robot" && (
           <RobotStyleFields
             instances={robotInstances}
@@ -1081,7 +1037,14 @@ function QuickUpload({
           文件
           <input
             type="file"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
+            onChange={(e) => {
+              const next = e.target.files?.[0] || null;
+              setFile(next);
+              if (next) {
+                const detected = formatFromFileName(next.name);
+                if (detected) setFormat(detected);
+              }
+            }}
           />
         </label>
         <label className="row" style={{ gap: 8 }}>
@@ -1156,15 +1119,8 @@ function DetailRow({
 
 type DetailKind = "batch" | "unit" | "file" | "upload_session";
 
-const FILE_TAG_KEYS = new Set(["custom_2", "custom_3", "custom_4"]);
-const FILE_TAG_NAMES = new Set(["获取方式", "获取地点", "获取设备"]);
-
-function schemesForKind(kind: DetailKind, schemes: TaxonomySchemeDef[]) {
-  if (kind === "upload_session") return [];
-  if (kind !== "file") return schemes;
-  return schemes.filter(
-    (scheme) => FILE_TAG_KEYS.has(scheme.key) || FILE_TAG_NAMES.has(scheme.name)
-  );
+function schemesForKind(_kind: DetailKind, schemes: TaxonomySchemeDef[]) {
+  return schemes;
 }
 
 function EntityDetailPanel({
@@ -1205,6 +1161,7 @@ function EntityDetailPanel({
   const [personName, setPersonName] = useState("");
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
+  const [fps, setFps] = useState("30");
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -1244,16 +1201,34 @@ function EntityDetailPanel({
           : batch?.annotation || {};
   const tagIds =
     kind === "file"
-      ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
+      ? {
+          ...(detail?.batch_taxonomy_tag_ids || batch?.taxonomy_tag_ids || {}),
+          ...(detail?.unit_taxonomy_tag_ids || unit?.taxonomy_tag_ids || {}),
+          ...(detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}),
+        }
       : kind === "unit"
-        ? unit?.taxonomy_tag_ids || {}
-        : batch?.taxonomy_tag_ids || {};
+        ? {
+            ...(batch?.taxonomy_tag_ids || {}),
+            ...(unit?.taxonomy_tag_ids || {}),
+          }
+        : kind === "upload_session"
+          ? session?.taxonomy_tag_ids || {}
+          : batch?.taxonomy_tag_ids || {};
   const tags =
     kind === "file"
-      ? detail?.taxonomy_tags || file?.taxonomy_tags || {}
+      ? {
+          ...(detail?.batch_taxonomy_tags || batch?.taxonomy_tags || {}),
+          ...(detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {}),
+          ...(detail?.taxonomy_tags || file?.taxonomy_tags || {}),
+        }
       : kind === "unit"
-        ? unit?.taxonomy_tags || {}
-        : batch?.taxonomy_tags || {};
+        ? {
+            ...(batch?.taxonomy_tags || {}),
+            ...(unit?.taxonomy_tags || {}),
+          }
+        : kind === "upload_session"
+          ? session?.taxonomy_tags || {}
+          : batch?.taxonomy_tags || {};
   const parentTags =
     kind === "file"
       ? { ...(detail?.batch_taxonomy_tags || batch?.taxonomy_tags || {}), ...(detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {}) }
@@ -1270,6 +1245,7 @@ function EntityDetailPanel({
     setPersonName(String(annotation.person_name || ""));
     setGender(String(annotation.gender || ""));
     setHeight(String(annotation.height || ""));
+    setFps(String(parseCsvFps(annotation.fps)));
     setSaved(false);
   }, [
     kind,
@@ -1284,6 +1260,7 @@ function EntityDetailPanel({
     annotation.person_name,
     annotation.gender,
     annotation.height,
+    annotation.fps,
   ]);
 
   useEffect(() => {
@@ -1311,6 +1288,10 @@ function EntityDetailPanel({
 
   const paramOntology =
     kind === "upload_session" ? session?.ontology : viewFile?.ontology;
+  const detailNeedsFps = needsManualCsvFps(
+    paramOntology,
+    kind === "upload_session" ? session?.format : viewFile?.format
+  );
 
   const title =
     kind === "batch"
@@ -1327,12 +1308,15 @@ function EntityDetailPanel({
     if (!kind) return;
     setSaving(true);
     try {
+      const csvFps = needsManualCsvFps(paramOntology, viewFile?.format || session?.format)
+        ? { fps: parseCsvFps(fps) }
+        : {};
       const fileAnnotation =
         viewFile?.ontology === "robot" || session?.ontology === "robot"
-          ? { quality, note, robot_style: robotStyle, robot_version: robotVersion }
+          ? { quality, note, robot_style: robotStyle, robot_version: robotVersion, ...csvFps }
           : viewFile?.ontology === "human" || session?.ontology === "human"
-            ? { quality, note, person_name: personName.trim(), gender, height: height.trim() }
-            : { quality, note };
+            ? { quality, note, person_name: personName.trim(), gender, height: height.trim(), ...csvFps }
+            : { quality, note, ...csvFps };
       const body = {
         annotation:
           kind === "file" || kind === "upload_session" ? fileAnnotation : { note },
@@ -1374,11 +1358,20 @@ function EntityDetailPanel({
         await api.storageUpdateUnit(unit.batch, unit.name, body);
       } else if (kind === "file" && file) {
         await api.storageUpdateFileMeta(file.path, body);
+      } else if (kind === "upload_session" && session) {
+        await api.storageUpdateUploadSession(session.id, {
+          ...body,
+          paths: session.paths,
+        });
       }
       onMessage(
         kind === "batch"
-          ? "分类标签已更新，已同步到该批次下的数据单元"
-          : "分类标签已更新"
+          ? "分类标签已更新，已同步到该批次下的数据单元和文件"
+          : kind === "unit"
+            ? "分类标签已更新，已同步到该数据单元下的文件"
+            : kind === "upload_session"
+              ? "分类标签已更新，已同步到这次上传的数据单元和文件"
+              : "分类标签已更新"
       );
       await onReload();
     } catch (e) {
@@ -1603,6 +1596,26 @@ function EntityDetailPanel({
               <DetailRow label="身高" value={heightLabel(height)} />
             </>
           )}
+          {detailNeedsFps && canEdit && (
+            <label>
+              帧率（Hz，机器人 CSV）
+              <input
+                type="number"
+                min="1"
+                max="10000"
+                step="0.1"
+                value={fps}
+                placeholder="默认 30"
+                onChange={(e) => {
+                  setFps(e.target.value);
+                  setSaved(false);
+                }}
+              />
+            </label>
+          )}
+          {detailNeedsFps && !canEdit && kind === "upload_session" && (
+            <DetailRow label="帧率" value={`${parseCsvFps(annotation.fps)} Hz`} />
+          )}
           {kind === "file" && canEdit && (
             <label>
               数据评价
@@ -1812,7 +1825,14 @@ function UnitMatrix({
             );
             return (
               <div className="storage-modality-row" key={modality}>
-                <div className={`storage-modality-name ${files.length ? "" : "missing"}`}>
+                <div
+                  className={`storage-modality-name ${files.length ? "" : "missing"}`}
+                  title={files.length ? `查看${label}文件信息` : undefined}
+                  onClick={() => {
+                    if (files.length) onFile(files[files.length - 1]);
+                  }}
+                  style={files.length ? { cursor: "pointer" } : undefined}
+                >
                   {label}
                 </div>
                 <div className="storage-file-pills">
@@ -1837,8 +1857,19 @@ function UnitMatrix({
                   <button
                     type="button"
                     className="storage-circle-add"
-                    title={`添加${label}`}
-                    onClick={() => onQuickUpload({ ontology, modality })}
+                    title={
+                      files.length && selectedFile?.id !== files[files.length - 1].id
+                        ? `查看并预览${label}`
+                        : `添加${label}`
+                    }
+                    onClick={() => {
+                      const last = files[files.length - 1];
+                      if (last && selectedFile?.id !== last.id) {
+                        onFile(last);
+                        return;
+                      }
+                      onQuickUpload({ ontology, modality });
+                    }}
                   >
                     +
                   </button>
@@ -1870,13 +1901,7 @@ export function StorageWorkspace({
   const [sortMode, setSortMode] = useState("name_asc");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [focus, setFocus] = useState<{ kind: DetailKind; key: string } | null>(null);
-  const [previewFiles, setPreviewFiles] = useState<(StorageFile | null)[]>([
-    null,
-    null,
-    null,
-    null,
-  ]);
-  const [activePreviewIndex, setActivePreviewIndex] = useState(0);
+  const preview = usePreview();
   const [quickPreset, setQuickPreset] = useState<{
     ontology: string;
     modality: string;
@@ -1893,6 +1918,7 @@ export function StorageWorkspace({
   const pendingSelectBatch = useRef<string | null>(null);
   const pendingSelectSession = useRef<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [uploadTagIds, setUploadTagIds] = useState<Record<string, number | "">>({});
 
   const hasAnnotationPermission = hasPerm("annotate");
   const canUpload =
@@ -1907,49 +1933,13 @@ export function StorageWorkspace({
   const canDownloadItems = hasPerm("download");
   const canCreateTaxonomy = canAnnotate && hasPerm("manage_data");
   const structureOnly = variant === "upload";
-  const selectedFile = previewFiles[activePreviewIndex] || null;
+  const selectedFile = preview.activeFile;
 
-  const clearPreviews = () => {
-    setPreviewFiles([null, null, null, null]);
-    setActivePreviewIndex(0);
-  };
-
-  const addPreviewFile = (file: StorageFile) => {
-    setFocus({ kind: "file", key: file.path });
-    const existingIndex = previewFiles.findIndex((item) => item?.id === file.id);
-    if (existingIndex >= 0) {
-      setActivePreviewIndex(existingIndex);
-      return;
-    }
-    const emptyIndex = previewFiles.findIndex((item) => item == null);
-    const targetIndex =
-      previewFiles[activePreviewIndex] == null
-        ? activePreviewIndex
-        : emptyIndex >= 0
-          ? emptyIndex
-          : activePreviewIndex;
-    setPreviewFiles((current) =>
-      current.map((item, index) => (index === targetIndex ? file : item))
-    );
-    setActivePreviewIndex(targetIndex);
-  };
-
-  const removePreviewFile = (index: number) => {
-    const next = previewFiles.map((file, itemIndex) =>
-      itemIndex === index ? null : file
-    );
-    setPreviewFiles(next);
-    if (index === activePreviewIndex) {
-      const nextIndex = next.findIndex((file) => file != null);
-      setActivePreviewIndex(nextIndex >= 0 ? nextIndex : 0);
-    }
-  };
-
-  const load = async (keepSelection = true) => {
+  const load = async (keepSelection = true, force = true) => {
     const requestId = ++loadSequence.current;
     setError("");
     try {
-      const overview = await api.storageOverview({
+      const overview = await fetchStorageOverview({
         q: query || undefined,
         taxonomy_scheme:
           mode === "folder" || mode === "uploader" ? undefined : mode,
@@ -1957,21 +1947,10 @@ export function StorageWorkspace({
           mode === "folder" || mode === "uploader" ? undefined : tagId,
         uploader_id: variant === "upload" ? user?.id : undefined,
         include_empty: variant === "manage" ? 1 : undefined,
-      });
+      }, force);
       if (requestId !== loadSequence.current) return;
       setData(overview);
-      setPreviewFiles((current) =>
-        current.map((file) => {
-          if (!file) return file;
-          return (
-            overview.files.find((item) => item.path === file.path) ||
-            overview.units
-              .flatMap((unit) => unit.files)
-              .find((item) => item.path === file.path) ||
-            file
-          );
-        })
-      );
+      preview.syncFromOverview(overview.files, overview.units);
       if (mode !== "folder" && mode !== "uploader" && tagId == null) {
         setClassificationUnits(overview.units);
       }
@@ -1993,18 +1972,15 @@ export function StorageWorkspace({
         setActiveSessionId(importedSession.id);
         setFocus({ kind: "upload_session", key: importedSession.id });
         setSelectedKey(null);
-        clearPreviews();
       } else if (importedBatch?.units[0]) {
         setSelectedKey(importedBatch.units[0].key);
         setFocus({ kind: "unit", key: importedBatch.units[0].key });
-        clearPreviews();
       } else if (pendingBatchName) {
         setFocus({ kind: "batch", key: pendingBatchName });
       } else if (!keepSelection || !overview.units.some((u) => u.key === selectedKey)) {
         const first = overview.units[0];
         setSelectedKey(first?.key || null);
         setFocus(first ? { kind: "unit", key: first.key } : null);
-        clearPreviews();
       }
     } catch (e) {
       if (requestId !== loadSequence.current) return;
@@ -2022,7 +1998,7 @@ export function StorageWorkspace({
   }, []);
 
   useEffect(() => {
-    void load(true);
+    void load(true, false);
   }, [mode, tagId, user?.id, variant]);
 
   const selected = useMemo(
@@ -2101,12 +2077,15 @@ export function StorageWorkspace({
 
   const focusedFile = useMemo(() => {
     if (focus?.kind !== "file") return selectedFile;
+    const path = focus.key;
     return (
-      selected?.files.find((item) => item.path === focus.key) ||
-      data?.files.find((item) => item.path === focus.key) ||
+      selected?.files.find((item) => item.path === path) ||
+      data?.units.flatMap((unit) => unit.files).find((item) => item.path === path) ||
+      data?.files.find((item) => item.path === path) ||
+      preview.slots.find((item) => item?.path === path) ||
       selectedFile
     );
-  }, [focus, selected, data, selectedFile]);
+  }, [focus, selected, data, selectedFile, preview.slots]);
 
   const promptName = (label: string, current: string) => {
     const next = window.prompt(label, current);
@@ -2158,7 +2137,14 @@ export function StorageWorkspace({
       setMessage("已删除所选项目");
       setFocus(null);
       setSelectedKey(null);
-      clearPreviews();
+      preview.removeByPaths(
+        [
+          ...batches.flatMap((item) =>
+            item.units.flatMap((unit) => unit.files.map((file) => file.path))
+          ),
+          ...leftover.flatMap((unit) => unit.files.map((file) => file.path)),
+        ]
+      );
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
@@ -2191,12 +2177,8 @@ export function StorageWorkspace({
           setFocus(null);
         }
         setSelectedKey(null);
-        clearPreviews();
-      } else if (paths) {
-        setPreviewFiles((current) =>
-          current.map((file) => (file && paths.includes(file.path) ? null : file))
-        );
       }
+      preview.removeByPaths(targets);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
@@ -2365,6 +2347,23 @@ export function StorageWorkspace({
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
 
+      {variant === "upload" && (
+        <section className="card storage-upload-preset is-bar">
+          <div className="storage-upload-preset-head">
+            <strong>预设分类标签</strong>
+            <span className="muted">先选标签再拖入；弹窗和导入后都还能改。</span>
+          </div>
+          <UploadTaxonomyFields
+            schemes={schemes}
+            nodes={nodes}
+            value={uploadTagIds}
+            onChange={setUploadTagIds}
+            canCreate={canCreateTaxonomy}
+            onNodesReload={reloadTaxonomies}
+          />
+        </section>
+      )}
+
       <div className="storage-workspace">
         <aside className="card storage-left-pane">
           {variant === "upload" && (
@@ -2373,6 +2372,12 @@ export function StorageWorkspace({
                 {mode === "upload_order" ? "上传顺序" : "存储结构"}
               </h3>
               <FolderBatchImport
+                schemes={schemes}
+                nodes={nodes}
+                canCreateTaxonomy={canCreateTaxonomy}
+                onNodesReload={reloadTaxonomies}
+                taxonomyTagIds={uploadTagIds}
+                onTaxonomyTagIdsChange={setUploadTagIds}
                 onImported={(batchName, sessionId) => {
                   pendingSelectBatch.current = batchName;
                   pendingSelectSession.current = sessionId || null;
@@ -2404,7 +2409,6 @@ export function StorageWorkspace({
                 onUnitSelect={(unit) => {
                   setSelectedKey(unit.key);
                   setFocus({ kind: "unit", key: unit.key });
-                  clearPreviews();
                 }}
               />
             </>
@@ -2421,7 +2425,6 @@ export function StorageWorkspace({
                 onUnitSelect={(unit) => {
                   setSelectedKey(unit.key);
                   setFocus({ kind: "unit", key: unit.key });
-                  clearPreviews();
                 }}
               />
             </>
@@ -2463,13 +2466,11 @@ export function StorageWorkspace({
                 setActiveSessionId(session.id);
                 setFocus({ kind: "upload_session", key: session.id });
                 setSelectedKey(null);
-                clearPreviews();
               }}
               onSelectUnit={(session, unit) => {
                 setActiveSessionId(session.id);
                 setFocus({ kind: "unit", key: unit.key });
                 setSelectedKey(unit.key);
-                clearPreviews();
               }}
               onDeleteSession={(session) => void handleDeleteUploadSession(session)}
               onDeleteSessionUnit={(session, unit) => {
@@ -2491,7 +2492,6 @@ export function StorageWorkspace({
                 setActiveSessionId(null);
                 setSelectedKey(unit.key);
                 setFocus({ kind: "unit", key: unit.key });
-                clearPreviews();
               }}
               onSelectBatch={(batch) => {
                 setActiveSessionId(null);
@@ -2603,7 +2603,7 @@ export function StorageWorkspace({
                           } else {
                             await api.storageDeleteFile(selectedFile.path);
                           }
-                          removePreviewFile(activePreviewIndex);
+                          preview.removeByPaths([selectedFile.path]);
                           await load();
                         } catch (e) {
                           setError(e instanceof Error ? e.message : "删除失败");
@@ -2618,65 +2618,24 @@ export function StorageWorkspace({
 
               <UnitMatrix
                 unit={selected}
-                selectedFile={focus?.kind === "file" ? focusedFile : selectedFile}
+                selectedFile={focus?.kind === "file" ? focusedFile : null}
                 onFile={(file) => {
                   setSelectedKey(`${file.batch}::${file.unit_name}`);
-                  addPreviewFile(file);
+                  setFocus({ kind: "file", key: file.path });
+                  preview.add(file);
                 }}
                 canUpload={canUpload}
                 onQuickUpload={setQuickPreset}
               />
 
-              <section className="storage-preview-section">
-                <h3>预览</h3>
-                <div className="storage-preview-grid">
-                  {previewFiles.map((file, index) => (
-                    <div
-                      key={index}
-                      className={`storage-preview-box ${
-                        activePreviewIndex === index ? "active" : ""
-                      }`}
-                      onClick={() => {
-                        setActivePreviewIndex(index);
-                        if (file) setFocus({ kind: "file", key: file.path });
-                      }}
-                    >
-                      {file && (
-                        <div className="storage-preview-header">
-                          <span title={file.path}>
-                            窗口 {index + 1} · {file.name} ·{" "}
-                            {file.uploader?.username || "上传者未知"}
-                          </span>
-                          <button
-                            type="button"
-                            className="storage-preview-close"
-                            title="关闭此预览"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              removePreviewFile(index);
-                            }}
-                          >
-                            ×
-                          </button>
-                        </div>
-                      )}
-                      <div className="storage-preview-content">
-                        {file ? (
-                          <Preview file={file} />
-                        ) : (
-                          <div className="storage-preview-empty">
-                            窗口 {index + 1}
-                            <br />
-                            点击上方文件添加预览
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
             </>
           )}
+          <FilePreviewDock
+            onActivate={(file) => {
+              setSelectedKey(`${file.batch}::${file.unit_name}`);
+              setFocus({ kind: "file", key: file.path });
+            }}
+          />
         </main>
         <EntityDetailPanel
           kind={focus?.kind || null}
@@ -2692,8 +2651,8 @@ export function StorageWorkspace({
           session={focusedSession}
           schemes={schemes}
           nodes={nodes}
-          canEdit={canAnnotateSelected}
-          canCreate={canCreateTaxonomy}
+          canEdit={variant !== "browse" && canAnnotateSelected}
+          canCreate={variant !== "browse" && canCreateTaxonomy}
           onReload={async () => {
             await load(true);
           }}

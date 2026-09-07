@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
+import { PreviewProvider } from "../preview/PreviewContext";
 import { ROLE_LABEL } from "../types";
 import type { User } from "../types";
 
@@ -118,7 +119,9 @@ export function Layout() {
           </button>
         </header>
       </div>
-      <Outlet />
+      <PreviewProvider>
+        <Outlet />
+      </PreviewProvider>
     </div>
   );
 }

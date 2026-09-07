@@ -8,6 +8,7 @@ from .config import settings
 from .core.security import hash_password
 from .database import SessionLocal, init_db
 from .models import User, UserRole
+from .services.disk_repository import schedule_catalog_rebuild
 from .services.hub_repo import ensure_hub_skeleton
 from .services.storage import data_root
 
@@ -37,6 +38,10 @@ async def lifespan(_: FastAPI):
         pass
     init_db()
     ensure_admin()
+    try:
+        schedule_catalog_rebuild()
+    except Exception:
+        pass
     yield
 
 

@@ -579,6 +579,110 @@ def seed_taxonomies(db: Session) -> None:
     db.flush()
 
 
+def _flatten_seed_tree(
+    tree: dict, parent_names: tuple[str, ...] = ()
+) -> list[tuple[str, str, tuple[str, ...], int]]:
+    rows: list[tuple[str, str, tuple[str, ...], int]] = []
+    for idx, (name, payload) in enumerate(tree.items()):
+        code, children = payload
+        rows.append((name, code or "", parent_names, idx))
+        if children:
+            rows.extend(_flatten_seed_tree(children, parent_names + (name,)))
+    return rows
+
+
+def _rewrite_subtree_paths(db: Session, node: TaxonomyNode, new_path: str) -> None:
+    old_path = node.path
+    if old_path == new_path:
+        return
+    descendants = (
+        db.query(TaxonomyNode)
+        .filter(
+            TaxonomyNode.scheme == node.scheme,
+            TaxonomyNode.path.like(f"{old_path}%"),
+        )
+        .order_by(TaxonomyNode.path.desc())
+        .all()
+    )
+    for item in descendants:
+        item.path = new_path + item.path[len(old_path) :]
+    db.flush()
+
+
+def restore_builtin_scheme_tree(db: Session, scheme: str) -> dict:
+    """Reparent existing builtin nodes to the seed tree. IDs and tags stay."""
+    if scheme not in ROOTS:
+        raise ValueError("只能恢复内置分类标准")
+    root_name, tree = ROOTS[scheme]
+    nodes = db.query(TaxonomyNode).filter(TaxonomyNode.scheme == scheme).all()
+    by_name: dict[str, list[TaxonomyNode]] = {}
+    for node in nodes:
+        by_name.setdefault(node.name, []).append(node)
+    roots = [node for node in nodes if node.parent_id is None]
+    root = next((node for node in roots if node.name == root_name), None)
+    if root is None and len(roots) == 1:
+        root = roots[0]
+    if root is None:
+        raise ValueError("找不到该分类标准的根节点")
+
+    used = {root.id}
+    name_to_node = {root.name: root}
+    planned: list[tuple[TaxonomyNode, tuple[str, ...], str, int]] = []
+    missing: list[str] = []
+    for name, code, parent_names, idx in _flatten_seed_tree(tree):
+        unused = [node for node in by_name.get(name, []) if node.id not in used]
+        candidate = min(unused, key=lambda node: node.id) if unused else None
+        if candidate is None:
+            missing.append(name)
+            continue
+        used.add(candidate.id)
+        name_to_node[name] = candidate
+        planned.append((candidate, parent_names, code, idx))
+
+    moved = 0
+    for node, parent_names, code, idx in planned:
+        parent = root if not parent_names else name_to_node.get(parent_names[-1])
+        if parent is None:
+            continue
+        new_path = join_folder_path(parent.path, node.name)
+        changed = (
+            node.parent_id != parent.id
+            or node.path != new_path
+            or (node.code or "") != code
+            or node.sort_order != idx
+        )
+        if not changed:
+            continue
+        if new_path != node.path:
+            clash = (
+                db.query(TaxonomyNode)
+                .filter(
+                    TaxonomyNode.scheme == scheme,
+                    TaxonomyNode.path == new_path,
+                    TaxonomyNode.id != node.id,
+                )
+                .first()
+            )
+            if clash:
+                _rewrite_subtree_paths(db, clash, f"/__restore_park/{clash.id}/")
+            _rewrite_subtree_paths(db, node, new_path)
+        node.parent_id = parent.id
+        node.code = code
+        node.sort_order = idx
+        moved += 1
+        db.flush()
+
+    if (root.code or "") != ROOT_CODES.get(scheme, ""):
+        root.code = ROOT_CODES.get(scheme, root.code or "")
+    return {
+        "scheme": scheme,
+        "root": root.name,
+        "moved": moved,
+        "missing": missing,
+        "kept": len(planned),
+    }
+
+
 def needs_taxonomy_rebuild(db: Session) -> bool:
     marker = (
         db.query(TaxonomyNode)

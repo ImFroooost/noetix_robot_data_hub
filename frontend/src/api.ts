@@ -234,6 +234,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ ordered_keys }),
     }),
+  restoreTaxonomyScheme: (key: string) =>
+    request<{ moved: number; missing: string[]; kept: number; root: string }>(
+      `/api/taxonomies/schemes/${encodeURIComponent(key)}/restore`,
+      { method: "POST" }
+    ),
   createTaxonomyNode: (body: Record<string, unknown>) =>
     request<import("./types").TaxonomyNode>("/api/taxonomies/nodes", {
       method: "POST",
@@ -267,14 +272,27 @@ export const api = {
     });
     return request<import("./types").StorageOverview>(
       `/api/storage/overview${q.size ? `?${q}` : ""}`
-    );
+    ).then((data) => {
+      const units =
+        data.units?.length
+          ? data.units
+          : (data.batches || []).flatMap((batch) => batch.units || []);
+      const files =
+        data.files?.length
+          ? data.files
+          : units.flatMap((unit) => unit.files || []);
+      return { ...data, units, files };
+    });
   },
   storageRescan: () =>
     request("/api/storage/rescan", { method: "POST" }),
-  storageCreateBatch: (name: string) =>
+  storageCreateBatch: (
+    name: string,
+    extra?: { taxonomy_tag_ids?: Record<string, number> }
+  ) =>
     request<import("./types").StorageBatch>("/api/storage/batches", {
       method: "POST",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, ...extra }),
     }),
   storageUpdateBatch: (name: string, body: Record<string, unknown>) =>
     request<import("./types").StorageBatch>(
@@ -351,6 +369,11 @@ export const api = {
   storageUploadFolder: (form: FormData) =>
     request<import("./types").StorageFolderUploadResult>(
       "/api/storage/data/upload-folder",
+      { method: "POST", body: form }
+    ),
+  storageUploadZip: (form: FormData) =>
+    request<import("./types").StorageFolderUploadResult>(
+      "/api/storage/data/upload-zip",
       { method: "POST", body: form }
     ),
   storageDeleteFile: (path: string) =>

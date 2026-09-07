@@ -201,7 +201,29 @@ export interface StorageAnnotation {
   person_name?: string;
   gender?: string;
   height?: string;
+  fps?: number | string;
   [key: string]: unknown;
+}
+
+export const DEFAULT_CSV_FPS = 30;
+
+export function isCsvFormat(format?: string | null) {
+  return String(format || "").trim().toLowerCase() === "csv";
+}
+
+export function needsManualCsvFps(ontology?: string | null, format?: string | null) {
+  if (String(ontology || "").toLowerCase() !== "robot") return false;
+  return String(format || "")
+    .toLowerCase()
+    .split(/[,\s]+/)
+    .includes("csv");
+}
+
+export function parseCsvFps(value: unknown): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 && numeric <= 10000
+    ? numeric
+    : DEFAULT_CSV_FPS;
 }
 
 export interface StorageFileDetail extends StorageFile {
@@ -258,6 +280,8 @@ export interface StorageUploadSession {
   channel: string;
   format: string;
   annotation: StorageAnnotation;
+  taxonomy_tag_ids?: Record<string, number>;
+  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
   paths: string[];
   unit_names: string[];
   file_count: number;
@@ -267,6 +291,7 @@ export interface StorageUploadSession {
 
 export interface StorageOverview {
   updated_at: string;
+  index_updated_at?: string;
   modalities: string[];
   ontologies: string[];
   uploaders: StorageUploader[];
@@ -597,6 +622,16 @@ export const TAXONOMY_SCHEME_LABEL: Record<string, string> = {
   intent: "动作意图",
   style: "动作风格",
 };
+
+export function compactTaxonomyTagIds(
+  ids: Record<string, number | "">
+): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(ids).filter(
+      (entry): entry is [string, number] => typeof entry[1] === "number"
+    )
+  );
+}
 
 export function taxonomySchemeLabel(
   scheme: string,
