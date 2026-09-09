@@ -301,6 +301,25 @@ export interface StorageOverview {
   upload_sessions?: StorageUploadSession[];
 }
 
+export interface CatalogRebuildStats {
+  file_count?: number;
+  unit_count?: number;
+  batch_count?: number;
+  model_file_count?: number;
+  model_instance_count?: number;
+}
+
+export interface CatalogRebuildStatus {
+  status: "idle" | "running" | "done" | "error";
+  phase: string;
+  percent: number;
+  message: string;
+  stats?: CatalogRebuildStats | null;
+  error?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
 export type StorageFolderUploadStatus =
   | "uploaded"
   | "replaced"

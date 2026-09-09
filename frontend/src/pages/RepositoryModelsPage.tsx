@@ -4,6 +4,7 @@ import { useAuth } from "../auth";
 import { FolderDropZone } from "../components/FolderDropZone";
 import { ModelFilePreview, modelPreviewKind } from "../components/ModelFilePreview";
 import type { ModelInstance, ModelRepositoryOverview } from "../types";
+import { INDEX_UPDATED_EVENT } from "../storageOverviewCache";
 import { zipRelFiles, type RelFile } from "../utils/folderUpload";
 
 const KIND_LABEL: Record<string, string> = {
@@ -40,6 +41,14 @@ export function RepositoryModelsPage() {
 
   useEffect(() => {
     load().catch((e) => setError(e instanceof Error ? e.message : "加载失败"));
+  }, []);
+
+  useEffect(() => {
+    const onIndexUpdated = () => {
+      load().catch((e) => setError(e instanceof Error ? e.message : "加载失败"));
+    };
+    window.addEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
+    return () => window.removeEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
   }, []);
 
   const instances = useMemo(

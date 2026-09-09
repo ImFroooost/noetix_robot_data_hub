@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
+import { ThemeToggle } from "../theme";
+import { IndexRefreshControl } from "./IndexRefreshControl";
+import { RoleHelpDialog, useRoleHelpAutoOpen } from "./RoleHelpDialog";
 import { PreviewProvider } from "../preview/PreviewContext";
 import { ROLE_LABEL } from "../types";
 import type { User } from "../types";
@@ -11,6 +14,7 @@ export function Layout() {
   const nav = useNavigate();
   const [targets, setTargets] = useState<User[]>([]);
   const [busy, setBusy] = useState(false);
+  const { open: helpOpen, setOpen: setHelpOpen } = useRoleHelpAutoOpen(user?.role);
 
   useEffect(() => {
     if (!impersonating) {
@@ -76,7 +80,7 @@ export function Layout() {
           </div>
         )}
         <header className="topbar">
-          <div className="brand">Noetix Motion Data Hub</div>
+          <div className="brand">Noetix Robot Data Hub</div>
           <nav className="nav">
             <NavLink to="/" end className={({ isActive }) => (isActive ? "active" : undefined)}>
               浏览
@@ -114,6 +118,15 @@ export function Layout() {
             {user?.username}（{user ? ROLE_LABEL[user.role] || user.role : ""}）
             {impersonating ? " ·视角" : ""}
           </div>
+          <ThemeToggle />
+          <IndexRefreshControl />
+          <button
+            type="button"
+            className="secondary help-trigger"
+            onClick={() => setHelpOpen(true)}
+          >
+            使用说明
+          </button>
           <button className="secondary" onClick={logout}>
             退出
           </button>
@@ -122,6 +135,11 @@ export function Layout() {
       <PreviewProvider>
         <Outlet />
       </PreviewProvider>
+      <RoleHelpDialog
+        role={user?.role}
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+      />
     </div>
   );
 }

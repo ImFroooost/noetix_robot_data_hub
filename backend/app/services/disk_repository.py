@@ -17,12 +17,15 @@ import tempfile
 import threading
 import zipfile
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from ..config import settings
 from .media_probe import probe_file, public_media
+
+ProgressFn = Callable[[str, int, str], None]
 
 DEFAULT_CSV_FPS = 30.0
 
@@ -43,6 +46,17 @@ _catalog_mtime: float | None = None
 _overlay_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
 _rebuild_lock = threading.Lock()
 _rebuild_running = False
+_status_lock = threading.Lock()
+_rebuild_status: dict[str, Any] = {
+    "status": "idle",
+    "phase": "",
+    "percent": 0,
+    "message": "",
+    "stats": None,
+    "error": None,
+    "started_at": None,
+    "finished_at": None,
+}
 
 
 def _now() -> str:
@@ -561,7 +575,9 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
     )
 
 
-def _scan_data_live(*, include_empty: bool = False) -> dict[str, Any]:
+def _scan_data_live(
+    *, include_empty: bool = False, on_progress: ProgressFn | None = None
+) -> dict[str, Any]:
     """Scan files and group by batch plus filename stem into data units.
 
     Near-identical stems (``name`` vs ``name_locomotion_test``) collapse to
@@ -571,10 +587,14 @@ def _scan_data_live(*, include_empty: bool = False) -> dict[str, Any]:
     metadata = read_metadata()
     files: list[dict[str, Any]] = []
     data_root = base / "data"
+    if on_progress:
+        on_progress("data", 5, "正在枚举数据文件…")
+    seen = 0
     if data_root.is_dir():
         for path in sorted(data_root.rglob("*")):
             if not path.is_file() or path.name.startswith("."):
                 continue
+            seen += 1
             rec = _parse_data_file(path, base)
             if rec:
                 rec["uploader"] = (metadata.get("file_uploaders") or {}).get(
@@ -584,6 +604,14 @@ def _scan_data_live(*, include_empty: bool = False) -> dict[str, Any]:
                 _attach_own_file_tags(rec, metadata)
                 apply_csv_fps(rec)
                 files.append(rec)
+            if on_progress and seen % 40 == 0:
+                on_progress(
+                    "data",
+                    min(55, 8 + seen // 150),
+                    f"正在扫描数据文件（已处理 {seen}）…",
+                )
+    if on_progress:
+        on_progress("data", 58, f"正在整理数据索引（{len(files)} 个文件）…")
 
     stems_by_batch: dict[str, list[str]] = defaultdict(list)
     for rec in files:
@@ -724,11 +752,14 @@ def _scan_data_live(*, include_empty: bool = False) -> dict[str, Any]:
     }
 
 
-def _scan_models_live() -> dict[str, Any]:
+def _scan_models_live(*, on_progress: ProgressFn | None = None) -> dict[str, Any]:
     base = root()
     metadata = read_metadata()
     instances: dict[tuple[str, str], dict[str, Any]] = {}
     model_root = base / "3d_model"
+    seen = 0
+    if on_progress:
+        on_progress("models", 62, "正在扫描三维模型…")
     for ontology in ONTOLOGIES:
         ont_root = model_root / ontology
         if not ont_root.is_dir():
@@ -757,6 +788,7 @@ def _scan_models_live() -> dict[str, Any]:
                 for file_path in sorted(instance_dir.rglob("*")):
                     if not file_path.is_file() or file_path.name.startswith("."):
                         continue
+                    seen += 1
                     rel = file_path.relative_to(base).as_posix()
                     item["files"].append(
                         {
@@ -768,6 +800,14 @@ def _scan_models_live() -> dict[str, Any]:
                             "size": file_path.stat().st_size,
                         }
                     )
+                    if on_progress and seen % 10 == 0:
+                        on_progress(
+                            "models",
+                            min(88, 62 + seen // 4),
+                            f"正在扫描三维模型（已处理 {seen}）…",
+                        )
+    if on_progress:
+        on_progress("models", 90, f"三维模型扫描完成（{seen} 个文件）")
     return {"updated_at": _now(), "instances": list(instances.values())}
 
 
@@ -803,30 +843,65 @@ def _catalog_age_sec() -> float | None:
         return None
 
 
-def schedule_catalog_rebuild(*, force: bool = False) -> bool:
-    """Rebuild the on-disk browse index in a background thread."""
+def _set_rebuild_status(**kwargs: Any) -> None:
+    with _status_lock:
+        _rebuild_status.update(kwargs)
+
+
+def catalog_rebuild_status() -> dict[str, Any]:
+    with _status_lock:
+        return dict(_rebuild_status)
+
+
+def start_catalog_rebuild(*, force: bool = False) -> dict[str, Any]:
+    """Start a background catalog rebuild and return the current status."""
     global _rebuild_running
     if not force:
         age = _catalog_age_sec()
         if age is not None and age < _CATALOG_MAX_AGE_SEC:
-            return False
+            return catalog_rebuild_status()
     with _rebuild_lock:
         if _rebuild_running:
-            return False
+            return catalog_rebuild_status()
         _rebuild_running = True
+        _set_rebuild_status(
+            status="running",
+            phase="start",
+            percent=1,
+            message="开始更新索引…",
+            stats=None,
+            error=None,
+            started_at=_now(),
+            finished_at=None,
+        )
 
     def run() -> None:
         global _rebuild_running
         try:
             rebuild_catalog()
-        except Exception:
-            pass
+        except Exception as exc:
+            _set_rebuild_status(
+                status="error",
+                phase="error",
+                message="索引更新失败",
+                error=str(exc),
+                finished_at=_now(),
+            )
         finally:
             with _rebuild_lock:
                 _rebuild_running = False
 
     threading.Thread(target=run, name="catalog-rebuild", daemon=True).start()
-    return True
+    return catalog_rebuild_status()
+
+
+def schedule_catalog_rebuild(*, force: bool = False) -> bool:
+    """Rebuild the on-disk browse index in a background thread."""
+    before = catalog_rebuild_status()
+    if before.get("status") == "running":
+        return False
+    result = start_catalog_rebuild(force=force)
+    return result.get("status") == "running"
 
 
 def _copy_file_row(rec: dict[str, Any]) -> dict[str, Any]:
@@ -1018,16 +1093,59 @@ def scan_models(*, live: bool = False) -> dict[str, Any]:
 
 
 def rebuild_catalog() -> dict[str, Any]:
-    snapshot = {
-        "version": 2,
-        "updated_at": _now(),
-        "data": _scan_data_live(include_empty=True),
-        "models": _scan_models_live(),
-    }
-    with _INDEX_LOCK:
-        _write_json(catalog_path(), snapshot, compact=True)
-        _invalidate_catalog_cache()
-    return snapshot
+    def report(phase: str, percent: int, message: str) -> None:
+        _set_rebuild_status(
+            status="running",
+            phase=phase,
+            percent=max(0, min(99, int(percent))),
+            message=message,
+            error=None,
+        )
+
+    report("data", 4, "正在扫描数据文件…")
+    try:
+        data = _scan_data_live(include_empty=True, on_progress=report)
+        report("models", 60, "正在扫描三维模型…")
+        models = _scan_models_live(on_progress=report)
+        report("write", 92, "正在写入索引…")
+        snapshot = {
+            "version": 2,
+            "updated_at": _now(),
+            "data": data,
+            "models": models,
+        }
+        with _INDEX_LOCK:
+            _write_json(catalog_path(), snapshot, compact=True)
+            _invalidate_catalog_cache()
+        stats = {
+            "file_count": len(data.get("files") or []),
+            "unit_count": len(data.get("units") or []),
+            "batch_count": len(data.get("batches") or []),
+            "model_file_count": sum(
+                len(item.get("files") or [])
+                for item in (models.get("instances") or [])
+            ),
+            "model_instance_count": len(models.get("instances") or []),
+        }
+        _set_rebuild_status(
+            status="done",
+            phase="done",
+            percent=100,
+            message="索引已更新",
+            stats=stats,
+            error=None,
+            finished_at=_now(),
+        )
+        return snapshot
+    except Exception as exc:
+        _set_rebuild_status(
+            status="error",
+            phase="error",
+            message="索引更新失败",
+            error=str(exc),
+            finished_at=_now(),
+        )
+        raise
 
 
 def create_batch(name: str) -> dict[str, Any]:

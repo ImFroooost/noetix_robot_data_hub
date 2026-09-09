@@ -37,7 +37,9 @@ from ..services.disk_repository import (
     parent_taxonomy_ids,
     probe_data_file,
     read_metadata,
+    catalog_rebuild_status,
     rebuild_catalog,
+    start_catalog_rebuild,
     record_upload_session,
     resolve_import_zip,
     rename_batch,
@@ -693,7 +695,14 @@ def overview(
 def rescan(
     _: User = Depends(get_current_user),
 ):
-    return rebuild_catalog()
+    return start_catalog_rebuild(force=True)
+
+
+@router.get("/rescan/status")
+def rescan_status(
+    _: User = Depends(get_current_user),
+):
+    return catalog_rebuild_status()
 
 
 @router.patch("/upload-sessions/{session_id}")

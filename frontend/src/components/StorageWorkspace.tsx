@@ -10,7 +10,7 @@ import {
   robotVersionLabel,
 } from "./RobotStyleFields";
 import { TaxonomySelect } from "./TaxonomyTree";
-import { fetchStorageOverview } from "../storageOverviewCache";
+import { fetchStorageOverview, INDEX_UPDATED_EVENT } from "../storageOverviewCache";
 import { formatFromFileName } from "../utils/folderUpload";
 import type {
   ModelInstance,
@@ -25,7 +25,7 @@ import type {
   TaxonomyNode,
   TaxonomySchemeDef,
 } from "../types";
-import { needsManualCsvFps, parseCsvFps, taxonomySchemeLabel } from "../types";
+import { isSuperRole, needsManualCsvFps, parseCsvFps, taxonomySchemeLabel } from "../types";
 
 const MODALITY_LABEL: Record<string, string> = {
   tpv_video: "第三视角视频",
@@ -366,8 +366,14 @@ function UnitTree({
   onDelete: (batches: StorageBatch[], units: StorageUnit[]) => void;
   onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void;
 }) {
+  const { user } = useAuth();
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [checkedBatches, setCheckedBatches] = useState<Record<string, boolean>>({});
+  const scopedEmpty =
+    !isSuperRole(user?.role) &&
+    !(user?.permissions || []).some(
+      (item) => item.capability === "browse" || item.capability === "manage_data"
+    );
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const batchKeys = data.batches.map((batch) => batch.name);
   const selectedBatches = data.batches.filter((batch) => checkedBatches[batch.name]);
@@ -507,7 +513,13 @@ function UnitTree({
           </TreeGroup>
         );
       })}
-      {!data.batches.length && <div className="muted">没有匹配的数据批次</div>}
+      {!data.batches.length && (
+        <div className="muted">
+          {scopedEmpty
+            ? "当前账号没有配置浏览范围，也没有自己上传的数据，所以列表为空。这和从哪台电脑打开无关。请用超级管理者登录查看全部数据，或在「用户管理」里为该账号配置范围。"
+            : "没有匹配的数据批次"}
+        </div>
+      )}
     </div>
   );
 }
@@ -2000,6 +2012,14 @@ export function StorageWorkspace({
   useEffect(() => {
     void load(true, false);
   }, [mode, tagId, user?.id, variant]);
+
+  useEffect(() => {
+    const onIndexUpdated = () => {
+      void load(true, true);
+    };
+    window.addEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
+    return () => window.removeEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
+  }, [mode, tagId, user?.id, variant, query]);
 
   const selected = useMemo(
     () => data?.units.find((unit) => unit.key === selectedKey) || null,

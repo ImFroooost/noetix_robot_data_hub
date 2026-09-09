@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, getActorToken, getToken, setActorToken, setToken } from "./api";
+import { requestOpenRoleHelp } from "./help/roleHelp";
 import type { Role, User } from "./types";
 
 interface AuthState {
@@ -58,6 +59,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const res = await api.login(username, password);
     setActorToken(null);
     setToken(res.access_token);
+    requestOpenRoleHelp();
     await refresh();
   };
 
@@ -73,6 +75,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     const res = await api.impersonate(userId);
     setToken(res.access_token);
+    requestOpenRoleHelp();
     await refresh();
   };
 

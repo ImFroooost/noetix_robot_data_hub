@@ -12,6 +12,13 @@
   --warn: #f0b429;
   --radius: 10px;
   --shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  --topbar-bg: rgba(23, 27, 36, 0.92);
+  --body-glow-a: rgba(79, 140, 255, 0.18);
+  --body-glow-b: rgba(61, 214, 198, 0.12);
+  --overlay: rgba(6, 8, 12, 0.72);
+  --hover-wash: rgba(255, 255, 255, 0.06);
+  --accent-softer: rgba(79, 140, 255, 0.08);
+  --panel-deep: #0b0d12;
   font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -26,8 +33,8 @@ body {
   margin: 0;
   min-height: 100vh;
   background:
-    radial-gradient(1200px 600px at 10% -10%, rgba(79, 140, 255, 0.18), transparent 50%),
-    radial-gradient(900px 500px at 90% 0%, rgba(61, 214, 198, 0.12), transparent 45%),
+    radial-gradient(1200px 600px at 10% -10%, var(--body-glow-a), transparent 50%),
+    radial-gradient(900px 500px at 90% 0%, var(--body-glow-b), transparent 45%),
     var(--bg);
 }
 
@@ -86,7 +93,7 @@ textarea {
   align-items: center;
   gap: 1.25rem;
   padding: 0.85rem 1.5rem;
-  background: rgba(23, 27, 36, 0.9);
+  background: var(--topbar-bg);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
 }
@@ -283,7 +290,7 @@ button:disabled {
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);
-  background: #0b0d12;
+  background: var(--panel-deep);
 }
 
 .error {
@@ -1043,7 +1050,7 @@ button:disabled {
 
 .animation-format-status {
   white-space: nowrap;
-  background: #0b0d12cc;
+  background: color-mix(in srgb, var(--panel-deep) 80%, transparent);
   padding: 6px 10px;
 }
 
@@ -1716,4 +1723,198 @@ button:disabled {
     align-items: flex-start;
     flex-direction: column;
   }
+}
+
+.help-trigger {
+  white-space: nowrap;
+}
+
+.index-refresh {
+  position: relative;
+}
+
+.index-refresh-panel {
+  position: absolute;
+  top: calc(100% + 0.55rem);
+  right: 0;
+  z-index: 40;
+  width: min(360px, 86vw);
+  padding: 0.85rem 0.95rem;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+  color: var(--text);
+}
+
+.index-refresh-panel.is-done {
+  border-color: rgba(74, 222, 128, 0.45);
+}
+
+.index-refresh-panel.is-error {
+  border-color: rgba(248, 113, 113, 0.55);
+}
+
+.index-refresh-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.index-refresh-close {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.15rem;
+}
+
+.index-refresh-panel p {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.index-refresh-bar {
+  margin-top: 0.7rem;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.index-refresh-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  transition: width 0.25s ease;
+}
+
+.index-refresh-percent {
+  margin-top: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  text-align: right;
+}
+
+.index-refresh-stats {
+  color: var(--text) !important;
+}
+
+.help-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+  background: var(--overlay);
+}
+
+.help-dialog {
+  width: min(880px, 100%);
+  max-height: min(88vh, 920px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.help-dialog-head,
+.help-dialog-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.9rem 1.15rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.help-dialog-foot {
+  border-bottom: 0;
+  border-top: 1px solid var(--border);
+  justify-content: flex-end;
+}
+
+.help-dialog-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.help-dialog-body {
+  padding: 0.4rem 1.2rem 1.2rem;
+  overflow: auto;
+  line-height: 1.65;
+}
+
+.help-dialog-body h1,
+.help-dialog-body h2,
+.help-dialog-body h3 {
+  margin: 1.1rem 0 0.45rem;
+}
+
+.help-dialog-body h1 {
+  font-size: 1.25rem;
+}
+
+.help-dialog-body h2 {
+  font-size: 1.05rem;
+}
+
+.help-dialog-body p,
+.help-dialog-body li {
+  color: var(--text);
+}
+
+.help-dialog-body ul,
+.help-dialog-body ol {
+  padding-left: 1.2rem;
+}
+
+.help-figure {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 0.75rem 0 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-deep);
+}
+
+.help-table-wrap {
+  overflow-x: auto;
+  margin: 0.6rem 0 1rem;
+}
+
+.help-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.help-table th,
+.help-table td {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.55rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.help-table th {
+  background: var(--bg-soft);
+}
+
+.help-doc-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-2);
+  cursor: pointer;
+  text-decoration: underline;
 }

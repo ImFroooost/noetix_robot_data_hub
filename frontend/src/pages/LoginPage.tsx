@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { Navigate } from "react-router-dom";
 import { useAuth } from "../auth";
+import { ThemeToggle } from "../theme";
 
 export function LoginPage() {
   const { user, loading, login } = useAuth();
@@ -26,8 +27,11 @@ export function LoginPage() {
 
   return (
     <div className="login-wrap">
+      <div className="login-theme-bar">
+        <ThemeToggle />
+      </div>
       <form className="card login-card stack" onSubmit={onSubmit}>
-        <h1>诺谛动作数据集</h1>
+        <h1>Noetix Robot Data Hub</h1>
         <p className="muted">人体动捕与机器人重定向数据管理平台</p>
         <label>
           用户名

@@ -285,7 +285,11 @@ export const api = {
     });
   },
   storageRescan: () =>
-    request("/api/storage/rescan", { method: "POST" }),
+    request<import("./types").CatalogRebuildStatus>("/api/storage/rescan", {
+      method: "POST",
+    }),
+  storageRescanStatus: () =>
+    request<import("./types").CatalogRebuildStatus>("/api/storage/rescan/status"),
   storageCreateBatch: (
     name: string,
     extra?: { taxonomy_tag_ids?: Record<string, number> }
