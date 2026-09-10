@@ -101,13 +101,12 @@ function NodeRow({
   const [renaming, setRenaming] = useState(false);
   const [renameVal, setRenameVal] = useState(node.name);
   const selected = selectedId === node.id;
-  const label = node.code ? `${node.code} ${node.name}` : node.name;
   const isDropTarget = dragOverId === node.id;
 
   return (
-    <div>
+    <div className="tax-branch">
       <div
-        className={`folder-row ${selected ? "active" : ""} ${
+        className={`folder-row tax-row ${selected ? "active is-selected" : ""} ${
           isDropTarget && dragOverPos === "into" ? "drop-target" : ""
         } ${isDropTarget && dragOverPos === "before" ? "drop-before" : ""} ${
           isDropTarget && dragOverPos === "after" ? "drop-after" : ""
@@ -159,14 +158,15 @@ function NodeRow({
           />
         ) : (
           <span
-            className="folder-name"
+            className="folder-name tax-name"
             title={
               manageable
                 ? `${node.path}\n拖拽可排序或移入其他节点；↑↓ 同级调整`
                 : node.path
             }
           >
-            {label}
+            {node.code ? <span className="tax-code">{node.code}</span> : null}
+            <span>{node.name}</span>
             {node.clip_count > 0 && (
               <span className="muted folder-meta"> ({node.clip_count})</span>
             )}
@@ -175,7 +175,7 @@ function NodeRow({
         {manageable && onMoveUp && (
           <button
             type="button"
-            className="secondary"
+            className="secondary tax-action"
             title="上移"
             disabled={!canMoveUp}
             style={{ padding: "0 0.3rem", fontSize: "0.75rem" }}
@@ -190,7 +190,7 @@ function NodeRow({
         {manageable && onMoveDown && (
           <button
             type="button"
-            className="secondary"
+            className="secondary tax-action"
             title="下移"
             disabled={!canMoveDown}
             style={{ padding: "0 0.3rem", fontSize: "0.75rem" }}
@@ -205,7 +205,7 @@ function NodeRow({
         {manageable && onCreateChild && (
           <button
             type="button"
-            className="secondary"
+            className="secondary tax-action"
             title="新建子节点"
             style={{ padding: "0 0.35rem", fontSize: "0.8rem" }}
             onClick={async (e) => {
@@ -221,7 +221,7 @@ function NodeRow({
         {manageable && onDelete && (
           <button
             type="button"
-            className="danger"
+            className="danger tax-action"
             title="删除"
             style={{ padding: "0 0.35rem", fontSize: "0.8rem" }}
             onClick={async (e) => {
@@ -423,7 +423,7 @@ export function TaxonomyTree({
   };
 
   return (
-    <div className="folder-tree">
+    <div className="folder-tree tax-tree">
       <div
         className={`folder-row ${selectedId == null ? "active" : ""} ${
           dragOverId === "root" ? "drop-target" : ""
@@ -442,7 +442,7 @@ export function TaxonomyTree({
           拖拽：上/下边缘同级排序，中间移入父节点；↑↓ 也可调序（序号随序更新）
         </p>
       )}
-      <div className="folder-tree-list">
+      <div className="folder-tree-list tax-tree-list">
         {tree.map((n, idx) => (
           <NodeRow
             key={n.id}

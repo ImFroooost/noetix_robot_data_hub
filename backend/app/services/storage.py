@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 from ..config import settings
+from .zip_names import decode_zip_filename
 
 
 def data_root() -> Path:
@@ -143,7 +144,22 @@ def extract_zip_to_robot_model(name: str, zip_source) -> tuple[str, str, str]:
         else:
             zf_ctx = zipfile.ZipFile(zip_source)
         with zf_ctx as zf:
-            zf.extractall(package_dir)
+            for info in zf.infolist():
+                name = decode_zip_filename(info)
+                if info.is_dir() or name.startswith("__MACOSX/"):
+                    continue
+                rel = Path(name)
+                if rel.is_absolute() or ".." in rel.parts:
+                    raise ValueError(f"压缩包包含非法路径：{name}")
+                target = (package_dir / rel).resolve()
+                if package_dir.resolve() not in target.parents and target != package_dir.resolve():
+                    raise ValueError(f"压缩包包含非法路径：{name}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if name.endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                with zf.open(info) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out)
     except zipfile.BadZipFile as e:
         raise ValueError(f"无效的 zip 文件：{e}") from e
 

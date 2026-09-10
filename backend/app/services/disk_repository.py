@@ -24,6 +24,7 @@ from typing import Any, BinaryIO
 
 from ..config import settings
 from .media_probe import probe_file, public_media
+from .zip_names import decode_zip_filename
 
 ProgressFn = Callable[[str, int, str], None]
 
@@ -1980,9 +1981,10 @@ def _safe_extract_zip(zip_file, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_file) as archive:
         for member in archive.infolist():
-            if member.is_dir() or member.filename.startswith("__MACOSX/"):
+            name = decode_zip_filename(member)
+            if member.is_dir() or name.startswith("__MACOSX/"):
                 continue
-            rel = safe_relative_path(member.filename)
+            rel = safe_relative_path(name)
             target = (destination / rel).resolve()
             if destination.resolve() not in target.parents:
                 raise ValueError("压缩包包含非法路径")

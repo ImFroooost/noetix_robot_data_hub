@@ -154,21 +154,32 @@ def _parse_child_index(parent_code: str, child_code: str) -> int | None:
     return None
 
 
+def _is_code_under_prefix(code: str, prefix: str) -> bool:
+    """Match A / A.1 and also first-level A1 / A10 / A1.2 under letter A."""
+    if not prefix or not code:
+        return False
+    if code == prefix:
+        return True
+    if code.startswith(prefix + "."):
+        return True
+    if len(prefix) == 1 and prefix.isalpha() and code.startswith(prefix):
+        tail = code[1:]
+        return bool(tail) and tail[0].isdigit()
+    return False
+
+
 def _rewrite_code_prefix(db: Session, scheme: str, old_prefix: str, new_prefix: str) -> None:
     if not old_prefix or old_prefix == new_prefix:
         return
-    # 使用 startswith（自动转义），避免 LIKE 把临时码中的 _ 当成通配符
     rows = (
         db.query(TaxonomyNode)
         .filter(TaxonomyNode.scheme == scheme)
-        .filter(
-            (TaxonomyNode.code == old_prefix)
-            | (TaxonomyNode.code.startswith(old_prefix + "."))
-        )
         .all()
     )
     for row in rows:
         code = row.code or ""
+        if not _is_code_under_prefix(code, old_prefix):
+            continue
         if code == old_prefix:
             row.code = new_prefix
         else:
@@ -183,24 +194,15 @@ def _letter_for_scheme_index(idx: int) -> str:
 
 
 def _sync_scheme_code_prefixes_to_sort_order(db: Session) -> None:
-    """按 sort_order 将各标准编码前缀重编为 A、B、C…，并级联改写节点 code。"""
+    """按 sort_order 将各标准编码前缀重编为 A、B、C…，并按树顺序重算全部节点码。"""
     rows = list_schemes(db)
     if not rows:
         return
-    # 两阶段，避免互换前缀时唯一约束/节点码互相覆盖
     for idx, row in enumerate(rows):
-        old = (row.code_prefix or "").strip()
-        temp = f"#{idx}"
-        if old and old != temp:
-            _rewrite_code_prefix(db, row.key, old, temp)
-        row.code_prefix = temp
+        row.code_prefix = _letter_for_scheme_index(idx)
     db.flush()
-    for idx, row in enumerate(rows):
-        new_prefix = _letter_for_scheme_index(idx)
-        temp = f"#{idx}"
-        _rewrite_code_prefix(db, row.key, temp, new_prefix)
-        row.code_prefix = new_prefix
-    db.flush()
+    for row in rows:
+        _renumber_from(db, row.key, None)
 
 
 def _siblings_query(db: Session, scheme: str, parent_id: int | None):
@@ -210,63 +212,40 @@ def _siblings_query(db: Session, scheme: str, parent_id: int | None):
     return q.filter(TaxonomyNode.parent_id == parent_id)
 
 
-def _renumber_children(db: Session, scheme: str, parent_id: int | None) -> None:
-    """按 sort_order 重编同级序号码，并级联更新子孙编码前缀。
-
-    根级（parent_id=None）通常为体系根字母节点，只整理 sort_order，不改编码。
-    """
-    # 确保此前对本 session 的 sort_order 写入对后续查询可见
+def _renumber_from(db: Session, scheme: str, parent_id: int | None) -> None:
+    """按当前树顺序重算该节点以下全部序号码。数据标签按 node_id 绑定，不受改码影响。"""
     db.flush()
-
+    siblings = (
+        _siblings_query(db, scheme, parent_id)
+        .order_by(TaxonomyNode.sort_order.asc(), TaxonomyNode.id.asc())
+        .all()
+    )
     if parent_id is None:
-        siblings = (
-            _siblings_query(db, scheme, None)
-            .order_by(TaxonomyNode.sort_order.asc(), TaxonomyNode.id.asc())
-            .all()
-        )
+        scheme_def = get_scheme(db, scheme)
+        prefix = ((scheme_def.code_prefix if scheme_def else "") or "X").strip()
         for idx, node in enumerate(siblings):
             node.sort_order = idx
+            node.code = prefix if len(siblings) == 1 else _child_code(prefix, idx + 1)
+        db.flush()
+        for node in siblings:
+            _renumber_from(db, scheme, node.id)
         return
 
     parent = db.get(TaxonomyNode, parent_id)
     if not parent or _scheme_str(parent.scheme) != scheme:
         return
     parent_code = (parent.code or "").strip()
-    if not parent_code:
-        siblings = (
-            _siblings_query(db, scheme, parent_id)
-            .order_by(TaxonomyNode.sort_order.asc(), TaxonomyNode.id.asc())
-            .all()
-        )
-        for idx, node in enumerate(siblings):
-            node.sort_order = idx
-        return
-
-    siblings = (
-        _siblings_query(db, scheme, parent_id)
-        .order_by(TaxonomyNode.sort_order.asc(), TaxonomyNode.id.asc())
-        .all()
-    )
     for idx, node in enumerate(siblings):
         node.sort_order = idx
-
-    # 两阶段改码（临时码不含 LIKE 通配符），避免同级互换时前缀互相覆盖
+        node.code = _child_code(parent_code, idx + 1) if parent_code else str(idx + 1)
+    db.flush()
     for node in siblings:
-        old = (node.code or "").strip()
-        if not old:
-            continue
-        _rewrite_code_prefix(db, scheme, old, f"~T{node.id}~")
-    db.flush()
+        _renumber_from(db, scheme, node.id)
 
-    for idx, node in enumerate(siblings, start=1):
-        new_code = _child_code(parent_code, idx)
-        temp = f"~T{node.id}~"
-        current = (node.code or "").strip()
-        if current == temp or current.startswith(temp + "."):
-            _rewrite_code_prefix(db, scheme, temp, new_code)
-        else:
-            node.code = new_code
-    db.flush()
+
+def _renumber_children(db: Session, scheme: str, parent_id: int | None) -> None:
+    """兼容旧调用：从该父节点起按顺序重编整棵子树。"""
+    _renumber_from(db, scheme, parent_id)
 
 
 def _scheme_out(db: Session, row: TaxonomySchemeDef) -> TaxonomySchemeOut:
@@ -486,6 +465,37 @@ def restore_scheme_tree(
     return result
 
 
+@router.post("/schemes/{key}/renumber", response_model=list[TaxonomyNodeOut])
+def renumber_scheme_tree(
+    key: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_manage_data),
+):
+    """按当前树顺序重算该标准下全部节点序号。标签仍指向同一节点 id。"""
+    _require_registered_scheme(db, key)
+    _renumber_from(db, key, None)
+    write_audit(
+        db,
+        user_id=admin.id,
+        action="renumber",
+        entity_type="taxonomy_scheme",
+        entity_id=None,
+        detail={"key": key},
+    )
+    db.commit()
+    nodes = (
+        db.query(TaxonomyNode)
+        .filter(TaxonomyNode.scheme == key)
+        .order_by(
+            TaxonomyNode.sort_order.asc(),
+            TaxonomyNode.name.asc(),
+            TaxonomyNode.id.asc(),
+        )
+        .all()
+    )
+    return [_node_out(db, n) for n in nodes]
+
+
 @router.put("/schemes/reorder", response_model=list[TaxonomySchemeOut])
 def reorder_schemes(
     body: TaxonomySchemeReorder,
@@ -673,6 +683,7 @@ def create_node(
     )
     db.add(node)
     db.flush()
+    _renumber_from(db, scheme, parent.id if parent else None)
     write_audit(
         db,
         user_id=user.id,

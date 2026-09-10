@@ -26,13 +26,13 @@ export function LoginPage() {
   };
 
   return (
-    <div className="login-wrap">
+    <div className="login-shell">
       <div className="login-theme-bar">
         <ThemeToggle />
       </div>
-      <form className="card login-card stack" onSubmit={onSubmit}>
+      <form className="card login-card login-card-modern stack" onSubmit={onSubmit}>
         <h1>Noetix Robot Data Hub</h1>
-        <p className="muted">人体动捕与机器人重定向数据管理平台</p>
+        <p className="muted">人体动捕与机器人数据，集中浏览、上传和协作</p>
         <label>
           用户名
           <input value={username} onChange={(e) => setUsername(e.target.value)} required />

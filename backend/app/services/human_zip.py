@@ -8,6 +8,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .zip_names import decode_zip_filename
+
 
 def folder_name_from_zip_filename(filename: str | None) -> str:
     """``260729.zip`` → ``260729``; sanitize path separators."""
@@ -122,24 +124,30 @@ def group_human_files(paths: list[Path]) -> tuple[list[GroupedMotion], list[str]
     return groups, warnings
 
 
-def iter_zip_human_members(zf: zipfile.ZipFile) -> list[str]:
-    out: list[str] = []
+def iter_zip_human_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
+    out: list[tuple[zipfile.ZipInfo, str]] = []
     for info in zf.infolist():
         if info.is_dir():
             continue
-        name = info.filename.replace("\\", "/")
+        name = decode_zip_filename(info)
         base = Path(name).name
         if _is_ignored(Path(base)):
             continue
         if is_importable_filename(base):
-            out.append(name)
+            out.append((info, name))
     return out
 
 
-def safe_extract_member(zf: zipfile.ZipFile, member: str, dest_dir: Path) -> Path:
+def safe_extract_member(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    dest_dir: Path,
+    *,
+    filename: str | None = None,
+) -> Path:
     """Extract one member with zip-slip guard. Returns absolute extracted path."""
     dest_dir = dest_dir.resolve()
-    # Normalize member path (no absolute / drive escapes)
+    member = filename or decode_zip_filename(info)
     rel = Path(member.replace("\\", "/"))
     if rel.is_absolute() or ".." in rel.parts:
         raise ValueError(f"非法 zip 路径: {member}")
@@ -147,7 +155,7 @@ def safe_extract_member(zf: zipfile.ZipFile, member: str, dest_dir: Path) -> Pat
     if not str(target).startswith(str(dest_dir)):
         raise ValueError(f"非法 zip 路径: {member}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    with zf.open(member) as src, target.open("wb") as out:
+    with zf.open(info) as src, target.open("wb") as out:
         while True:
             chunk = src.read(1024 * 1024)
             if not chunk:
@@ -164,11 +172,11 @@ def extract_and_group_zip(zip_path: Path, work_dir: Path) -> tuple[list[GroupedM
         members = iter_zip_human_members(zf)
         if not members:
             return [], ["ZIP 中未找到可导入文件（按后缀识别格式，如 bvh/csv/fbx/tak 或新后缀）"]
-        for member in members:
+        for info, name in members:
             try:
-                extracted.append(safe_extract_member(zf, member, work_dir))
+                extracted.append(safe_extract_member(zf, info, work_dir, filename=name))
             except Exception as e:
-                warnings.append(f"解压失败 {member}: {e}")
+                warnings.append(f"解压失败 {name}: {e}")
     groups, gw = group_human_files(extracted)
     warnings.extend(gw)
     return groups, warnings

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from ..config import settings
+from .zip_names import decode_zip_filename
 from .dimensions import (
     load_dimension_schema,
     save_dimension_schema,
@@ -306,7 +307,7 @@ def extract_zip_members(zip_source, dest_dir: Path) -> list[Path]:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            name = Path(info.filename).name
+            name = Path(decode_zip_filename(info)).name
             if not name or name.startswith("."):
                 continue
             target = dest_dir / name

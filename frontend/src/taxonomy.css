@@ -1,0 +1,124 @@
+.tax-page .tax-scheme-tabs button {
+  border-radius: 999px;
+  transition: transform 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.tax-page .tax-scheme-tabs button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.tax-panel {
+  border: 1px solid color-mix(in srgb, var(--accent-2) 22%, var(--border));
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--sidebar) 55%, var(--bg-elev)), var(--bg-elev));
+  box-shadow: var(--shadow);
+  animation: tax-rise 0.28s ease;
+}
+
+.tax-detail {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent-soft) 70%, var(--bg-elev)), var(--bg-elev));
+}
+
+.tax-tree .folder-tree-list {
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  border-radius: 14px;
+  padding: 0.35rem;
+}
+
+.tax-row {
+  gap: 0.4rem;
+  margin: 0.12rem 0;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    transform 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.tax-row:hover {
+  background: var(--sidebar-hover);
+  border-color: color-mix(in srgb, var(--accent-2) 28%, var(--border));
+  transform: translateX(3px);
+}
+
+.tax-row.is-selected,
+.tax-row.active {
+  background: var(--sidebar-active);
+  border-color: color-mix(in srgb, var(--accent-2) 45%, var(--border));
+  box-shadow: inset 3px 0 0 var(--accent-2);
+}
+
+.tax-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.tax-code {
+  flex: 0 0 auto;
+  min-width: 2.1rem;
+  padding: 0.08rem 0.4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-2) 18%, var(--bg-soft));
+  color: var(--accent-2);
+  font-size: 0.72rem;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.tax-action {
+  min-height: 1.7rem !important;
+  min-width: 1.7rem;
+  border-radius: 999px !important;
+  padding: 0 0.35rem !important;
+  transition: transform 0.15s ease, filter 0.15s ease;
+}
+
+.tax-action:hover:not(:disabled) {
+  transform: scale(1.08);
+}
+
+.tax-branch {
+  animation: tax-rise 0.22s ease;
+}
+
+@keyframes tax-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.app-content .card {
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.app-content .card:hover {
+  border-color: color-mix(in srgb, var(--accent-2) 30%, var(--border));
+}
+
+.storage-page .card,
+.storage-model-page .card {
+  border-color: color-mix(in srgb, var(--accent-2) 16%, var(--border));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tax-row,
+  .tax-action,
+  .tax-branch,
+  .tax-panel,
+  .tax-page .tax-scheme-tabs button {
+    animation: none;
+    transition: none;
+  }
+}

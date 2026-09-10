@@ -146,6 +146,45 @@ function TreeAllButton({
   );
 }
 
+function DownloadToolbar({
+  count,
+  canDownload,
+  onDownload,
+  onClear,
+}: {
+  count: number;
+  canDownload?: boolean;
+  onDownload?: () => void;
+  onClear: () => void;
+}) {
+  if (!canDownload) return null;
+  return (
+    <div className="storage-tree-manage">
+      <span className="muted">已选 {count} 项</span>
+      <button
+        type="button"
+        className="secondary"
+        disabled={!count}
+        onClick={onDownload}
+      >
+        下载
+      </button>
+      <button type="button" className="secondary" disabled={!count} onClick={onClear}>
+        取消选择
+      </button>
+    </div>
+  );
+}
+
+function uniqueUnits(items: StorageUnit[]) {
+  const seen = new Set<string>();
+  return items.filter((unit) => {
+    if (seen.has(unit.key)) return false;
+    seen.add(unit.key);
+    return true;
+  });
+}
+
 function TreeToolbar({
   onCollapseAll,
   onExpandAll,
@@ -531,6 +570,9 @@ function UploaderTreePanel({
   selectedKey,
   onSelect,
   onUnitSelect,
+  canDownload,
+  currentUserId,
+  onDownload,
 }: {
   uploaders: StorageUploader[];
   units: StorageUnit[];
@@ -538,9 +580,25 @@ function UploaderTreePanel({
   selectedKey: string | null;
   onSelect: (id: number | null) => void;
   onUnitSelect: (unit: StorageUnit) => void;
+  canDownload?: boolean;
+  currentUserId?: number;
+  onDownload?: (units: StorageUnit[]) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [checkedUploaders, setCheckedUploaders] = useState<Record<string, boolean>>({});
+  const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const uploaderKeys = uploaders.map((item) => String(item.id));
+  const unitsOf = (uploader: StorageUploader) =>
+    units.filter((unit) =>
+      unit.files.some((file) =>
+        uploader.id === -1 ? !file.uploader : file.uploader?.id === uploader.id
+      )
+    );
+  const selectedUploaders = uploaders.filter((item) => checkedUploaders[String(item.id)]);
+  const selectedUnits = units.filter((unit) => checkedUnits[unit.key]);
+  const selectedCount = selectedUploaders.length + selectedUnits.length;
+  const canDownloadAny =
+    !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
   return (
     <div className="storage-tree storage-structure-tree">
@@ -549,18 +607,30 @@ function UploaderTreePanel({
         onExpandAll={() =>
           setExpanded(Object.fromEntries(uploaderKeys.map((key) => [key, true])))
         }
+        extra={
+          <DownloadToolbar
+            count={selectedCount}
+            canDownload={canDownloadAny}
+            onDownload={() =>
+              onDownload?.(
+                uniqueUnits([
+                  ...selectedUploaders.flatMap((item) => unitsOf(item)),
+                  ...selectedUnits,
+                ])
+              )
+            }
+            onClear={() => {
+              setCheckedUploaders({});
+              setCheckedUnits({});
+            }}
+          />
+        }
       />
       <TreeAllButton selected={selectedId == null} onClick={() => onSelect(null)}>
         全部上传用户
       </TreeAllButton>
       {uploaders.map((uploader) => {
-        const uploaderUnits = units.filter((unit) =>
-          unit.files.some((file) =>
-            uploader.id === -1
-              ? !file.uploader
-              : file.uploader?.id === uploader.id
-          )
-        );
+        const uploaderUnits = unitsOf(uploader);
         const key = String(uploader.id);
         const open = expanded[key] === true;
         return (
@@ -584,6 +654,18 @@ function UploaderTreePanel({
               }))
             }
             onSelect={() => onSelect(uploader.id)}
+            checked={!!checkedUploaders[key]}
+            onCheck={canDownloadAny ? (value) => setCheckedUploaders((current) => ({ ...current, [key]: value })) : undefined}
+            actions={
+              <TreeActions
+                canDownload={
+                  uploaderUnits.length > 0 &&
+                  (!!canDownload ||
+                    uploaderUnits.some((unit) => unitOwnedBy(unit, currentUserId)))
+                }
+                onDownload={() => onDownload?.(uploaderUnits)}
+              />
+            }
           >
             {open ? (
               <>
@@ -597,6 +679,14 @@ function UploaderTreePanel({
                       onSelect(uploader.id);
                       onUnitSelect(unit);
                     }}
+                    checked={!!checkedUnits[unit.key]}
+                    onCheck={canDownloadAny ? (value) => setCheckedUnits((current) => ({ ...current, [unit.key]: value })) : undefined}
+                    actions={
+                      <TreeActions
+                        canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                        onDownload={() => onDownload?.([unit])}
+                      />
+                    }
                   />
                 ))}
                 {!uploaderUnits.length && (
@@ -637,22 +727,30 @@ function UploadSessionTree({
   selectedSessionId,
   selectedUnitKey,
   canDeleteSession,
+  canDownload,
+  currentUserId,
   onSelectSession,
   onSelectUnit,
   onDeleteSession,
   onDeleteSessionUnit,
+  onDownload,
 }: {
   sessions: StorageUploadSession[];
   units: StorageUnit[];
   selectedSessionId: string | null;
   selectedUnitKey: string | null;
   canDeleteSession?: (session: StorageUploadSession) => boolean;
+  canDownload?: boolean;
+  currentUserId?: number;
   onSelectSession: (session: StorageUploadSession) => void;
   onSelectUnit: (session: StorageUploadSession, unit: StorageUnit) => void;
   onDeleteSession?: (session: StorageUploadSession) => void;
   onDeleteSessionUnit?: (session: StorageUploadSession, unit: StorageUnit) => void;
+  onDownload?: (units: StorageUnit[]) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [checkedSessions, setCheckedSessions] = useState<Record<string, boolean>>({});
+  const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const unitsByKey = new Map(units.map((unit) => [unit.key, unit]));
   const unitsByName = new Map<string, StorageUnit[]>();
   units.forEach((unit) => {
@@ -660,6 +758,22 @@ function UploadSessionTree({
     list.push(unit);
     unitsByName.set(`${unit.batch}::${unit.name}`, list);
   });
+  const unitsOf = (session: StorageUploadSession) =>
+    session.unit_names
+      .map(
+        (name) =>
+          unitsByKey.get(`${session.batch}::${name}`) ||
+          unitsByName.get(`${session.batch}::${name}`)?.[0]
+      )
+      .filter((item): item is StorageUnit => !!item);
+  const unitCheckKey = (sessionId: string, unitKey: string) => `${sessionId}:${unitKey}`;
+  const selectedSessions = sessions.filter((item) => checkedSessions[item.id]);
+  const selectedUnits = sessions.flatMap((session) =>
+    unitsOf(session).filter((unit) => checkedUnits[unitCheckKey(session.id, unit.key)])
+  );
+  const selectedCount = selectedSessions.length + selectedUnits.length;
+  const canDownloadAny =
+    !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
   return (
     <div className="storage-tree storage-structure-tree">
@@ -670,15 +784,27 @@ function UploadSessionTree({
         onExpandAll={() =>
           setExpanded(Object.fromEntries(sessions.map((item) => [item.id, true])))
         }
+        extra={
+          <DownloadToolbar
+            count={selectedCount}
+            canDownload={canDownloadAny}
+            onDownload={() =>
+              onDownload?.(
+                uniqueUnits([
+                  ...selectedSessions.flatMap((item) => unitsOf(item)),
+                  ...selectedUnits,
+                ])
+              )
+            }
+            onClear={() => {
+              setCheckedSessions({});
+              setCheckedUnits({});
+            }}
+          />
+        }
       />
       {sessions.map((session) => {
-        const sessionUnits = session.unit_names
-          .map(
-            (name) =>
-              unitsByKey.get(`${session.batch}::${name}`) ||
-              unitsByName.get(`${session.batch}::${name}`)?.[0]
-          )
-          .filter((item): item is StorageUnit => !!item);
+        const sessionUnits = unitsOf(session);
         const open = expanded[session.id] === true;
         const allowDelete = !!canDeleteSession?.(session);
         return (
@@ -703,35 +829,68 @@ function UploadSessionTree({
               }))
             }
             onSelect={() => onSelectSession(session)}
+            checked={!!checkedSessions[session.id]}
+            onCheck={
+              canDownloadAny
+                ? (value) =>
+                    setCheckedSessions((current) => ({
+                      ...current,
+                      [session.id]: value,
+                    }))
+                : undefined
+            }
             actions={
-              allowDelete && onDeleteSession ? (
-                <TreeActions
-                  canEdit
-                  onDelete={() => onDeleteSession(session)}
-                />
-              ) : undefined
+              <TreeActions
+                canDownload={
+                  sessionUnits.length > 0 &&
+                  (!!canDownload ||
+                    sessionUnits.some((unit) => unitOwnedBy(unit, currentUserId)))
+                }
+                canEdit={allowDelete}
+                onDownload={() => onDownload?.(sessionUnits)}
+                onDelete={
+                  allowDelete && onDeleteSession
+                    ? () => onDeleteSession(session)
+                    : undefined
+                }
+              />
             }
           >
             {open ? (
               <>
                 {sessionUnits.map((unit) => {
                   const unitPaths = sessionUnitPaths(session, unit);
+                  const checkKey = unitCheckKey(session.id, unit.key);
                   return (
                     <TreeUnitItem
-                      key={`${session.id}:${unit.key}`}
+                      key={checkKey}
                       title={unit.name}
                       meta={`${unitPaths.length || unit.file_count} 个文件`}
                       selected={
                         selectedSessionId === session.id && selectedUnitKey === unit.key
                       }
                       onClick={() => onSelectUnit(session, unit)}
+                      checked={!!checkedUnits[checkKey]}
+                      onCheck={
+                        canDownloadAny
+                          ? (value) =>
+                              setCheckedUnits((current) => ({
+                                ...current,
+                                [checkKey]: value,
+                              }))
+                          : undefined
+                      }
                       actions={
-                        allowDelete && onDeleteSessionUnit && unitPaths.length ? (
-                          <TreeActions
-                            canEdit
-                            onDelete={() => onDeleteSessionUnit(session, unit)}
-                          />
-                        ) : undefined
+                        <TreeActions
+                          canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                          canEdit={allowDelete && !!unitPaths.length}
+                          onDownload={() => onDownload?.([unit])}
+                          onDelete={
+                            allowDelete && onDeleteSessionUnit && unitPaths.length
+                              ? () => onDeleteSessionUnit(session, unit)
+                              : undefined
+                          }
+                        />
                       }
                     />
                   );
@@ -756,6 +915,9 @@ function TaxonomyTreePanel({
   selectedKey,
   onSelect,
   onUnitSelect,
+  canDownload,
+  currentUserId,
+  onDownload,
 }: {
   nodes: TaxonomyNode[];
   units: StorageUnit[];
@@ -763,9 +925,14 @@ function TaxonomyTreePanel({
   selectedKey: string | null;
   onSelect: (id: number | null) => void;
   onUnitSelect: (unit: StorageUnit) => void;
+  canDownload?: boolean;
+  currentUserId?: number;
+  onDownload?: (units: StorageUnit[]) => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
   const [expandedUnits, setExpandedUnits] = useState<Record<number, boolean>>({});
+  const [checkedNodes, setCheckedNodes] = useState<Record<number, boolean>>({});
+  const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const children = new Map<number | null, TaxonomyNode[]>();
   nodes.forEach((node) => {
     const list = children.get(node.parent_id) || [];
@@ -776,16 +943,22 @@ function TaxonomyTreePanel({
     list.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name))
   );
   const scheme = nodes[0]?.scheme || "";
-  const countUnder = (node: TaxonomyNode) =>
+  const unitsUnder = (node: TaxonomyNode) =>
     units.filter((unit) => {
       const taggedId = unit.taxonomy_tag_ids?.[scheme];
       const tagged = nodes.find((item) => item.id === taggedId);
       return !!tagged && tagged.path.startsWith(node.path);
-    }).length;
+    });
+  const selectedNodes = nodes.filter((node) => checkedNodes[node.id]);
+  const selectedUnits = units.filter((unit) => checkedUnits[unit.key]);
+  const selectedCount = selectedNodes.length + selectedUnits.length;
+  const canDownloadAny =
+    !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
   const renderNodes = (parentId: number | null, depth = 0): ReactNode =>
     (children.get(parentId) || []).map((node) => {
       const childRows = children.get(node.id) || [];
+      const nodeUnits = unitsUnder(node);
       const directUnits = units.filter(
         (unit) => unit.taxonomy_tag_ids?.[scheme] === node.id
       );
@@ -800,7 +973,7 @@ function TaxonomyTreePanel({
           open={open}
           selected={selectedId === node.id}
           title={node.code ? `${node.code} ${node.name}` : node.name}
-          meta={<span>{countUnder(node)} 个单元</span>}
+          meta={<span>{nodeUnits.length} 个单元</span>}
           toggleLabel={open ? "收起分类" : "展开分类"}
           onToggle={() => {
             if (hasNested) {
@@ -810,6 +983,23 @@ function TaxonomyTreePanel({
             setExpandedUnits((current) => ({ ...current, [node.id]: !unitsVisible }));
           }}
           onSelect={() => onSelect(node.id)}
+          checked={!!checkedNodes[node.id]}
+          onCheck={
+            canDownloadAny
+              ? (value) =>
+                  setCheckedNodes((current) => ({ ...current, [node.id]: value }))
+              : undefined
+          }
+          actions={
+            <TreeActions
+              canDownload={
+                nodeUnits.length > 0 &&
+                (!!canDownload ||
+                  nodeUnits.some((unit) => unitOwnedBy(unit, currentUserId)))
+              }
+              onDownload={() => onDownload?.(nodeUnits)}
+            />
+          }
         >
           {unitsVisible &&
             directUnits.map((unit) => (
@@ -822,6 +1012,22 @@ function TaxonomyTreePanel({
                   onSelect(node.id);
                   onUnitSelect(unit);
                 }}
+                checked={!!checkedUnits[unit.key]}
+                onCheck={
+                  canDownloadAny
+                    ? (value) =>
+                        setCheckedUnits((current) => ({
+                          ...current,
+                          [unit.key]: value,
+                        }))
+                    : undefined
+                }
+                actions={
+                  <TreeActions
+                    canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                    onDownload={() => onDownload?.([unit])}
+                  />
+                }
               />
             ))}
           {dirOpen && childRows.length > 0 && renderNodes(node.id, depth + 1)}
@@ -843,6 +1049,24 @@ function TaxonomyTreePanel({
           setCollapsed({});
           setExpandedUnits(Object.fromEntries(nodes.map((node) => [node.id, true])));
         }}
+        extra={
+          <DownloadToolbar
+            count={selectedCount}
+            canDownload={canDownloadAny}
+            onDownload={() =>
+              onDownload?.(
+                uniqueUnits([
+                  ...selectedNodes.flatMap((node) => unitsUnder(node)),
+                  ...selectedUnits,
+                ])
+              )
+            }
+            onClear={() => {
+              setCheckedNodes({});
+              setCheckedUnits({});
+            }}
+          />
+        }
       />
       <TreeAllButton selected={selectedId == null} onClick={() => onSelect(null)}>
         全部分类节点
@@ -2430,6 +2654,9 @@ export function StorageWorkspace({
                   setSelectedKey(unit.key);
                   setFocus({ kind: "unit", key: unit.key });
                 }}
+                canDownload={canDownloadItems}
+                currentUserId={user?.id}
+                onDownload={(units) => handleDownloadItems([], units)}
               />
             </>
           )}
@@ -2446,6 +2673,9 @@ export function StorageWorkspace({
                   setSelectedKey(unit.key);
                   setFocus({ kind: "unit", key: unit.key });
                 }}
+                canDownload={canDownloadItems}
+                currentUserId={user?.id}
+                onDownload={(units) => handleDownloadItems([], units)}
               />
             </>
           )}
@@ -2482,6 +2712,9 @@ export function StorageWorkspace({
                 focus?.kind === "unit" || focus?.kind === "file" ? selectedKey : null
               }
               canDeleteSession={canDeleteUploadSession}
+              canDownload={canDownloadItems}
+              currentUserId={user?.id}
+              onDownload={(units) => handleDownloadItems([], units)}
               onSelectSession={(session) => {
                 setActiveSessionId(session.id);
                 setFocus({ kind: "upload_session", key: session.id });
@@ -2556,15 +2789,32 @@ export function StorageWorkspace({
                     {focusedSession.username || "上传者未知"}
                   </span>
                 </div>
-                {canDeleteUploadSession(focusedSession) && (
-                  <button
-                    type="button"
-                    className="danger"
-                    onClick={() => void handleDeleteUploadSession(focusedSession)}
-                  >
-                    删除本次上传
-                  </button>
-                )}
+                <div className="row" style={{ gap: 8 }}>
+                  {(canDownloadItems || focusedSession.user_id === user?.id) && (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => {
+                        const sessionUnits = (data?.units || []).filter((unit) =>
+                          focusedSession.unit_names.includes(unit.name) &&
+                          unit.batch === focusedSession.batch
+                        );
+                        handleDownloadItems([], sessionUnits);
+                      }}
+                    >
+                      下载本次上传
+                    </button>
+                  )}
+                  {canDeleteUploadSession(focusedSession) && (
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => void handleDeleteUploadSession(focusedSession)}
+                    >
+                      删除本次上传
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="storage-preview-empty">
                 这是一次独立上传记录，不会和同批次的其它上传合并。请在右侧修改本次上传时设置的款式、姓名等参数，保存后只作用于这次上传的文件。也可从左侧展开后选择其中的数据单元。
@@ -2585,6 +2835,15 @@ export function StorageWorkspace({
                   </span>
                 </div>
                 <div className="row" style={{ gap: 8 }}>
+                  {(canDownloadItems || unitOwnedBy(selected, user?.id)) && (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => handleDownloadItems([], [selected])}
+                    >
+                      下载此单元
+                    </button>
+                  )}
                   {selectedFile &&
                     (canDownloadItems || selectedFile.uploader?.id === user?.id) && (
                     <button

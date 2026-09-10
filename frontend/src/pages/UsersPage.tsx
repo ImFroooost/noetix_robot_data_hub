@@ -240,7 +240,6 @@ export function UsersPage() {
   return (
     <div className="page stack">
       <div className="card stack">
-        <h1>用户管理</h1>
         <p className="muted" style={{ margin: 0 }}>
           普通角色的能力为「受限」：只对已分配的文件夹或分类节点生效。超级角色的对应能力为全量。
           「管理数据」包含同范围的浏览、下载、标注、上传。只有超级管理者可以管理用户。点「进入视角」可按该用户的权限浏览界面。

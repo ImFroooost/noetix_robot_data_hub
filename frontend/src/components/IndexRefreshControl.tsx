@@ -16,7 +16,7 @@ function formatStats(status: CatalogRebuildStatus) {
   return parts.join(" · ");
 }
 
-export function IndexRefreshControl() {
+export function IndexRefreshControl({ className = "btn-primary" }: { className?: string }) {
   const [status, setStatus] = useState<CatalogRebuildStatus | null>(null);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
@@ -117,7 +117,7 @@ export function IndexRefreshControl() {
     <div className="index-refresh">
       <button
         type="button"
-        className="secondary help-trigger"
+        className={className}
         disabled={running}
         onClick={() => void startRefresh()}
       >

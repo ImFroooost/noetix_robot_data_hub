@@ -7,6 +7,8 @@ import { ThemeProvider } from "./theme";
 import "./styles.css";
 import "./recovered-ui.css";
 import "./theme.css";
+import "./shell.css";
+import "./taxonomy.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

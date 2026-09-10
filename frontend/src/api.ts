@@ -239,6 +239,11 @@ export const api = {
       `/api/taxonomies/schemes/${encodeURIComponent(key)}/restore`,
       { method: "POST" }
     ),
+  renumberTaxonomyScheme: (key: string) =>
+    request<import("./types").TaxonomyNode[]>(
+      `/api/taxonomies/schemes/${encodeURIComponent(key)}/renumber`,
+      { method: "POST" }
+    ),
   createTaxonomyNode: (body: Record<string, unknown>) =>
     request<import("./types").TaxonomyNode>("/api/taxonomies/nodes", {
       method: "POST",

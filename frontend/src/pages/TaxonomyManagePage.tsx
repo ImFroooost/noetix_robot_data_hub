@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import { ResizableColumns, ResizableHeight } from "../components/ResizableColumns";
@@ -37,7 +36,17 @@ export function TaxonomyManagePage() {
   };
 
   useEffect(() => {
-    load().catch((e) => setError(e.message));
+    (async () => {
+      try {
+        const rows = await api.listTaxonomySchemes();
+        for (const row of rows) {
+          await api.renumberTaxonomyScheme(row.key);
+        }
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "加载失败");
+      }
+    })();
   }, []);
 
   const schemeNodes = useMemo(
@@ -116,7 +125,8 @@ export function TaxonomyManagePage() {
     try {
       const next = await api.reorderTaxonomySchemes(keys);
       setSchemes(next);
-      setMsg(dir < 0 ? "已左移" : "已右移");
+      await load();
+      setMsg(dir < 0 ? "已左移，序号已重编" : "已右移，序号已重编");
     } catch (e) {
       setError(e instanceof Error ? e.message : "排序失败");
     } finally {
@@ -171,13 +181,7 @@ export function TaxonomyManagePage() {
   };
 
   return (
-    <div className="page stack">
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <h1 style={{ margin: 0 }}>分类标签管理</h1>
-        <Link className="btn secondary" to="/">
-          ← 返回检索
-        </Link>
-      </div>
+    <div className="page stack tax-page">
       <p className="muted" style={{ margin: 0 }}>
         可维护多套独立分类标准：支持重命名、左右排序；内置标准不可删除。树节点支持拖拽排序/移入、↑↓
         同级调整；序号码随顺序自动重编。双击可重命名；「+」新建子节点。
@@ -185,7 +189,7 @@ export function TaxonomyManagePage() {
       {error && <div className="error">{error}</div>}
       {msg && <div className="success">{msg}</div>}
 
-      <div className="browse-tabs" style={{ flexWrap: "wrap", gap: 6 }}>
+      <div className="browse-tabs tax-scheme-tabs" style={{ flexWrap: "wrap", gap: 6 }}>
         {schemes.map((s) => (
           <button
             key={s.key}
@@ -305,7 +309,7 @@ export function TaxonomyManagePage() {
         mins={[240]}
         maxes={[720]}
       >
-        <div className="card stack">
+        <div className="card stack tax-panel">
           <h2>
             {taxonomySchemeLabel(scheme, schemes)}
             {currentScheme ? `（${currentScheme.code_prefix}）` : ""}
@@ -390,7 +394,7 @@ export function TaxonomyManagePage() {
             />
           </ResizableHeight>
         </div>
-        <div className="card stack">
+        <div className="card stack tax-panel tax-detail">
           <h2>节点详情</h2>
           {selected ? (
             <>
@@ -460,24 +464,12 @@ export function TaxonomyManagePage() {
                   </small>
                 </label>
               ) : null}
-              <label>
-                修改编码
-                <input
-                  key={`code-${selected.id}`}
-                  defaultValue={selected.code}
-                  onBlur={async (e) => {
-                    const code = e.target.value.trim();
-                    if (code === (selected.code || "")) return;
-                    try {
-                      await api.updateTaxonomyNode(selected.id, { code });
-                      await load();
-                      setMsg("编码已更新");
-                    } catch (err) {
-                      setError(err instanceof Error ? err.message : "更新失败");
-                    }
-                  }}
-                />
-              </label>
+              <div>
+                <div className="muted">编码规则</div>
+                <div className="muted" style={{ fontSize: "0.85rem" }}>
+                  序号随同级顺序自动重编（A1、A2、A2.1…）。数据标签按节点绑定，改名或调序不会换绑到别的类别。
+                </div>
+              </div>
               <label>
                 描述
                 <textarea
