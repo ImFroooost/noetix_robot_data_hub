@@ -1,9 +1,17 @@
-import { Children, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Children, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { api, downloadAuth, downloadAuthPost } from "../api";
 import { useAuth } from "../auth";
 import { usePreview } from "../preview/PreviewContext";
 import { FilePreviewDock } from "./FilePreviewDock";
 import { FolderBatchImport, UploadTaxonomyFields } from "./FolderBatchImport";
+import {
+  DEFAULT_HUMAN_MODEL,
+  HumanModelFields,
+  humanModelFileLabel,
+  humanModelFiles,
+  resolveHumanModelName,
+} from "./HumanModelFields";
+import { MotionKindFields } from "./MotionKindFields";
 import {
   RobotStyleFields,
   robotDescriptionVersions,
@@ -25,7 +33,19 @@ import type {
   TaxonomyNode,
   TaxonomySchemeDef,
 } from "../types";
-import { isSuperRole, needsManualCsvFps, parseCsvFps, taxonomySchemeLabel } from "../types";
+import {
+  isMotionModality,
+  isSmplFormat,
+  isSmplMotionFile,
+  isSuperRole,
+  MOTION_KIND_OPTIONS,
+  motionKindLabel,
+  needsManualCsvFps,
+  parseCsvFps,
+  resolveMotionKind,
+  taxonomySchemeLabel,
+  type MotionKind,
+} from "../types";
 
 const MODALITY_LABEL: Record<string, string> = {
   tpv_video: "第三视角视频",
@@ -265,6 +285,7 @@ function TreeGroup({
   onSelect,
   children,
   nested = false,
+  depth = 0,
   checked,
   onCheck,
   actions,
@@ -279,6 +300,7 @@ function TreeGroup({
   onSelect: () => void;
   children?: ReactNode;
   nested?: boolean;
+  depth?: number;
   checked?: boolean;
   onCheck?: (checked: boolean) => void;
   actions?: ReactNode;
@@ -326,8 +348,19 @@ function TreeGroup({
       )}
     </>
   );
-  if (nested) return <div className="storage-tree-nested">{body}</div>;
-  return <div className={`storage-tree-node ${open ? "is-open" : ""}`}>{body}</div>;
+  const wrapStyle = { "--tree-depth": depth } as CSSProperties;
+  if (nested) {
+    return (
+      <div className={`storage-tree-nested ${open ? "is-open" : ""}`} style={wrapStyle}>
+        {body}
+      </div>
+    );
+  }
+  return (
+    <div className={`storage-tree-node ${open ? "is-open" : ""}`} style={wrapStyle}>
+      {body}
+    </div>
+  );
 }
 
 function TreeUnitItem({
@@ -912,6 +945,7 @@ function TaxonomyTreePanel({
   nodes,
   units,
   selectedId,
+  selectedExact,
   selectedKey,
   onSelect,
   onUnitSelect,
@@ -922,16 +956,18 @@ function TaxonomyTreePanel({
   nodes: TaxonomyNode[];
   units: StorageUnit[];
   selectedId: number | null;
+  selectedExact?: boolean;
   selectedKey: string | null;
-  onSelect: (id: number | null) => void;
+  onSelect: (id: number | null, exact?: boolean) => void;
   onUnitSelect: (unit: StorageUnit) => void;
   canDownload?: boolean;
   currentUserId?: number;
   onDownload?: (units: StorageUnit[]) => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
-  const [expandedUnits, setExpandedUnits] = useState<Record<number, boolean>>({});
+  const [unspecifiedOpen, setUnspecifiedOpen] = useState<Record<number, boolean>>({});
   const [checkedNodes, setCheckedNodes] = useState<Record<number, boolean>>({});
+  const [checkedUnspecified, setCheckedUnspecified] = useState<Record<number, boolean>>({});
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const children = new Map<number | null, TaxonomyNode[]>();
   nodes.forEach((node) => {
@@ -949,40 +985,101 @@ function TaxonomyTreePanel({
       const tagged = nodes.find((item) => item.id === taggedId);
       return !!tagged && tagged.path.startsWith(node.path);
     });
+  const unspecifiedUnitsOf = (node: TaxonomyNode) =>
+    units.filter((unit) => unit.taxonomy_tag_ids?.[scheme] === node.id);
   const selectedNodes = nodes.filter((node) => checkedNodes[node.id]);
+  const selectedUnspecified = nodes.filter((node) => checkedUnspecified[node.id]);
   const selectedUnits = units.filter((unit) => checkedUnits[unit.key]);
-  const selectedCount = selectedNodes.length + selectedUnits.length;
+  const selectedCount =
+    selectedNodes.length + selectedUnspecified.length + selectedUnits.length;
   const canDownloadAny =
     !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
+  const renderUnspecified = (node: TaxonomyNode, depth: number) => {
+    const bucket = unspecifiedUnitsOf(node);
+    const open = unspecifiedOpen[node.id] !== false;
+    return (
+      <TreeGroup
+        key={`unspecified:${node.id}`}
+        nested={depth > 0}
+        depth={depth}
+        open={open}
+        selected={selectedId === node.id && !!selectedExact}
+        title="暂未细分"
+        meta={<span>{bucket.length} 个单元</span>}
+        toggleLabel={open ? "收起未细分" : "展开未细分"}
+        onToggle={() =>
+          setUnspecifiedOpen((current) => ({ ...current, [node.id]: !open }))
+        }
+        onSelect={() => onSelect(node.id, true)}
+        checked={!!checkedUnspecified[node.id]}
+        onCheck={
+          canDownloadAny
+            ? (value) =>
+                setCheckedUnspecified((current) => ({ ...current, [node.id]: value }))
+            : undefined
+        }
+        actions={
+          <TreeActions
+            canDownload={
+              bucket.length > 0 &&
+              (!!canDownload || bucket.some((unit) => unitOwnedBy(unit, currentUserId)))
+            }
+            onDownload={() => onDownload?.(bucket)}
+          />
+        }
+      >
+        {bucket.map((unit) => (
+          <TreeUnitItem
+            key={unit.key}
+            title={unit.name}
+            meta={unit.batch}
+            selected={selectedKey === unit.key}
+            onClick={() => {
+              onSelect(node.id, true);
+              onUnitSelect(unit);
+            }}
+            checked={!!checkedUnits[unit.key]}
+            onCheck={
+              canDownloadAny
+                ? (value) =>
+                    setCheckedUnits((current) => ({
+                      ...current,
+                      [unit.key]: value,
+                    }))
+                : undefined
+            }
+            actions={
+              <TreeActions
+                canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                onDownload={() => onDownload?.([unit])}
+              />
+            }
+          />
+        ))}
+        {!bucket.length && <div className="muted storage-tree-empty">暂无数据单元</div>}
+      </TreeGroup>
+    );
+  };
+
   const renderNodes = (parentId: number | null, depth = 0): ReactNode =>
     (children.get(parentId) || []).map((node) => {
-      const childRows = children.get(node.id) || [];
       const nodeUnits = unitsUnder(node);
-      const directUnits = units.filter(
-        (unit) => unit.taxonomy_tag_ids?.[scheme] === node.id
-      );
-      const hasNested = childRows.length > 0;
       const dirOpen = collapsed[node.id] !== true;
-      const unitsVisible = expandedUnits[node.id] === true;
-      const open = hasNested ? dirOpen : unitsVisible;
       return (
         <TreeGroup
           key={node.id}
           nested={depth > 0}
-          open={open}
-          selected={selectedId === node.id}
+          depth={depth}
+          open={dirOpen}
+          selected={selectedId === node.id && !selectedExact}
           title={node.code ? `${node.code} ${node.name}` : node.name}
           meta={<span>{nodeUnits.length} 个单元</span>}
-          toggleLabel={open ? "收起分类" : "展开分类"}
-          onToggle={() => {
-            if (hasNested) {
-              setCollapsed((current) => ({ ...current, [node.id]: dirOpen }));
-              return;
-            }
-            setExpandedUnits((current) => ({ ...current, [node.id]: !unitsVisible }));
-          }}
-          onSelect={() => onSelect(node.id)}
+          toggleLabel={dirOpen ? "收起分类" : "展开分类"}
+          onToggle={() =>
+            setCollapsed((current) => ({ ...current, [node.id]: dirOpen }))
+          }
+          onSelect={() => onSelect(node.id, false)}
           checked={!!checkedNodes[node.id]}
           onCheck={
             canDownloadAny
@@ -1001,39 +1098,8 @@ function TaxonomyTreePanel({
             />
           }
         >
-          {unitsVisible &&
-            directUnits.map((unit) => (
-              <TreeUnitItem
-                key={unit.key}
-                title={unit.name}
-                meta={unit.batch}
-                selected={selectedKey === unit.key}
-                onClick={() => {
-                  onSelect(node.id);
-                  onUnitSelect(unit);
-                }}
-                checked={!!checkedUnits[unit.key]}
-                onCheck={
-                  canDownloadAny
-                    ? (value) =>
-                        setCheckedUnits((current) => ({
-                          ...current,
-                          [unit.key]: value,
-                        }))
-                    : undefined
-                }
-                actions={
-                  <TreeActions
-                    canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
-                    onDownload={() => onDownload?.([unit])}
-                  />
-                }
-              />
-            ))}
-          {dirOpen && childRows.length > 0 && renderNodes(node.id, depth + 1)}
-          {unitsVisible && !directUnits.length && !childRows.length && (
-            <div className="muted storage-tree-empty">暂无数据单元</div>
-          )}
+          {dirOpen && renderNodes(node.id, depth + 1)}
+          {dirOpen && renderUnspecified(node, depth + 1)}
         </TreeGroup>
       );
     });
@@ -1042,12 +1108,12 @@ function TaxonomyTreePanel({
     <div className="storage-tree storage-structure-tree">
       <TreeToolbar
         onCollapseAll={() => {
-          setCollapsed({});
-          setExpandedUnits({});
+          setCollapsed(Object.fromEntries(nodes.map((node) => [node.id, true])));
+          setUnspecifiedOpen(Object.fromEntries(nodes.map((node) => [node.id, false])));
         }}
         onExpandAll={() => {
           setCollapsed({});
-          setExpandedUnits(Object.fromEntries(nodes.map((node) => [node.id, true])));
+          setUnspecifiedOpen(Object.fromEntries(nodes.map((node) => [node.id, true])));
         }}
         extra={
           <DownloadToolbar
@@ -1057,12 +1123,14 @@ function TaxonomyTreePanel({
               onDownload?.(
                 uniqueUnits([
                   ...selectedNodes.flatMap((node) => unitsUnder(node)),
+                  ...selectedUnspecified.flatMap((node) => unspecifiedUnitsOf(node)),
                   ...selectedUnits,
                 ])
               )
             }
             onClear={() => {
               setCheckedNodes({});
+              setCheckedUnspecified({});
               setCheckedUnits({});
             }}
           />
@@ -1085,7 +1153,7 @@ function QuickUpload({
   onUploaded,
 }: {
   unit: StorageUnit;
-  preset?: { ontology: string; modality: string };
+  preset?: { ontology: string; modality: string; motionKind?: MotionKind };
   manageOverride: boolean;
   onClose: () => void;
   onUploaded: () => void;
@@ -1096,27 +1164,42 @@ function QuickUpload({
   const [format, setFormat] = useState("");
   const [robotStyle, setRobotStyle] = useState("");
   const [robotVersion, setRobotVersion] = useState("");
+  const [humanModel, setHumanModel] = useState(DEFAULT_HUMAN_MODEL);
+  const [humanModelFile, setHumanModelFile] = useState("");
   const [personName, setPersonName] = useState("");
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
   const [fps, setFps] = useState("30");
+  const [motionKind, setMotionKind] = useState<MotionKind>(
+    resolveMotionKind(preset?.motionKind)
+  );
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
+  const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [replace, setReplace] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (ontology !== "robot") return;
+    if (ontology !== "robot" && ontology !== "human") return;
     let cancelled = false;
     api
       .storageModels()
       .then((data) => {
         if (cancelled) return;
         setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
+        setHumanInstances(data.instances.filter((item) => item.ontology === "human"));
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : "机器人款式加载失败");
+        if (!cancelled) {
+          setError(
+            e instanceof Error
+              ? e.message
+              : ontology === "robot"
+                ? "机器人款式加载失败"
+                : "人体模型加载失败"
+          );
+        }
       });
     return () => {
       cancelled = true;
@@ -1154,8 +1237,17 @@ function QuickUpload({
                 person_name: personName.trim(),
                 gender,
                 height: height.trim(),
+                ...(isSmplFormat(resolvedFormat, file.name)
+                  ? {
+                      human_model: resolveHumanModelName(humanModel),
+                      human_model_file: humanModelFile,
+                    }
+                  : {}),
               }),
           ...(needsManualCsvFps(ontology, resolvedFormat) ? { fps: parseCsvFps(fps) } : {}),
+          ...(isMotionModality(modality)
+            ? { motion_kind: resolveMotionKind(motionKind) }
+            : {}),
         })
       );
       form.set("file", file);
@@ -1212,6 +1304,9 @@ function QuickUpload({
             placeholder="选文件后自动用后缀，也可改"
           />
         </label>
+        {isMotionModality(modality) && (
+          <MotionKindFields value={motionKind} onChange={setMotionKind} />
+        )}
         {needsManualCsvFps(ontology, format) && (
           <label>
             帧率（Hz，机器人 CSV）
@@ -1234,6 +1329,17 @@ function QuickUpload({
             onChange={(nextStyle, nextVersion) => {
               setRobotStyle(nextStyle);
               setRobotVersion(nextVersion);
+            }}
+          />
+        )}
+        {ontology === "human" && isSmplFormat(format, file?.name) && (
+          <HumanModelFields
+            instances={humanInstances}
+            model={humanModel}
+            modelFile={humanModelFile}
+            onChange={(nextModel, nextFile) => {
+              setHumanModel(nextModel);
+              setHumanModelFile(nextFile);
             }}
           />
         )}
@@ -1394,11 +1500,15 @@ function EntityDetailPanel({
   const [quality, setQuality] = useState("");
   const [robotStyle, setRobotStyle] = useState("");
   const [robotVersion, setRobotVersion] = useState("");
+  const [humanModel, setHumanModel] = useState(DEFAULT_HUMAN_MODEL);
+  const [humanModelFile, setHumanModelFile] = useState("");
   const [personName, setPersonName] = useState("");
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
   const [fps, setFps] = useState("30");
+  const [motionKind, setMotionKind] = useState<MotionKind>("skeleton");
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
+  const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -1478,10 +1588,13 @@ function EntityDetailPanel({
     setQuality(String(annotation.quality || ""));
     setRobotStyle(String(annotation.robot_style || ""));
     setRobotVersion(String(annotation.robot_version || ""));
+    setHumanModel(resolveHumanModelName(annotation.human_model));
+    setHumanModelFile(String(annotation.human_model_file || ""));
     setPersonName(String(annotation.person_name || ""));
     setGender(String(annotation.gender || ""));
     setHeight(String(annotation.height || ""));
     setFps(String(parseCsvFps(annotation.fps)));
+    setMotionKind(resolveMotionKind(annotation.motion_kind));
     setSaved(false);
   }, [
     kind,
@@ -1493,18 +1606,28 @@ function EntityDetailPanel({
     annotation.quality,
     annotation.robot_style,
     annotation.robot_version,
+    annotation.human_model,
+    annotation.human_model_file,
     annotation.person_name,
     annotation.gender,
     annotation.height,
     annotation.fps,
+    annotation.motion_kind,
   ]);
 
   useEffect(() => {
-    if (
-      (kind !== "file" && kind !== "upload_session") ||
-      (kind === "file" && file?.ontology !== "robot" && detail?.ontology !== "robot") ||
-      (kind === "upload_session" && session?.ontology !== "robot")
-    ) {
+    const needRobot =
+      (kind === "file" && (file?.ontology === "robot" || detail?.ontology === "robot")) ||
+      (kind === "upload_session" && session?.ontology === "robot");
+    const needHuman =
+      (kind === "file" && isSmplMotionFile(detail || file)) ||
+      (kind === "upload_session" &&
+        isSmplMotionFile({
+          ontology: session?.ontology,
+          modality: session?.modality,
+          format: session?.format,
+        }));
+    if ((kind !== "file" && kind !== "upload_session") || (!needRobot && !needHuman)) {
       return;
     }
     let cancelled = false;
@@ -1512,15 +1635,41 @@ function EntityDetailPanel({
       .storageModels()
       .then((data) => {
         if (cancelled) return;
-        setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
+        if (needRobot) {
+          setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
+        }
+        if (needHuman) {
+          setHumanInstances(data.instances.filter((item) => item.ontology === "human"));
+        }
       })
       .catch((e) => {
-        if (!cancelled) onError(e instanceof Error ? e.message : "机器人款式加载失败");
+        if (!cancelled) {
+          onError(
+            e instanceof Error
+              ? e.message
+              : needRobot
+                ? "机器人款式加载失败"
+                : "人体模型加载失败"
+          );
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [kind, file?.ontology, detail?.ontology, session?.ontology]);
+  }, [
+    kind,
+    file?.ontology,
+    file?.modality,
+    file?.format,
+    file?.name,
+    detail?.ontology,
+    detail?.modality,
+    detail?.format,
+    detail?.name,
+    session?.ontology,
+    session?.modality,
+    session?.format,
+  ]);
 
   const paramOntology =
     kind === "upload_session" ? session?.ontology : viewFile?.ontology;
@@ -1547,12 +1696,40 @@ function EntityDetailPanel({
       const csvFps = needsManualCsvFps(paramOntology, viewFile?.format || session?.format)
         ? { fps: parseCsvFps(fps) }
         : {};
+      const smplAnnotation = isSmplMotionFile(
+        kind === "upload_session"
+          ? { ontology: session?.ontology, modality: session?.modality, format: session?.format }
+          : viewFile
+      )
+        ? { human_model: resolveHumanModelName(humanModel), human_model_file: humanModelFile }
+        : {};
+      const motionAnnotation = isMotionModality(
+        kind === "upload_session" ? session?.modality : viewFile?.modality
+      )
+        ? { motion_kind: resolveMotionKind(motionKind) }
+        : {};
       const fileAnnotation =
         viewFile?.ontology === "robot" || session?.ontology === "robot"
-          ? { quality, note, robot_style: robotStyle, robot_version: robotVersion, ...csvFps }
+          ? {
+              quality,
+              note,
+              robot_style: robotStyle,
+              robot_version: robotVersion,
+              ...motionAnnotation,
+              ...csvFps,
+            }
           : viewFile?.ontology === "human" || session?.ontology === "human"
-            ? { quality, note, person_name: personName.trim(), gender, height: height.trim(), ...csvFps }
-            : { quality, note, ...csvFps };
+            ? {
+                quality,
+                note,
+                person_name: personName.trim(),
+                gender,
+                height: height.trim(),
+                ...smplAnnotation,
+                ...motionAnnotation,
+                ...csvFps,
+              }
+            : { quality, note, ...motionAnnotation, ...csvFps };
       const body = {
         annotation:
           kind === "file" || kind === "upload_session" ? fileAnnotation : { note },
@@ -1740,6 +1917,26 @@ function EntityDetailPanel({
             );
           })}
           {(kind === "file" || kind === "upload_session") &&
+            isMotionModality(
+              kind === "upload_session" ? session?.modality : viewFile?.modality
+            ) &&
+            canEdit && (
+            <MotionKindFields
+              value={motionKind}
+              onChange={(next) => {
+                setMotionKind(next);
+                setSaved(false);
+              }}
+            />
+          )}
+          {(kind === "file" || kind === "upload_session") &&
+            isMotionModality(
+              kind === "upload_session" ? session?.modality : viewFile?.modality
+            ) &&
+            !canEdit && (
+            <DetailRow label="运动类型" value={motionKindLabel(motionKind)} />
+          )}
+          {(kind === "file" || kind === "upload_session") &&
             paramOntology === "robot" &&
             canEdit && (
             <RobotStyleFields
@@ -1769,6 +1966,47 @@ function EntityDetailPanel({
                       robotInstances.find((item) => item.name === robotStyle)
                     ),
                     robotVersion
+                  )}
+                />
+              ) : null}
+            </>
+          )}
+          {(kind === "file" || kind === "upload_session") &&
+            isSmplMotionFile(
+              kind === "upload_session"
+                ? { ontology: session?.ontology, modality: session?.modality, format: session?.format }
+                : viewFile
+            ) &&
+            canEdit && (
+            <HumanModelFields
+              instances={humanInstances}
+              model={humanModel}
+              modelFile={humanModelFile}
+              extraModel={humanModel}
+              onChange={(nextModel, nextFile) => {
+                setHumanModel(nextModel);
+                setHumanModelFile(nextFile);
+                setSaved(false);
+              }}
+            />
+          )}
+          {(kind === "file" || kind === "upload_session") &&
+            isSmplMotionFile(
+              kind === "upload_session"
+                ? { ontology: session?.ontology, modality: session?.modality, format: session?.format }
+                : viewFile
+            ) &&
+            !canEdit && (
+            <>
+              <DetailRow label="人体模型" value={resolveHumanModelName(humanModel)} />
+              {humanModelFiles(
+                humanInstances.find((item) => item.name === humanModel)
+              ).length > 1 || humanModelFile ? (
+                <DetailRow
+                  label="人体模型文件"
+                  value={humanModelFileLabel(
+                    humanModelFiles(humanInstances.find((item) => item.name === humanModel)),
+                    humanModelFile
                   )}
                 />
               ) : null}
@@ -1908,8 +2146,12 @@ function EntityDetailPanel({
 
 const ONTOLOGIES = ["human", "robot"] as const;
 
-function downloadKindKey(ontology: string, modality: string) {
-  return `${ontology}:${modality}`;
+function downloadKindKey(ontology: string, modality: string, format = "") {
+  return `${ontology}:${modality}:${format}`;
+}
+
+function fileFormatOf(file: StorageFile) {
+  return (file.format || formatFromFileName(file.name) || "unknown").toLowerCase();
 }
 
 function filesFromDownloadTargets(batches: StorageBatch[], units: StorageUnit[]) {
@@ -1938,25 +2180,31 @@ function DownloadPicker({
   units: StorageUnit[];
   busy: boolean;
   onClose: () => void;
-  onConfirm: (kinds: { ontology: string; modality: string }[]) => void;
+  onConfirm: (kinds: { ontology: string; modality: string; format: string }[]) => void;
 }) {
   const leftover = units.filter(
     (unit) => !batches.some((batch) => batch.name === unit.batch)
   );
   const files = filesFromDownloadTargets(batches, leftover);
   const available = new Set(
-    files.map((file) => downloadKindKey(file.ontology, file.modality))
+    files.map((file) => downloadKindKey(file.ontology, file.modality, fileFormatOf(file)))
   );
   const [checked, setChecked] = useState<Record<string, boolean>>(() =>
     Object.fromEntries([...available].map((key) => [key, true]))
   );
-  const selectedKinds = ONTOLOGIES.flatMap((ontology) =>
-    Object.keys(MODALITY_LABEL)
-      .filter((modality) => checked[downloadKindKey(ontology, modality)])
-      .map((modality) => ({ ontology, modality }))
-  );
+  const selectedKinds = files
+    .map((file) => ({
+      ontology: file.ontology,
+      modality: file.modality,
+      format: fileFormatOf(file),
+    }))
+    .filter((kind) => checked[downloadKindKey(kind.ontology, kind.modality, kind.format)])
+    .filter((kind, index, list) => {
+      const key = downloadKindKey(kind.ontology, kind.modality, kind.format);
+      return list.findIndex((item) => downloadKindKey(item.ontology, item.modality, item.format) === key) === index;
+    });
   const selectedCount = files.filter((file) =>
-    checked[downloadKindKey(file.ontology, file.modality)]
+    checked[downloadKindKey(file.ontology, file.modality, fileFormatOf(file))]
   ).length;
   const title =
     batches.length === 1 && !leftover.length
@@ -1980,41 +2228,69 @@ function DownloadPicker({
             <section key={ontology} className="storage-ontology-card">
               <h3>{ontology === "human" ? "人体数据" : "机器人数据"}</h3>
               {Object.entries(MODALITY_LABEL).map(([modality, label]) => {
-                const key = downloadKindKey(ontology, modality);
                 const rowFiles = files.filter(
                   (file) => file.ontology === ontology && file.modality === modality
                 );
-                const formats = [...new Set(rowFiles.map((file) => file.format))];
+                const formats = [...new Set(rowFiles.map((file) => fileFormatOf(file)))].sort();
+                const formatKeys = formats.map((format) =>
+                  downloadKindKey(ontology, modality, format)
+                );
                 const enabled = rowFiles.length > 0;
+                const selectedFormats = formatKeys.filter((key) => checked[key]);
+                const allOn = enabled && selectedFormats.length === formatKeys.length;
+                const someOn = selectedFormats.length > 0;
                 return (
-                  <label
+                  <div
                     key={modality}
                     className={`storage-download-row ${enabled ? "" : "is-empty"}`}
                   >
                     <input
                       type="checkbox"
                       disabled={!enabled || busy}
-                      checked={enabled && !!checked[key]}
+                      checked={allOn}
+                      ref={(el) => {
+                        if (el) el.indeterminate = someOn && !allOn;
+                      }}
                       onChange={(e) =>
                         setChecked((current) => ({
                           ...current,
-                          [key]: e.target.checked,
+                          ...Object.fromEntries(formatKeys.map((key) => [key, e.target.checked])),
                         }))
                       }
                     />
                     <span className={`storage-modality-name ${enabled ? "" : "missing"}`}>
                       {label}
                     </span>
-                    <span className="storage-file-pills">
+                    <span className="storage-download-formats">
                       {enabled ? (
-                        <span className="muted">
-                          {formats.join(" / ")} · {rowFiles.length} 个文件
-                        </span>
+                        formats.map((format) => {
+                          const key = downloadKindKey(ontology, modality, format);
+                          const count = rowFiles.filter(
+                            (file) => fileFormatOf(file) === format
+                          ).length;
+                          return (
+                            <label key={format} className="storage-download-format">
+                              <input
+                                type="checkbox"
+                                disabled={busy}
+                                checked={!!checked[key]}
+                                onChange={(e) =>
+                                  setChecked((current) => ({
+                                    ...current,
+                                    [key]: e.target.checked,
+                                  }))
+                                }
+                              />
+                              {format}
+                              <span className="muted">{count}</span>
+                            </label>
+                          );
+                        })
                       ) : (
                         <span className="muted">缺省</span>
                       )}
                     </span>
-                  </label>
+                  </div>
                 );
               })}
             </section>
@@ -2037,6 +2313,19 @@ function DownloadPicker({
   );
 }
 
+function matrixRows() {
+  return Object.entries(MODALITY_LABEL).flatMap(([modality, label]) =>
+    modality === "motion"
+      ? MOTION_KIND_OPTIONS.map(([kind, kindLabel]) => ({
+          key: `${modality}:${kind}`,
+          modality,
+          motionKind: kind,
+          label: kindLabel,
+        }))
+      : [{ key: modality, modality, motionKind: undefined as MotionKind | undefined, label }]
+  );
+}
+
 function UnitMatrix({
   unit,
   selectedFile,
@@ -2048,19 +2337,26 @@ function UnitMatrix({
   selectedFile: StorageFile | null;
   onFile: (file: StorageFile) => void;
   canUpload: boolean;
-  onQuickUpload: (preset: { ontology: string; modality: string }) => void;
+  onQuickUpload: (preset: {
+    ontology: string;
+    modality: string;
+    motionKind?: MotionKind;
+  }) => void;
 }) {
   return (
     <div className="storage-unit-matrix">
       {(["human", "robot"] as const).map((ontology) => (
         <section key={ontology} className="storage-ontology-card">
           <h3>{ontology === "human" ? "人体数据" : "机器人数据"}</h3>
-          {Object.entries(MODALITY_LABEL).map(([modality, label]) => {
+          {matrixRows().map(({ key, modality, motionKind, label }) => {
             const files = unit.files.filter(
-              (f) => f.ontology === ontology && f.modality === modality
+              (f) =>
+                f.ontology === ontology &&
+                f.modality === modality &&
+                (!motionKind || resolveMotionKind(f.annotation?.motion_kind) === motionKind)
             );
             return (
-              <div className="storage-modality-row" key={modality}>
+              <div className="storage-modality-row" key={key}>
                 <div
                   className={`storage-modality-name ${files.length ? "" : "missing"}`}
                   title={files.length ? `查看${label}文件信息` : undefined}
@@ -2104,7 +2400,7 @@ function UnitMatrix({
                         onFile(last);
                         return;
                       }
-                      onQuickUpload({ ontology, modality });
+                      onQuickUpload({ ontology, modality, motionKind });
                     }}
                   >
                     +
@@ -2133,6 +2429,11 @@ export function StorageWorkspace({
   const [nodes, setNodes] = useState<TaxonomyNode[]>([]);
   const [mode, setMode] = useState("folder");
   const [tagId, setTagId] = useState<number | null>(null);
+  const [tagExact, setTagExact] = useState(false);
+  const selectTag = (id: number | null, exact = false) => {
+    setTagId(id);
+    setTagExact(Boolean(exact) && id != null);
+  };
   const [query, setQuery] = useState("");
   const [sortMode, setSortMode] = useState("name_asc");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -2141,6 +2442,7 @@ export function StorageWorkspace({
   const [quickPreset, setQuickPreset] = useState<{
     ontology: string;
     modality: string;
+    motionKind?: MotionKind;
   } | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -2181,6 +2483,8 @@ export function StorageWorkspace({
           mode === "folder" || mode === "uploader" ? undefined : mode,
         tag_id:
           mode === "folder" || mode === "uploader" ? undefined : tagId,
+        tag_exact:
+          mode === "folder" || mode === "uploader" || !tagExact ? undefined : 1,
         uploader_id: variant === "upload" ? user?.id : undefined,
         include_empty: variant === "manage" ? 1 : undefined,
       }, force);
@@ -2235,7 +2539,7 @@ export function StorageWorkspace({
 
   useEffect(() => {
     void load(true, false);
-  }, [mode, tagId, user?.id, variant]);
+  }, [mode, tagId, tagExact, user?.id, variant]);
 
   useEffect(() => {
     const onIndexUpdated = () => {
@@ -2243,7 +2547,7 @@ export function StorageWorkspace({
     };
     window.addEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
     return () => window.removeEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
-  }, [mode, tagId, user?.id, variant, query]);
+  }, [mode, tagId, tagExact, user?.id, variant, query]);
 
   const selected = useMemo(
     () => data?.units.find((unit) => unit.key === selectedKey) || null,
@@ -2436,7 +2740,9 @@ export function StorageWorkspace({
     setDownloadPick({ batches, units: leftover });
   };
 
-  const confirmDownload = async (kinds: { ontology: string; modality: string }[]) => {
+  const confirmDownload = async (
+    kinds: { ontology: string; modality: string; format: string }[]
+  ) => {
     if (!downloadPick || !kinds.length) return;
     const { batches, units } = downloadPick;
     const filename =
@@ -2475,33 +2781,56 @@ export function StorageWorkspace({
   }
 
   return (
-    <div className="page storage-page stack">
+    <div className={`page storage-page stack${variant === "upload" ? " is-upload" : ""}`}>
+      {variant === "upload" && (
+        <div className="card storage-upload-dock">
+          <section className="storage-upload-dock-tags">
+            <div className="storage-upload-preset-head">
+              <strong>预设分类标签</strong>
+              <span className="muted">先选标签再导入，弹窗和导入后都还能改</span>
+            </div>
+            <UploadTaxonomyFields
+              schemes={schemes}
+              nodes={nodes}
+              value={uploadTagIds}
+              onChange={setUploadTagIds}
+              canCreate={canCreateTaxonomy}
+              onNodesReload={reloadTaxonomies}
+            />
+          </section>
+          <section className="storage-upload-dock-panel is-import">
+            <div className="storage-upload-dock-title">
+              <strong>新建与导入</strong>
+              <span className="muted">也可把文件夹 / zip 拖到这里</span>
+            </div>
+            <FolderBatchImport
+              layout="dock"
+              schemes={schemes}
+              nodes={nodes}
+              canCreateTaxonomy={canCreateTaxonomy}
+              onNodesReload={reloadTaxonomies}
+              taxonomyTagIds={uploadTagIds}
+              onTaxonomyTagIdsChange={setUploadTagIds}
+              onImported={(batchName, sessionId) => {
+                pendingSelectBatch.current = batchName;
+                pendingSelectSession.current = sessionId || null;
+                setExtraBatches((current) =>
+                  current.includes(batchName) ? current : [...current, batchName]
+                );
+                if (sessionId && mode !== "upload_order") {
+                  setMode("upload_order");
+                  return;
+                }
+                void load(true);
+              }}
+              onError={setError}
+              onMessage={setMessage}
+            />
+          </section>
+        </div>
+      )}
+      {variant !== "upload" && (
       <div className="storage-toolbar card">
-        {variant === "upload" && (
-          <div className="storage-filter-line">
-            <span className="muted">分类标准：</span>
-            <button
-              type="button"
-              className={mode === "folder" ? "active" : "secondary"}
-              onClick={() => {
-                setMode("folder");
-                setTagId(null);
-              }}
-            >
-              存储结构
-            </button>
-            <button
-              type="button"
-              className={mode === "upload_order" ? "active" : "secondary"}
-              onClick={() => {
-                setMode("upload_order");
-                setTagId(null);
-              }}
-            >
-              上传顺序
-            </button>
-          </div>
-        )}
         {!structureOnly && (
           <div className="storage-filter-line">
             <span className="muted">分类标准：</span>
@@ -2510,7 +2839,7 @@ export function StorageWorkspace({
               className={mode === "folder" ? "active" : "secondary"}
               onClick={() => {
                 setMode("folder");
-                setTagId(null);
+                selectTag(null);
               }}
             >
               存储结构
@@ -2520,7 +2849,7 @@ export function StorageWorkspace({
               className={mode === "uploader" ? "active" : "secondary"}
               onClick={() => {
                 setMode("uploader");
-                setTagId(null);
+                selectTag(null);
               }}
             >
               上传用户
@@ -2532,7 +2861,7 @@ export function StorageWorkspace({
                 className={mode === scheme.key ? "active" : "secondary"}
                 onClick={() => {
                   setMode(scheme.key);
-                  setTagId(null);
+                  selectTag(null);
                 }}
               >
                 {taxonomySchemeLabel(scheme.key, schemes)}
@@ -2575,7 +2904,7 @@ export function StorageWorkspace({
             <span className="muted">{taxonomySchemeLabel(mode, schemes)}：</span>
             <select
               value={tagId ?? ""}
-              onChange={(e) => setTagId(e.target.value ? Number(e.target.value) : null)}
+              onChange={(e) => selectTag(e.target.value ? Number(e.target.value) : null)}
             >
               <option value="">全部</option>
               {currentNodes.map((node) => (
@@ -2587,57 +2916,72 @@ export function StorageWorkspace({
           </div>
         )}
       </div>
+      )}
 
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
 
-      {variant === "upload" && (
-        <section className="card storage-upload-preset is-bar">
-          <div className="storage-upload-preset-head">
-            <strong>预设分类标签</strong>
-            <span className="muted">先选标签再拖入；弹窗和导入后都还能改。</span>
-          </div>
-          <UploadTaxonomyFields
-            schemes={schemes}
-            nodes={nodes}
-            value={uploadTagIds}
-            onChange={setUploadTagIds}
-            canCreate={canCreateTaxonomy}
-            onNodesReload={reloadTaxonomies}
-          />
-        </section>
-      )}
-
       <div className="storage-workspace">
         <aside className="card storage-left-pane">
           {variant === "upload" && (
-            <>
-              <h3 style={{ marginTop: 0, marginBottom: 10 }}>
-                {mode === "upload_order" ? "上传顺序" : "存储结构"}
-              </h3>
-              <FolderBatchImport
-                schemes={schemes}
-                nodes={nodes}
-                canCreateTaxonomy={canCreateTaxonomy}
-                onNodesReload={reloadTaxonomies}
-                taxonomyTagIds={uploadTagIds}
-                onTaxonomyTagIdsChange={setUploadTagIds}
-                onImported={(batchName, sessionId) => {
-                  pendingSelectBatch.current = batchName;
-                  pendingSelectSession.current = sessionId || null;
-                  setExtraBatches((current) =>
-                    current.includes(batchName) ? current : [...current, batchName]
-                  );
-                  if (sessionId && mode !== "upload_order") {
+            <div className="storage-upload-browse">
+              <div className="storage-upload-dock-title">
+                <strong>查看与搜索</strong>
+                <span className="muted">
+                  {mode === "upload_order" ? "上传顺序" : "存储结构"}
+                </span>
+              </div>
+              <div className="storage-filter-line">
+                <span className="muted">列表：</span>
+                <button
+                  type="button"
+                  className={mode === "folder" ? "active" : "secondary"}
+                  onClick={() => {
+                    setMode("folder");
+                    selectTag(null);
+                  }}
+                >
+                  存储结构
+                </button>
+                <button
+                  type="button"
+                  className={mode === "upload_order" ? "active" : "secondary"}
+                  onClick={() => {
                     setMode("upload_order");
-                    return;
-                  }
-                  void load(true);
-                }}
-                onError={setError}
-                onMessage={setMessage}
-              />
-            </>
+                    selectTag(null);
+                  }}
+                >
+                  上传顺序
+                </button>
+              </div>
+              <div className="storage-filter-line">
+                <span className="muted">排序：</span>
+                <select
+                  value={sortMode}
+                  onChange={(e) => setSortMode(e.target.value)}
+                >
+                  <option value="created_asc">创建时间正序</option>
+                  <option value="created_desc">创建时间倒序</option>
+                  <option value="modified_asc">修改时间正序</option>
+                  <option value="modified_desc">修改时间倒序</option>
+                  <option value="name_asc">字符顺序 A-Z</option>
+                  <option value="name_desc">字符顺序 Z-A</option>
+                </select>
+              </div>
+              <div className="storage-filter-line">
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void load(false);
+                  }}
+                  placeholder="搜索批次或数据单元"
+                />
+                <button type="button" onClick={() => void load(false)}>
+                  搜索
+                </button>
+              </div>
+            </div>
           )}
           {mode !== "folder" && mode !== "uploader" && mode !== "upload_order" && (
             <>
@@ -2648,8 +2992,9 @@ export function StorageWorkspace({
                 nodes={currentNodes}
                 units={classificationUnits}
                 selectedId={tagId}
+                selectedExact={tagExact}
                 selectedKey={selectedKey}
-                onSelect={setTagId}
+                onSelect={selectTag}
                 onUnitSelect={(unit) => {
                   setSelectedKey(unit.key);
                   setFocus({ kind: "unit", key: unit.key });

@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type DragEvent,
   type KeyboardEvent,
 } from "react";
@@ -143,10 +144,15 @@ function TreeNode({
   return (
     <div>
       <div
-        className={`folder-row ${active ? "active" : ""} ${isDropTarget ? "drop-target" : ""} ${
+        className={`folder-row browse-folder-row ${active ? "active" : ""} ${isDropTarget ? "drop-target" : ""} ${
           isCut ? "cut" : ""
         }`}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        style={
+          {
+            paddingLeft: 8 + depth * 14,
+            "--tree-depth": depth,
+          } as CSSProperties
+        }
         draggable={manageable && !isRenaming}
         onDragStart={(e) => onDragStartFolder(e, node)}
         onDragOver={(e) => onDragOverTarget(e, node.id)}

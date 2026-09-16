@@ -465,6 +465,29 @@ def get_preview(
     return FileResponse(path, media_type="application/json")
 
 
+@router.get("/previews/human/{file_id}/smpl")
+def get_smpl_motion(
+    file_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """按需解析 SMPL/SMPL-X/SMPL-H 动作 npz，返回骨架播放所需的 poses/trans/fps。"""
+    from ..worker.parsers import load_smpl_motion
+
+    rec = db.get(HumanMotionFile, file_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    clip = db.get(MotionClip, rec.clip_id)
+    ensure_clip_capability(db, user, Capability.browse, clip)
+    path = absolute_path(rec.file_path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="文件缺失")
+    try:
+        return load_smpl_motion(path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SMPL 解析失败：{exc}") from exc
+
+
 @router.get("/thumbnails/{clip_id}")
 def get_thumbnail(
     clip_id: int,

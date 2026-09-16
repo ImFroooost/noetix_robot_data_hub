@@ -1,5 +1,5 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Grid, Html, OrbitControls } from "@react-three/drei";
+import { Html, OrbitControls } from "@react-three/drei";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import { ColladaLoader } from "three/examples/jsm/loaders/ColladaLoader.js";
@@ -8,9 +8,10 @@ import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
-import { api } from "../api";
+import { api, fetchJsonAuth } from "../api";
 import { fetchAuth, fetchRepoMesh, normalizeRepoPath } from "../utils/repoMesh";
 import { AnimationFormatPreview } from "./AnimationFormatPreview";
+import { ViewerSceneChrome } from "./ViewerSceneChrome";
 import type { ModelInstance, ModelInstanceFile } from "../types";
 
 export type ModelPreviewKind =
@@ -23,6 +24,7 @@ export type ModelPreviewKind =
   | "bvh"
   | "urdf"
   | "mjcf"
+  | "smpl"
   | "unsupported";
 
 function fileExt(name: string) {
@@ -46,6 +48,7 @@ export function modelPreviewKind(file: {
   if (ext === "urdf") return "urdf";
   if (ext === "mjcf" || rel.includes("/mjcf/") || rel.startsWith("mjcf/")) return "mjcf";
   if (ext === "xml") return "mjcf";
+  if (ext === "pkl" || ext === "npz" || file.kind === "smpl") return "smpl";
   return "unsupported";
 }
 
@@ -499,6 +502,65 @@ function MjcfModelScene({
   );
 }
 
+function SmplModelScene({
+  path,
+  onStatus,
+}: {
+  path: string;
+  onStatus?: (status: "loading" | "ready" | "error", message?: string) => void;
+}) {
+  const [object, setObject] = useState<THREE.Object3D | null>(null);
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setStatus("loading");
+    setError("");
+    setObject(null);
+    onStatus?.("loading");
+
+    fetchJsonAuth(api.smplModelUrl(path))
+      .then((data) => {
+        if (cancelled) return;
+        const vertices = data.vertices as number[][];
+        const faces = data.faces as number[][];
+        if (!vertices?.length || !faces?.length) {
+          throw new Error("模型没有网格数据");
+        }
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute(
+          "position",
+          new THREE.Float32BufferAttribute(vertices.flat(), 3)
+        );
+        geometry.setIndex(faces.flat());
+        geometry.computeVertexNormals();
+        const mesh = new THREE.Mesh(geometry, meshMaterial(0xd8b4a0));
+        setObject(mesh);
+        setStatus("ready");
+        onStatus?.("ready");
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : "SMPL 模型加载失败";
+        setError(message);
+        setStatus("error");
+        onStatus?.("error", message);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [path, onStatus]);
+
+  return (
+    <group>
+      {object && <FittedModel object={object} rotateZUp={false} />}
+      <SceneStatus status={status} loading="SMPL 模型加载中…" error={error} />
+    </group>
+  );
+}
+
 function ModelPreviewCanvas({
   children,
   status,
@@ -528,11 +590,7 @@ function ModelPreviewCanvas({
         gl={{ antialias: true, alpha: false }}
         style={{ width: "100%", height: "100%", display: "block" }}
       >
-        <color attach="background" args={["#0b0d12"]} />
-        <ambientLight intensity={0.8} />
-        <directionalLight position={[3, 5, 2]} intensity={1.2} />
-        <hemisphereLight args={["#dfe8ff", "#2a3140", 0.4]} />
-        <Grid args={[10, 10]} cellColor="#334" sectionColor="#556" fadeDistance={20} />
+        <ViewerSceneChrome hemisphere />
         {children}
         <OrbitControls makeDefault />
       </Canvas>
@@ -543,8 +601,8 @@ function ModelPreviewCanvas({
 function unsupportedHint(file: ModelInstanceFile) {
   const ext = fileExt(file.name);
   if (ext === "blend") return "Blender 源文件无法在浏览器中预览，请下载后用 Blender 打开。";
-  if (ext === "pkl" || ext === "npy" || ext === "npz" || file.kind === "smpl") {
-    return "SMPL 参数文件暂不支持网页预览。";
+  if (ext === "npy") {
+    return "单独的 .npy 参数文件暂不支持网页预览。";
   }
   return `暂不支持预览 .${ext || "该"} 文件，请选择网格、URDF、MJCF、FBX 或 BVH。`;
 }
@@ -610,6 +668,12 @@ export function ModelFilePreview({
           key={`${instance.key}:${file.path}`}
           mjcfPath={file.path}
           packageRoot={packageRoot}
+          onStatus={onStatus}
+        />
+      ) : kind === "smpl" ? (
+        <SmplModelScene
+          key={`${instance.key}:${file.path}`}
+          path={file.path}
           onStatus={onStatus}
         />
       ) : (

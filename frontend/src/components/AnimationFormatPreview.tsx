@@ -1,14 +1,57 @@
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Grid, Html, OrbitControls } from "@react-three/drei";
-import { useEffect, useRef, useState } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { Html, OrbitControls } from "@react-three/drei";
+import { Component, useEffect, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import { BVHLoader } from "three/examples/jsm/loaders/BVHLoader.js";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { getToken } from "../api";
+import {
+  applyViewerFigureColors,
+  figureScale,
+  FrameFigure,
+  SkeletonLines,
+  useViewerLook,
+  ViewerSceneChrome,
+} from "./ViewerSceneChrome";
+import {
+  cycleUpAxisMode,
+  detectUpAxisFromExtents,
+  resolveUpAxis,
+  upAxisModeLabel,
+  upAxisToRotationX,
+  useUpAxisMode,
+  type UpAxis,
+} from "../viewerUpAxis";
 
 const _bvhHips = new THREE.Vector3();
 const _bvhBox = new THREE.Box3();
 const _bvhPt = new THREE.Vector3();
+
+/** WebGL 不可用或渲染出错时给出提示，而不是留下空白画布。 */
+class CanvasErrorBoundary extends Component<{ children: ReactNode }, { error: string }> {
+  state = { error: "" };
+
+  static getDerivedStateFromError(err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  componentDidCatch(err: unknown) {
+    console.error("[preview] canvas 渲染失败", err);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="storage-preview-empty">
+          3D 渲染失败：{this.state.error}
+          <br />
+          请确认浏览器支持并开启了 WebGL
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 async function fetchBinary(url: string) {
   const token = getToken();
@@ -24,13 +67,18 @@ export function BvhScene({
   time,
   duration,
   onDuration,
+  viewNonce = 0,
+  rotationX = 0,
+  onDetectedUpAxis,
 }: {
   url: string;
   time: number;
   duration: number;
   onDuration?: (sec: number) => void;
+  viewNonce?: number;
+  rotationX?: number;
+  onDetectedUpAxis?: (up: UpAxis) => void;
 }) {
-  const { scene } = useThree();
   const centerRef = useRef<THREE.Group>(null);
   const boneRootRef = useRef<THREE.Bone | null>(null);
   const helperRef = useRef<THREE.SkeletonHelper | null>(null);
@@ -40,23 +88,29 @@ export function BvhScene({
   const offsetReady = useRef(false);
   const onDurationRef = useRef(onDuration);
   onDurationRef.current = onDuration;
+  const onDetectedRef = useRef(onDetectedUpAxis);
+  onDetectedRef.current = onDetectedUpAxis;
   const [boneRoot, setBoneRoot] = useState<THREE.Bone | null>(null);
+  const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
   const [scale, setScale] = useState(0.01);
+  const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
+  const look = useViewerLook();
 
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
     setError("");
     setBoneRoot(null);
+    setHelper(null);
+    setOffset([0, 0, 0]);
     boneRootRef.current = null;
     mixer.current = null;
     action.current = null;
     offsetReady.current = false;
     fixedOffset.current.set(0, 0, 0);
     if (helperRef.current) {
-      scene.remove(helperRef.current);
       helperRef.current.geometry.dispose();
       (helperRef.current.material as THREE.Material).dispose();
       helperRef.current = null;
@@ -86,7 +140,10 @@ export function BvhScene({
         let sumZ = 0;
         let samples = 0;
         let minY = Infinity;
-        let maxHeight = 0;
+        let spanY = 0;
+        let spanZ = 0;
+        let midY = 0;
+        let midZ = 0;
         const n = 24;
         for (let i = 0; i < n; i++) {
           probeAction.time = (i / Math.max(n - 1, 1)) * clipDur;
@@ -105,13 +162,20 @@ export function BvhScene({
           });
           if (!_bvhBox.isEmpty()) {
             minY = Math.min(minY, _bvhBox.min.y);
-            maxHeight = Math.max(maxHeight, _bvhBox.max.y - _bvhBox.min.y);
+            const sy = _bvhBox.max.y - _bvhBox.min.y;
+            const sz = _bvhBox.max.z - _bvhBox.min.z;
+            spanY = Math.max(spanY, sy);
+            spanZ = Math.max(spanZ, sz);
+            midY += (_bvhBox.max.y + _bvhBox.min.y) / 2;
+            midZ += (_bvhBox.max.z + _bvhBox.min.z) / 2;
           }
         }
         const meanX = samples ? sumX / samples : 0;
         const meanZ = samples ? sumZ / samples : 0;
         if (!Number.isFinite(minY)) minY = 0;
-        const nextScale = maxHeight > 8 ? 0.01 : 1;
+        const maxHeight = Math.max(spanY, spanZ);
+        onDetectedRef.current?.(detectUpAxisFromExtents(spanY, spanZ, midY / Math.max(samples, 1), midZ / Math.max(samples, 1)));
+        const nextScale = figureScale(maxHeight);
         fixedOffset.current.set(
           -meanX * nextScale,
           -minY * nextScale,
@@ -123,10 +187,8 @@ export function BvhScene({
         // files but swallowed metre-scale skeletons (height ≈ 1–2).
         const jointRadius = Math.max(maxHeight * 0.016, 0.002);
         const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
-        const jointMat = new THREE.MeshStandardMaterial({
-          color: 0xffb454,
-          emissive: 0x663300,
-          roughness: 0.55,
+        const jointMat = new THREE.MeshBasicMaterial({
+          color: look.joint,
         });
         bone0.traverse((obj) => {
           if (!(obj as THREE.Bone).isBone) return;
@@ -135,22 +197,21 @@ export function BvhScene({
           obj.add(dot);
         });
 
-        const helper = new THREE.SkeletonHelper(bone0);
-        const mat = helper.material as THREE.LineBasicMaterial;
-        mat.depthTest = false;
-        mat.depthWrite = false;
-        mat.transparent = true;
-        mat.opacity = 1;
-        helper.frustumCulled = false;
-        scene.add(helper);
-        helperRef.current = helper;
+        const nextHelper = styleSkeletonHelper(new THREE.SkeletonHelper(bone0), look);
+        helperRef.current = nextHelper;
 
         boneRootRef.current = bone0;
         mixer.current = probeMixer;
         action.current = probeAction;
         if (clipDur > 0) onDurationRef.current?.(clipDur);
         setScale(nextScale);
+        setOffset([
+          fixedOffset.current.x,
+          fixedOffset.current.y,
+          fixedOffset.current.z,
+        ]);
         setBoneRoot(bone0);
+        setHelper(nextHelper);
         setStatus("ready");
       })
       .catch((e: unknown) => {
@@ -163,7 +224,6 @@ export function BvhScene({
     return () => {
       cancelled = true;
       if (helperRef.current) {
-        scene.remove(helperRef.current);
         helperRef.current.geometry.dispose();
         (helperRef.current.material as THREE.Material).dispose();
         helperRef.current = null;
@@ -187,7 +247,11 @@ export function BvhScene({
         });
       }
     };
-  }, [url, scene]);
+  }, [url]);
+
+  useEffect(() => {
+    applyViewerFigureColors(helperRef.current, boneRootRef.current, look);
+  }, [look, boneRoot, status]);
 
   useFrame(() => {
     const center = centerRef.current;
@@ -202,25 +266,35 @@ export function BvhScene({
   });
 
   return (
-    <group>
-      <group ref={centerRef}>
-        {boneRoot && (
-          <group scale={scale}>
-            <primitive object={boneRoot} />
-          </group>
+    <>
+      {helper && <primitive object={helper} />}
+      <SkeletonLines root={boneRoot} color={look.bone} />
+      <group rotation={[rotationX, 0, 0]}>
+        <group ref={centerRef} position={offset}>
+          {boneRoot && (
+            <group scale={scale}>
+              <primitive object={boneRoot} />
+            </group>
+          )}
+        </group>
+        <FrameFigure
+          objectRef={centerRef}
+          ready={status === "ready" && !!boneRoot}
+          resetKey={`${url}:${scale}:${offset.join(",")}:${rotationX}`}
+          nonce={viewNonce}
+        />
+        {status === "loading" && (
+          <Html center style={{ pointerEvents: "none" }}>
+            <div className="muted animation-format-status">BVH 加载中…</div>
+          </Html>
+        )}
+        {status === "error" && (
+          <Html center style={{ pointerEvents: "none" }}>
+            <div className="error animation-format-status">{error || "BVH 可视化失败"}</div>
+          </Html>
         )}
       </group>
-      {status === "loading" && (
-        <Html center style={{ pointerEvents: "none" }}>
-          <div className="muted animation-format-status">BVH 加载中…</div>
-        </Html>
-      )}
-      {status === "error" && (
-        <Html center style={{ pointerEvents: "none" }}>
-          <div className="error animation-format-status">{error || "BVH 可视化失败"}</div>
-        </Html>
-      )}
-    </group>
+    </>
   );
 }
 
@@ -238,23 +312,23 @@ function expandSkeletonBox(root: THREE.Object3D, box: THREE.Box3) {
   }
 }
 
-function styleSkeletonHelper(helper: THREE.SkeletonHelper) {
+function styleSkeletonHelper(helper: THREE.SkeletonHelper, look?: { bone: string }) {
   const mat = helper.material as THREE.LineBasicMaterial;
   mat.depthTest = false;
   mat.depthWrite = false;
   mat.transparent = true;
   mat.opacity = 1;
+  mat.vertexColors = false;
+  if (look) mat.color.set(look.bone);
   helper.frustumCulled = false;
   return helper;
 }
 
-function attachJointDots(root: THREE.Object3D, height: number) {
+function attachJointDots(root: THREE.Object3D, height: number, look?: { joint: string; jointEmissive: string }) {
   const jointRadius = Math.max(height * 0.016, 0.002);
   const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
-  const jointMat = new THREE.MeshStandardMaterial({
-    color: 0xffb454,
-    emissive: 0x663300,
-    roughness: 0.55,
+  const jointMat = new THREE.MeshBasicMaterial({
+    color: look?.joint ?? 0xffb454,
   });
   root.traverse((obj) => {
     if (!(obj as THREE.Bone).isBone) return;
@@ -288,13 +362,18 @@ export function FbxScene({
   time,
   duration = 1,
   onDuration,
+  viewNonce = 0,
+  rotationX = 0,
+  onDetectedUpAxis,
 }: {
   url: string;
   time: number;
   duration?: number;
   onDuration?: (sec: number) => void;
+  viewNonce?: number;
+  rotationX?: number;
+  onDetectedUpAxis?: (up: UpAxis) => void;
 }) {
-  const { scene } = useThree();
   const centerRef = useRef<THREE.Group>(null);
   const objectRef = useRef<THREE.Group | null>(null);
   const helperRef = useRef<THREE.SkeletonHelper | null>(null);
@@ -304,23 +383,29 @@ export function FbxScene({
   const offsetReady = useRef(false);
   const onDurationRef = useRef(onDuration);
   onDurationRef.current = onDuration;
+  const onDetectedRef = useRef(onDetectedUpAxis);
+  onDetectedRef.current = onDetectedUpAxis;
   const [object, setObject] = useState<THREE.Group | null>(null);
+  const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
   const [scale, setScale] = useState(0.01);
+  const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
+  const look = useViewerLook();
 
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
     setError("");
     setObject(null);
+    setHelper(null);
+    setOffset([0, 0, 0]);
     objectRef.current = null;
     mixer.current = null;
     action.current = null;
     offsetReady.current = false;
     fixedOffset.current.set(0, 0, 0);
     if (helperRef.current) {
-      scene.remove(helperRef.current);
       helperRef.current.geometry.dispose();
       (helperRef.current.material as THREE.Material).dispose();
       helperRef.current = null;
@@ -357,7 +442,10 @@ export function FbxScene({
         let sumZ = 0;
         let samples = 0;
         let minY = Infinity;
-        let maxHeight = 0;
+        let spanY = 0;
+        let spanZ = 0;
+        let midY = 0;
+        let midZ = 0;
         const n = probeAction && probeMixer ? 24 : 1;
         for (let i = 0; i < n; i++) {
           if (probeAction && probeMixer) {
@@ -371,12 +459,21 @@ export function FbxScene({
           sumZ += mid.z;
           samples += 1;
           minY = Math.min(minY, _bvhBox.min.y);
-          maxHeight = Math.max(maxHeight, _bvhBox.max.y - _bvhBox.min.y);
+          const sy = _bvhBox.max.y - _bvhBox.min.y;
+          const sz = _bvhBox.max.z - _bvhBox.min.z;
+          spanY = Math.max(spanY, sy);
+          spanZ = Math.max(spanZ, sz);
+          midY += (_bvhBox.max.y + _bvhBox.min.y) / 2;
+          midZ += (_bvhBox.max.z + _bvhBox.min.z) / 2;
         }
         const meanX = samples ? sumX / samples : 0;
         const meanZ = samples ? sumZ / samples : 0;
         if (!Number.isFinite(minY)) minY = 0;
-        const nextScale = maxHeight > 8 ? 0.01 : 1;
+        const maxHeight = Math.max(spanY, spanZ);
+        onDetectedRef.current?.(
+          detectUpAxisFromExtents(spanY, spanZ, midY / Math.max(samples, 1), midZ / Math.max(samples, 1))
+        );
+        const nextScale = figureScale(maxHeight);
         fixedOffset.current.set(
           -meanX * nextScale,
           -minY * nextScale,
@@ -385,12 +482,12 @@ export function FbxScene({
         offsetReady.current = true;
 
         if (boneCount && !meshCount) {
-          attachJointDots(obj, maxHeight || 1);
+          attachJointDots(obj, maxHeight || 1, look);
         }
+        let nextHelper: THREE.SkeletonHelper | null = null;
         if (boneCount) {
-          const helper = styleSkeletonHelper(new THREE.SkeletonHelper(obj));
-          scene.add(helper);
-          helperRef.current = helper;
+          nextHelper = styleSkeletonHelper(new THREE.SkeletonHelper(obj), look);
+          helperRef.current = nextHelper;
         }
 
         objectRef.current = obj;
@@ -398,7 +495,13 @@ export function FbxScene({
         action.current = probeAction;
         if (clip && clip.duration > 0) onDurationRef.current?.(clip.duration);
         setScale(nextScale);
+        setOffset([
+          fixedOffset.current.x,
+          fixedOffset.current.y,
+          fixedOffset.current.z,
+        ]);
         setObject(obj);
+        setHelper(nextHelper);
         setStatus("ready");
       })
       .catch((e: unknown) => {
@@ -411,14 +514,17 @@ export function FbxScene({
     return () => {
       cancelled = true;
       if (helperRef.current) {
-        scene.remove(helperRef.current);
         helperRef.current.geometry.dispose();
         (helperRef.current.material as THREE.Material).dispose();
         helperRef.current = null;
       }
       detachJointDots(objectRef.current);
     };
-  }, [url, scene]);
+  }, [url]);
+
+  useEffect(() => {
+    applyViewerFigureColors(helperRef.current, objectRef.current, look);
+  }, [look, object, status]);
 
   useFrame(() => {
     const center = centerRef.current;
@@ -433,25 +539,35 @@ export function FbxScene({
   });
 
   return (
-    <group>
-      <group ref={centerRef}>
-        {object && (
-          <group scale={scale}>
-            <primitive object={object} />
-          </group>
+    <>
+      {helper && <primitive object={helper} />}
+      <SkeletonLines root={object} color={look.bone} />
+      <group rotation={[rotationX, 0, 0]}>
+        <group ref={centerRef} position={offset}>
+          {object && (
+            <group scale={scale}>
+              <primitive object={object} />
+            </group>
+          )}
+        </group>
+        <FrameFigure
+          objectRef={centerRef}
+          ready={status === "ready" && !!object}
+          resetKey={`${url}:${scale}:${offset.join(",")}:${rotationX}`}
+          nonce={viewNonce}
+        />
+        {status === "loading" && (
+          <Html center style={{ pointerEvents: "none" }}>
+            <div className="muted animation-format-status">FBX 加载中…</div>
+          </Html>
+        )}
+        {status === "error" && (
+          <Html center style={{ pointerEvents: "none" }}>
+            <div className="error animation-format-status">{error || "FBX 可视化失败"}</div>
+          </Html>
         )}
       </group>
-      {status === "loading" && (
-        <Html center style={{ pointerEvents: "none" }}>
-          <div className="muted animation-format-status">FBX 加载中…</div>
-        </Html>
-      )}
-      {status === "error" && (
-        <Html center style={{ pointerEvents: "none" }}>
-          <div className="error animation-format-status">{error || "FBX 可视化失败"}</div>
-        </Html>
-      )}
-    </group>
+    </>
   );
 }
 
@@ -476,12 +592,19 @@ export function AnimationFormatPreview({
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [mediaDuration, setMediaDuration] = useState(0);
+  const [glProblem, setGlProblem] = useState("");
+  const [viewNonce, setViewNonce] = useState(0);
+  const [upAxisMode, setUpAxisMode] = useUpAxisMode();
+  const [detectedUp, setDetectedUp] = useState<UpAxis>("y");
   const duration = mediaDuration || durationHint || 1;
+  const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
 
   useEffect(() => {
     setTime(0);
     setPlaying(true);
     setMediaDuration(0);
+    setGlProblem("");
+    setDetectedUp("y");
   }, [url]);
 
   useEffect(() => {
@@ -507,17 +630,51 @@ export function AnimationFormatPreview({
       onClick={(event) => event.stopPropagation()}
     >
       <div className="viewer-panel animation-format-canvas">
-        <Canvas camera={{ position: [2.4, 1.8, 3.2], fov: 50 }}>
-          <color attach="background" args={["#0b0d12"]} />
-          <ambientLight intensity={0.7} />
-          <directionalLight position={[3, 5, 2]} intensity={1.1} />
-          <Grid args={[10, 10]} cellColor="#334" sectionColor="#556" fadeDistance={20} />
+        {glProblem ? (
+          <div className="storage-preview-empty">
+            {glProblem}
+            <br />
+            请刷新页面；若反复出现，重启浏览器或检查浏览器「硬件加速」设置
+          </div>
+        ) : null}
+        <CanvasErrorBoundary>
+        <Canvas
+          key={url}
+          camera={{ position: [2.4, 1.8, 3.2], fov: 50 }}
+          style={{ width: "100%", height: "100%", display: "block" }}
+          resize={{ debounce: 0 }}
+          gl={{ antialias: true, alpha: false }}
+          onCreated={({ gl }) => {
+            try {
+              const ctx = gl.getContext();
+              const dbg = ctx.getExtension("WEBGL_debug_renderer_info");
+              const renderer = dbg
+                ? ctx.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                : ctx.getParameter(ctx.RENDERER);
+              console.info(`[preview] WebGL 渲染器: ${renderer}`);
+            } catch {
+              /* ignore */
+            }
+            gl.domElement.addEventListener("webglcontextlost", (event) => {
+              event.preventDefault();
+              console.error("[preview] WebGL 上下文丢失");
+              setGlProblem("浏览器的 3D 渲染上下文丢失（WebGL context lost）");
+            });
+            gl.domElement.addEventListener("webglcontextrestored", () => {
+              setGlProblem("");
+            });
+          }}
+        >
+          <ViewerSceneChrome />
           {format === "bvh" ? (
             <BvhScene
               url={url}
               time={time}
               duration={duration}
               onDuration={setMediaDuration}
+              viewNonce={viewNonce}
+              rotationX={rotationX}
+              onDetectedUpAxis={setDetectedUp}
             />
           ) : (
             <FbxScene
@@ -525,10 +682,14 @@ export function AnimationFormatPreview({
               time={time}
               duration={duration}
               onDuration={setMediaDuration}
+              viewNonce={viewNonce}
+              rotationX={rotationX}
+              onDetectedUpAxis={setDetectedUp}
             />
           )}
           <OrbitControls makeDefault />
         </Canvas>
+        </CanvasErrorBoundary>
       </div>
       <div className="playback-controls animation-format-controls">
         <button
@@ -576,6 +737,25 @@ export function AnimationFormatPreview({
           <option value={1.5}>1.5×</option>
           <option value={2}>2×</option>
         </select>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="重新把骨架对准到画面中央"
+          onClick={() => setViewNonce((n) => n + 1)}
+        >
+          复位视角
+        </button>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="切换坐标系方向：自动识别 / Y-up / Z-up"
+          onClick={() => {
+            setUpAxisMode(cycleUpAxisMode(upAxisMode));
+            setViewNonce((n) => n + 1);
+          }}
+        >
+          {upAxisModeLabel(upAxisMode, detectedUp)}
+        </button>
       </div>
     </div>
   );

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
 import { fetchStorageOverview, invalidateStorageOverview } from "../storageOverviewCache";
+import { DEFAULT_HUMAN_MODEL, HumanModelFields, resolveHumanModelName } from "./HumanModelFields";
+import { MotionKindFields } from "./MotionKindFields";
 import { RobotStyleFields } from "./RobotStyleFields";
 import { TaxonomySelect } from "./TaxonomyTree";
 import type {
@@ -13,9 +15,14 @@ import type {
 } from "../types";
 import {
   compactTaxonomyTagIds,
+  DEFAULT_MOTION_KIND,
+  isMotionModality,
+  isSmplFormat,
   needsManualCsvFps,
   parseCsvFps,
+  resolveMotionKind,
   taxonomySchemeLabel,
+  type MotionKind,
 } from "../types";
 import {
   filesFromDataTransfer,
@@ -49,10 +56,13 @@ type ZipImportDraft = {
   channel: string;
   robotStyle: string;
   robotVersion: string;
+  humanModel: string;
+  humanModelFile: string;
   personName: string;
   gender: string;
   height: string;
   fps: string;
+  motionKind: MotionKind;
   replace: boolean;
 };
 
@@ -67,10 +77,13 @@ type FolderImportDraft = {
   format: string;
   robotStyle: string;
   robotVersion: string;
+  humanModel: string;
+  humanModelFile: string;
   personName: string;
   gender: string;
   height: string;
   fps: string;
+  motionKind: MotionKind;
   actions: Record<string, FolderAction>;
 };
 
@@ -191,6 +204,7 @@ export function FolderBatchImport({
   taxonomyTagIds,
   onTaxonomyTagIdsChange,
   showInlinePreset = false,
+  layout = "pane",
   onImported,
   onError,
   onMessage,
@@ -202,6 +216,7 @@ export function FolderBatchImport({
   taxonomyTagIds: Record<string, number | "">;
   onTaxonomyTagIdsChange: (next: Record<string, number | "">) => void;
   showInlinePreset?: boolean;
+  layout?: "pane" | "dock";
   onImported: (batchName: string, sessionId?: string) => void;
   onError: (message: string) => void;
   onMessage: (message: string) => void;
@@ -215,6 +230,7 @@ export function FolderBatchImport({
   const [localZipPath, setLocalZipPath] = useState("");
   const [draggingFolder, setDraggingFolder] = useState(false);
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
+  const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const zipInputRef = useRef<HTMLInputElement>(null);
   const taxonomyPayload = compactTaxonomyTagIds(taxonomyTagIds);
@@ -222,23 +238,42 @@ export function FolderBatchImport({
   const needRobotStyles =
     (!!folderDraft && folderDraft.ontology === "robot") ||
     (!!zipDraft && zipDraft.ontology === "robot");
+  const needHumanModels =
+    (!!folderDraft &&
+      folderDraft.ontology === "human" &&
+      (isSmplFormat(folderDraft.format) ||
+        folderDraft.files.some((item) => isSmplFormat("", item.file.name)))) ||
+    (!!zipDraft && zipDraft.ontology === "human" && zipDraft.modality === "motion");
 
   useEffect(() => {
-    if (!needRobotStyles) return;
+    if (!needRobotStyles && !needHumanModels) return;
     let cancelled = false;
     api
       .storageModels()
       .then((data) => {
         if (cancelled) return;
-        setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
+        if (needRobotStyles) {
+          setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
+        }
+        if (needHumanModels) {
+          setHumanInstances(data.instances.filter((item) => item.ontology === "human"));
+        }
       })
       .catch((e) => {
-        if (!cancelled) setFolderError(e instanceof Error ? e.message : "机器人款式加载失败");
+        if (!cancelled) {
+          setFolderError(
+            e instanceof Error
+              ? e.message
+              : needRobotStyles
+                ? "机器人款式加载失败"
+                : "人体模型加载失败"
+          );
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [needRobotStyles]);
+  }, [needRobotStyles, needHumanModels]);
 
   const nextAvailableBatchName = (base: string, batches: StorageOverview["batches"]) => {
     const names = new Set(batches.map((item) => item.name));
@@ -270,10 +305,13 @@ export function FolderBatchImport({
       channel: "rgb",
       robotStyle: "",
       robotVersion: "",
+      humanModel: DEFAULT_HUMAN_MODEL,
+      humanModelFile: "",
       personName: "",
       gender: "",
       height: "",
       fps: "30",
+      motionKind: DEFAULT_MOTION_KIND,
       replace: false,
     });
   };
@@ -313,10 +351,13 @@ export function FolderBatchImport({
       format: "",
       robotStyle: "",
       robotVersion: "",
+      humanModel: DEFAULT_HUMAN_MODEL,
+      humanModelFile: "",
       personName: "",
       gender: "",
       height: "",
       fps: "30",
+      motionKind: DEFAULT_MOTION_KIND,
       actions: {},
     });
   };
@@ -392,7 +433,16 @@ export function FolderBatchImport({
                 person_name: zipDraft.personName.trim(),
                 gender: zipDraft.gender,
                 height: zipDraft.height.trim(),
+                ...(zipDraft.modality === "motion"
+                  ? {
+                      human_model: resolveHumanModelName(zipDraft.humanModel),
+                      human_model_file: zipDraft.humanModelFile,
+                    }
+                  : {}),
               }),
+          ...(isMotionModality(zipDraft.modality)
+            ? { motion_kind: resolveMotionKind(zipDraft.motionKind) }
+            : {}),
           ...(zipDraft.ontology === "robot" ? { fps: parseCsvFps(zipDraft.fps) } : {}),
         })
       );
@@ -513,7 +563,17 @@ export function FolderBatchImport({
                 person_name: folderDraft.personName.trim(),
                 gender: folderDraft.gender,
                 height: folderDraft.height.trim(),
+                ...(isSmplFormat(folderDraft.format) ||
+                folderDraft.files.some((item) => isSmplFormat("", item.file.name))
+                  ? {
+                      human_model: resolveHumanModelName(folderDraft.humanModel),
+                      human_model_file: folderDraft.humanModelFile,
+                    }
+                  : {}),
               }),
+          ...(isMotionModality(folderDraft.modality)
+            ? { motion_kind: resolveMotionKind(folderDraft.motionKind) }
+            : {}),
           ...(needsManualCsvFps(
             folderDraft.ontology,
             folderDraft.format || (folderExtensions.includes("csv") ? "csv" : "")
@@ -568,7 +628,9 @@ export function FolderBatchImport({
         </section>
       )}
       <div
-        className={`storage-batch-drop ${draggingFolder ? "dragging" : ""}`}
+        className={`storage-batch-drop ${layout === "dock" ? "is-dock" : ""} ${
+          draggingFolder ? "dragging" : ""
+        }`}
         onDragEnter={(event) => {
           event.preventDefault();
           setDraggingFolder(true);
@@ -583,16 +645,18 @@ export function FolderBatchImport({
       >
         <button
           type="button"
-          className="storage-batch-create"
+          className={`storage-batch-create ${layout === "dock" ? "is-compact" : ""}`}
           onClick={() => void createBatch()}
         >
           <strong>＋ 新建批次</strong>
-          <span>点击创建空批次</span>
+          {layout !== "dock" && <span>点击创建空批次</span>}
         </button>
-        <div className="storage-batch-drop-hint">
-          或将文件夹 / zip 拖到这里批量导入（如 260902.zip）
-        </div>
-        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+        {layout !== "dock" && (
+          <div className="storage-batch-drop-hint">
+            或将文件夹 / zip 拖到这里批量导入（如 260902.zip）
+          </div>
+        )}
+        <div className="row storage-batch-drop-actions">
           <button
             type="button"
             className="storage-batch-folder-pick secondary"
@@ -607,13 +671,10 @@ export function FolderBatchImport({
           >
             选择 zip
           </button>
-        </div>
-        <div className="row" style={{ gap: 8, flexWrap: "wrap", width: "100%" }}>
           <input
             value={localZipPath}
             placeholder="/home/noetix/Downloads/260902.zip"
             onChange={(event) => setLocalZipPath(event.target.value)}
-            style={{ flex: "1 1 240px" }}
           />
           <button
             type="button"
@@ -823,6 +884,12 @@ export function FolderBatchImport({
                   />
                 </label>
               )}
+              {isMotionModality(folderDraft.modality) && (
+                <MotionKindFields
+                  value={folderDraft.motionKind}
+                  onChange={(motionKind) => updateFolderDraft({ motionKind })}
+                />
+              )}
               {folderDraft.ontology === "robot" && (
                 <RobotStyleFields
                   instances={robotInstances}
@@ -830,6 +897,18 @@ export function FolderBatchImport({
                   version={folderDraft.robotVersion}
                   onChange={(robotStyle, robotVersion) =>
                     updateFolderDraft({ robotStyle, robotVersion })
+                  }
+                />
+              )}
+              {folderDraft.ontology === "human" &&
+                (isSmplFormat(folderDraft.format) ||
+                  folderDraft.files.some((item) => isSmplFormat("", item.file.name))) && (
+                <HumanModelFields
+                  instances={humanInstances}
+                  model={folderDraft.humanModel}
+                  modelFile={folderDraft.humanModelFile}
+                  onChange={(humanModel, humanModelFile) =>
+                    updateFolderDraft({ humanModel, humanModelFile })
                   }
                 />
               )}
@@ -1085,6 +1164,12 @@ export function FolderBatchImport({
                   </select>
                 </label>
               </div>
+              {isMotionModality(zipDraft.modality) && (
+                <MotionKindFields
+                  value={zipDraft.motionKind}
+                  onChange={(motionKind) => updateZipDraft({ motionKind })}
+                />
+              )}
               {zipDraft.ontology === "robot" && (
                 <RobotStyleFields
                   instances={robotInstances}
@@ -1092,6 +1177,16 @@ export function FolderBatchImport({
                   version={zipDraft.robotVersion}
                   onChange={(robotStyle, robotVersion) =>
                     updateZipDraft({ robotStyle, robotVersion })
+                  }
+                />
+              )}
+              {zipDraft.ontology === "human" && zipDraft.modality === "motion" && (
+                <HumanModelFields
+                  instances={humanInstances}
+                  model={zipDraft.humanModel}
+                  modelFile={zipDraft.humanModelFile}
+                  onChange={(humanModel, humanModelFile) =>
+                    updateZipDraft({ humanModel, humanModelFile })
                   }
                 />
               )}

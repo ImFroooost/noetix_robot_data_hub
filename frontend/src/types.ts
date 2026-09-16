@@ -192,12 +192,17 @@ export interface StorageFile {
   annotation?: StorageAnnotation;
 }
 
+export type MotionKind = "skeleton" | "object" | "merged";
+
 export interface StorageAnnotation {
   quality?: string;
   note?: string;
   status?: string;
   robot_style?: string;
   robot_version?: string;
+  human_model?: string;
+  human_model_file?: string;
+  motion_kind?: MotionKind | string;
   person_name?: string;
   gender?: string;
   height?: string;
@@ -205,10 +210,56 @@ export interface StorageAnnotation {
   [key: string]: unknown;
 }
 
+export const DEFAULT_MOTION_KIND: MotionKind = "skeleton";
+
+export const MOTION_KIND_OPTIONS: [MotionKind, string][] = [
+  ["skeleton", "骨架数据"],
+  ["object", "物体数据"],
+  ["merged", "合并数据"],
+];
+
+export function isMotionKind(value: unknown): value is MotionKind {
+  return value === "skeleton" || value === "object" || value === "merged";
+}
+
+export function resolveMotionKind(value?: unknown): MotionKind {
+  return isMotionKind(value) ? value : DEFAULT_MOTION_KIND;
+}
+
+export function motionKindLabel(value?: unknown): string {
+  const kind = resolveMotionKind(value);
+  return MOTION_KIND_OPTIONS.find(([key]) => key === kind)?.[1] || "骨架数据";
+}
+
+export function isMotionModality(modality?: string | null) {
+  return String(modality || "").toLowerCase() === "motion";
+}
+
 export const DEFAULT_CSV_FPS = 30;
 
 export function isCsvFormat(format?: string | null) {
   return String(format || "").trim().toLowerCase() === "csv";
+}
+
+/** 人体 SMPL/SMPL-X/SMPL-H 动作：format 为 smpl，或文件是 npz。 */
+export function isSmplFormat(format?: string | null, name?: string | null) {
+  const fmt = String(format || "").trim().toLowerCase();
+  const ext = String(name || "").split(".").pop()?.toLowerCase() || "";
+  return fmt === "smpl" || ext === "npz";
+}
+
+export function isSmplMotionFile(file?: {
+  ontology?: string | null;
+  modality?: string | null;
+  format?: string | null;
+  name?: string | null;
+} | null) {
+  if (!file) return false;
+  return (
+    String(file.ontology || "").toLowerCase() === "human" &&
+    String(file.modality || "").toLowerCase() === "motion" &&
+    isSmplFormat(file.format, file.name)
+  );
 }
 
 export function needsManualCsvFps(ontology?: string | null, format?: string | null) {

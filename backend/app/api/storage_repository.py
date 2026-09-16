@@ -115,6 +115,7 @@ class UnitRefIn(BaseModel):
 class DataKindIn(BaseModel):
     ontology: str
     modality: str
+    format: str | None = None
 
 
 class StorageSelectionIn(BaseModel):
@@ -468,6 +469,7 @@ def _decorate_and_filter(
     taxonomy_scheme: str | None,
     tag_id: int | None,
     uploader_id: int | None,
+    tag_exact: bool = False,
 ) -> dict[str, Any]:
     q_norm = (q or "").strip().lower()
     wanted_tag_ids: set[int] | None = None
@@ -475,6 +477,8 @@ def _decorate_and_filter(
         node = db.get(TaxonomyNode, tag_id)
         if not node or str(node.scheme) != taxonomy_scheme:
             wanted_tag_ids = set()
+        elif tag_exact:
+            wanted_tag_ids = {tag_id}
         else:
             wanted_tag_ids = {
                 row[0]
@@ -672,6 +676,7 @@ def overview(
     q: str | None = None,
     taxonomy_scheme: str | None = None,
     tag_id: int | None = None,
+    tag_exact: bool = False,
     uploader_id: int | None = None,
     include_empty: bool = False,
     db: Session = Depends(get_db),
@@ -687,6 +692,7 @@ def overview(
         q=q,
         taxonomy_scheme=taxonomy_scheme,
         tag_id=tag_id,
+        tag_exact=tag_exact,
         uploader_id=uploader_id,
     )
 
@@ -1064,7 +1070,7 @@ def archive_selection(
         filename = f"{units[0][1]}.zip"
     else:
         filename = "storage_selection.zip"
-    kinds = [(item.ontology, item.modality) for item in body.kinds]
+    kinds = [(item.ontology, item.modality, item.format) for item in body.kinds]
 
     def accept(record: dict[str, Any]) -> bool:
         unit = _find_unit(snapshot, record["batch"], record["unit_name"])
@@ -1783,6 +1789,48 @@ def get_file(
         filename=file_path.name if download else None,
         content_disposition_type=disposition,
     )
+
+
+@router.get("/smpl-model")
+def get_smpl_model(
+    path: str = Query(...),
+    user: User = Depends(get_current_user),
+):
+    """按需解析 SMPL/SMPL-X/SMPL-H 身体模型（pkl/npz），返回模板网格顶点+面。"""
+    from ..worker.parsers import load_smpl_model
+
+    try:
+        file_path = resolve_repo_file(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if file_path.stat().st_size == 0:
+        raise HTTPException(status_code=400, detail="模型文件为空，请上传真实的 SMPL 模型")
+    try:
+        return load_smpl_model(file_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SMPL 模型解析失败：{exc}") from exc
+
+
+@router.get("/smpl-motion")
+def get_smpl_motion_by_path(
+    path: str = Query(...),
+    user: User = Depends(get_current_user),
+):
+    """按需解析 SMPL/SMPL-X/SMPL-H 动作 npz（按仓库路径），返回 poses/trans/fps。"""
+    from ..worker.parsers import load_smpl_motion
+
+    try:
+        file_path = resolve_repo_file(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    try:
+        return load_smpl_motion(file_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SMPL 解析失败：{exc}") from exc
 
 
 @router.delete("/file")

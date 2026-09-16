@@ -3,6 +3,7 @@ import {
   useEffect,
   useMemo,
   useState,
+  type CSSProperties,
   type DragEvent,
   type MouseEvent,
 } from "react";
@@ -164,7 +165,12 @@ function FolderBranch({
         className={`folder-row browse-folder-row ${folderActive ? "active" : ""} ${
           isDrop ? "drop-target" : ""
         }`}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        style={
+          {
+            paddingLeft: 8 + depth * 14,
+            "--tree-depth": depth,
+          } as CSSProperties
+        }
         onClick={() => {
           onSelectFolder?.(node);
           if (!open) toggle();

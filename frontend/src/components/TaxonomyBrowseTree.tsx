@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { api, getToken } from "../api";
 import type { ClipListItem, RepoPack, TaxonomyNode } from "../types";
 
@@ -91,7 +91,12 @@ function NodeBranch({
     <div>
       <div
         className={`folder-row browse-folder-row ${active ? "active" : ""}`}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        style={
+          {
+            paddingLeft: 8 + depth * 14,
+            "--tree-depth": depth,
+          } as CSSProperties
+        }
         onClick={() => {
           onSelectNode(node);
           if (!open) toggle();

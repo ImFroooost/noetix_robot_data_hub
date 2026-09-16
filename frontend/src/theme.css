@@ -30,6 +30,7 @@
   --accent-softer: rgba(198, 240, 77, 0.11);
   --teal-soft: rgba(157, 140, 255, 0.16);
   --panel-deep: #0b0d12;
+  --viewer-bg: #0b0d12;
   --chip-on: #d8ff7a;
   --toggle-track: #171b21;
 }
@@ -65,6 +66,7 @@
   --accent-softer: rgba(182, 230, 42, 0.16);
   --teal-soft: rgba(109, 94, 245, 0.12);
   --panel-deep: #dfe6d4;
+  --viewer-bg: #d8e0cc;
   --chip-on: #4a6a08;
   --toggle-track: #d4e0c4;
 }
@@ -153,7 +155,7 @@ body {
 
 .viewer-panel,
 .storage-model-canvas {
-  background: #0b0d12;
+  background: var(--viewer-bg);
 }
 
 .table tr:hover td,
@@ -249,10 +251,28 @@ body {
 
 [data-theme="light"] .storage-kind-chip.is-on,
 [data-theme="light"] .chip-btn.is-active,
+[data-theme="light"] .browse-folder-row {
+  background: var(--bg-elev);
+}
+
+[data-theme="light"] .browse-folder-row:hover {
+  background: var(--bg-soft);
+}
+
+[data-theme="light"] .browse-folder-row.active,
+[data-theme="light"] .browse-folder-row.active:hover {
+  background: color-mix(in srgb, var(--accent) 32%, var(--bg-elev));
+}
+
 [data-theme="light"] .folder-row.active,
 [data-theme="light"] .browse-result-row:hover,
 [data-theme="light"] .browse-clip-row.batch-checked {
   background: var(--accent-softer);
+}
+
+[data-theme="light"] .folder-row.browse-folder-row.active,
+[data-theme="light"] .folder-row.browse-folder-row.active:hover {
+  background: color-mix(in srgb, var(--accent) 32%, var(--bg-elev));
 }
 
 [data-theme="light"] .index-refresh-panel {
@@ -484,4 +504,9 @@ body {
 
 [data-theme="dark"] .storage-filter-line button.active {
   box-shadow: 0 0 16px rgba(198, 240, 77, 0.24);
+}
+
+.browse-folder-row.active,
+.browse-folder-row.active:hover {
+  background: color-mix(in srgb, var(--accent) 28%, var(--bg-elev));
 }

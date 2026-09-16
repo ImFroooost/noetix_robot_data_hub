@@ -32,6 +32,11 @@
   margin: 0.12rem 0;
   border-radius: 10px;
   border: 1px solid transparent;
+  position: sticky;
+  top: calc(var(--tree-depth, 0) * var(--tree-sticky-row, 2.1rem));
+  z-index: calc(16 - var(--tree-depth, 0));
+  background: var(--bg-elev);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--border) 70%, transparent);
   transition:
     background 0.18s ease,
     border-color 0.18s ease,
@@ -40,14 +45,14 @@
 }
 
 .tax-row:hover {
-  background: var(--sidebar-hover);
+  background: color-mix(in srgb, var(--accent-2) 14%, var(--bg-elev));
   border-color: color-mix(in srgb, var(--accent-2) 28%, var(--border));
   transform: translateX(3px);
 }
 
 .tax-row.is-selected,
 .tax-row.active {
-  background: var(--sidebar-active);
+  background: color-mix(in srgb, var(--accent-2) 22%, var(--bg-elev));
   border-color: color-mix(in srgb, var(--accent-2) 45%, var(--border));
   box-shadow: inset 3px 0 0 var(--accent-2);
 }

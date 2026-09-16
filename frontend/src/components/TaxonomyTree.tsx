@@ -1,6 +1,7 @@
 import {
   useMemo,
   useState,
+  type CSSProperties,
   type DragEvent,
 } from "react";
 import { api } from "../api";
@@ -111,7 +112,12 @@ function NodeRow({
         } ${isDropTarget && dragOverPos === "before" ? "drop-before" : ""} ${
           isDropTarget && dragOverPos === "after" ? "drop-after" : ""
         }`}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        style={
+          {
+            paddingLeft: 8 + depth * 14,
+            "--tree-depth": depth,
+          } as CSSProperties
+        }
         draggable={Boolean(manageable && !renaming)}
         onDragStart={(e) => onDragStartNode(e, node)}
         onDragOver={(e) => onDragOverTarget(e, node.id)}

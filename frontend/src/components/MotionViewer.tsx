@@ -1,10 +1,20 @@
 import { Canvas, useFrame } from "@react-three/fiber";
-import { OrbitControls, Grid, Line } from "@react-three/drei";
+import { OrbitControls, Line } from "@react-three/drei";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import URDFLoader from "urdf-loader";
 import { api, fetchJsonAuth } from "../api";
 import { BvhScene, FbxScene } from "./AnimationFormatPreview";
+import { useViewerLook, ViewerSceneChrome } from "./ViewerSceneChrome";
+import {
+  cycleUpAxisMode,
+  detectUpAxisFromJointFrames,
+  resolveUpAxis,
+  upAxisModeLabel,
+  upAxisToRotationX,
+  useUpAxisMode,
+  type UpAxis,
+} from "../viewerUpAxis";
 import type { Clip, HumanFile, RobotFile, RobotModel, RobotStage } from "../types";
 import {
   STAGE_LABEL,
@@ -55,12 +65,13 @@ function timeToFrame(t: number, fps: number, frameCount: number) {
 }
 
 function PathTrail({ positions }: { positions: number[][] }) {
+  const look = useViewerLook();
   const points = useMemo(
     () => positions.map((p) => new THREE.Vector3(p[0] * 0.01, p[1] * 0.01, (p[2] ?? 0) * 0.01)),
     [positions]
   );
   if (points.length < 2) return null;
-  return <Line points={points} color="#6cb2ff" lineWidth={2} />;
+  return <Line points={points} color={look.trail} lineWidth={2} />;
 }
 
 function JointDots({
@@ -72,6 +83,7 @@ function JointDots({
   fps: number;
   time: number;
 }) {
+  const look = useViewerLook();
   const idx = timeToFrame(time, fps, frames.length);
   const vals = frames[idx] || [];
   const pts = [];
@@ -79,7 +91,7 @@ function JointDots({
     pts.push(
       <mesh key={i} position={[vals[i] * 0.01, vals[i + 1] * 0.01, vals[i + 2] * 0.01]}>
         <sphereGeometry args={[0.03, 12, 12]} />
-        <meshStandardMaterial color="#ffb454" />
+        <meshStandardMaterial color={look.joint} />
       </mesh>
     );
   }
@@ -89,7 +101,7 @@ function JointDots({
       pts.push(
         <mesh key={i} position={[i * 0.08 - 1, vals[i] * 0.2, 0]}>
           <boxGeometry args={[0.05, 0.05, 0.05]} />
-          <meshStandardMaterial color="#7dd3fc" />
+          <meshStandardMaterial color={look.marker} />
         </mesh>
       );
     }
@@ -125,7 +137,6 @@ function UrdfRobot({
       api.mediaUrl(model.urdf_path),
       (robot) => {
         if (cancelled) return;
-        robot.rotation.x = -Math.PI / 2;
         robotRef.current = robot;
         setReady(true);
       },
@@ -158,7 +169,11 @@ function UrdfRobot({
   });
 
   if (!ready || !robotRef.current) return null;
-  return <primitive object={robotRef.current} />;
+  return (
+    <group>
+      <primitive object={robotRef.current} />
+    </group>
+  );
 }
 
 function SceneContent({
@@ -169,7 +184,9 @@ function SceneContent({
   robotModel,
   time,
   duration,
+  rotationX,
   onMediaDuration,
+  onDetectedUpAxis,
 }: {
   humanFile: HumanFile | null;
   humanPreview: HumanPreview | null;
@@ -178,7 +195,9 @@ function SceneContent({
   robotModel: RobotModel | null;
   time: number;
   duration: number;
+  rotationX: number;
   onMediaDuration?: (sec: number) => void;
+  onDetectedUpAxis?: (up: UpAxis) => void;
 }) {
   const fmt = (humanFile?.format || "").toLowerCase();
   const humanIsBvh = fmt === "bvh";
@@ -191,11 +210,24 @@ function SceneContent({
   // 仅人体时居中；人机同屏时左右分列
   const humanX = showHuman && showRobot ? -1.2 : 0;
   const robotX = showHuman && showRobot ? 1.2 : 0;
+
+  useEffect(() => {
+    if (humanIsBvh || humanIsFbx) return;
+    const humanFrames = humanPreview?.pose_preview || humanPreview?.frames;
+    if (humanFrames?.length) {
+      onDetectedUpAxis?.(detectUpAxisFromJointFrames(humanFrames));
+      return;
+    }
+    if (robotPreview?.frames?.length) {
+      onDetectedUpAxis?.(detectUpAxisFromJointFrames(robotPreview.frames));
+      return;
+    }
+    if (robotModel) onDetectedUpAxis?.("z");
+  }, [humanIsBvh, humanIsFbx, humanPreview, robotPreview, robotModel, onDetectedUpAxis]);
+
   return (
     <>
-      <ambientLight intensity={0.7} />
-      <directionalLight position={[3, 5, 2]} intensity={1.1} />
-      <Grid args={[10, 10]} cellColor="#334" sectionColor="#556" fadeDistance={20} />
+      <ViewerSceneChrome />
       <group position={[humanX, 0, 0]}>
         {humanIsBvh && humanFile && (
           <BvhScene
@@ -203,6 +235,8 @@ function SceneContent({
             time={time}
             duration={duration}
             onDuration={onMediaDuration}
+            rotationX={rotationX}
+            onDetectedUpAxis={onDetectedUpAxis}
           />
         )}
         {humanIsFbx && humanFile && (
@@ -210,33 +244,47 @@ function SceneContent({
             url={api.fileUrl("human", humanFile.id)}
             time={time}
             onDuration={onMediaDuration}
+            rotationX={rotationX}
+            onDetectedUpAxis={onDetectedUpAxis}
           />
         )}
         {humanIsSmpl && humanPreview?.pose_preview && (
-          <JointDots
-            frames={humanPreview.pose_preview}
-            fps={humanPreview.fps || humanFile?.fps || 30}
-            time={time}
-          />
+          <group rotation={[rotationX, 0, 0]}>
+            <JointDots
+              frames={humanPreview.pose_preview}
+              fps={humanPreview.fps || humanFile?.fps || 30}
+              time={time}
+            />
+          </group>
         )}
         {humanIsSmpl && humanPreview?.frames && (
-          <JointDots
-            frames={humanPreview.frames}
-            fps={humanPreview.fps || humanFile?.fps || 30}
-            time={time}
-          />
+          <group rotation={[rotationX, 0, 0]}>
+            <JointDots
+              frames={humanPreview.frames}
+              fps={humanPreview.fps || humanFile?.fps || 30}
+              time={time}
+            />
+          </group>
         )}
       </group>
       <group position={[robotX, 0, 0]}>
         {robotPlayable && robotModel && (
-          <UrdfRobot model={robotModel} preview={robotPreview} time={time} />
+          <group rotation={[rotationX, 0, 0]}>
+            <UrdfRobot
+              model={robotModel}
+              preview={robotPreview}
+              time={time}
+            />
+          </group>
         )}
         {robotPlayable && !robotModel && robotPreview?.frames && (
-          <JointDots
-            frames={robotPreview.frames}
-            fps={robotPreview.fps || robotFile?.fps || 30}
-            time={time}
-          />
+          <group rotation={[rotationX, 0, 0]}>
+            <JointDots
+              frames={robotPreview.frames}
+              fps={robotPreview.fps || robotFile?.fps || 30}
+              time={time}
+            />
+          </group>
         )}
       </group>
       <OrbitControls makeDefault />
@@ -279,6 +327,9 @@ export function MotionViewer({
   const [robotPreview, setRobotPreview] = useState<RobotPreview | null>(null);
   /** BVH/FBX 解析出的真实时长（元数据未写入时也能播完） */
   const [mediaDuration, setMediaDuration] = useState(0);
+  const [upAxisMode, setUpAxisMode] = useUpAxisMode();
+  const [detectedUp, setDetectedUp] = useState<UpAxis>("y");
+  const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
 
   const lockedHuman = humanFileId != null;
   const lockedRobotSelect = robotFileId != null;
@@ -305,6 +356,7 @@ export function MotionViewer({
     setTime(0);
     setPlaying(true);
     setMediaDuration(0);
+    setDetectedUp("y");
   }, [humanFileId, robotFileId, humanId]);
 
   const humanFile =
@@ -467,8 +519,12 @@ export function MotionViewer({
       )}
 
       <div className={panelClass}>
-        <Canvas camera={{ position: [2.5, 2, 3.5], fov: 50 }}>
-          <color attach="background" args={["#0b0d12"]} />
+        <Canvas
+          camera={{ position: [2.5, 2, 3.5], fov: 50 }}
+          style={{ width: "100%", height: "100%", display: "block" }}
+          resize={{ debounce: 0 }}
+          gl={{ antialias: true, alpha: false }}
+        >
           <SceneContent
             humanFile={humanFile}
             humanPreview={humanPreview}
@@ -477,7 +533,9 @@ export function MotionViewer({
             robotModel={robotModel}
             time={time}
             duration={duration}
+            rotationX={rotationX}
             onMediaDuration={setMediaDuration}
+            onDetectedUpAxis={setDetectedUp}
           />
         </Canvas>
       </div>
@@ -536,6 +594,14 @@ export function MotionViewer({
           <option value={1.5}>1.5×</option>
           <option value={2}>2×</option>
         </select>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="切换坐标系方向：自动识别 / Y-up / Z-up"
+          onClick={() => setUpAxisMode(cycleUpAxisMode(upAxisMode))}
+        >
+          {upAxisModeLabel(upAxisMode, detectedUp)}
+        </button>
       </div>
 
       {!compact && !controlsOnly && (

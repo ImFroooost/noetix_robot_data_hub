@@ -1933,7 +1933,7 @@ def collect_archive_entries(
     *,
     batches: list[str] | None = None,
     units: list[tuple[str, str]] | None = None,
-    kinds: list[tuple[str, str]] | None = None,
+    kinds: list[tuple[str, str] | tuple[str, str, str | None]] | None = None,
     accept: Any | None = None,
 ) -> list[tuple[Path, str]]:
     snapshot = scan_data(include_empty=True)
@@ -1942,15 +1942,26 @@ def collect_archive_entries(
         unit_key(safe_name(batch, label="数据批次名"), safe_name(name, label="数据单元名"))
         for batch, name in units or []
     }
-    wanted_kinds = {(ontology, modality) for ontology, modality in kinds or []}
+    wanted_any: set[tuple[str, str]] = set()
+    wanted_formats: set[tuple[str, str, str]] = set()
+    for item in kinds or []:
+        ontology, modality = item[0], item[1]
+        fmt = str(item[2] or "").lower() if len(item) > 2 else ""
+        if fmt:
+            wanted_formats.add((ontology, modality, fmt))
+        else:
+            wanted_any.add((ontology, modality))
     entries: list[tuple[Path, str]] = []
     seen: set[str] = set()
     for rec in snapshot["files"]:
         key = unit_key(rec["batch"], rec["unit_name"])
         if rec["batch"] not in wanted_batches and key not in wanted_units:
             continue
-        if wanted_kinds and (rec["ontology"], rec["modality"]) not in wanted_kinds:
-            continue
+        if wanted_any or wanted_formats:
+            rec_fmt = str(rec.get("format") or "").lower()
+            kind = (rec["ontology"], rec["modality"])
+            if kind not in wanted_any and (*kind, rec_fmt) not in wanted_formats:
+                continue
         if accept is not None and not accept(rec):
             continue
         if rec["path"] in seen:

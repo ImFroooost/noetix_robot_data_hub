@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import type { TaxonomyNode } from "../types";
 
 type TreeNode = TaxonomyNode & { children: TreeNode[] };
@@ -46,7 +46,12 @@ function Branch({
     <div>
       <div
         className={`folder-row browse-folder-row ${active ? "active" : ""}`}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        style={
+          {
+            paddingLeft: 8 + depth * 14,
+            "--tree-depth": depth,
+          } as CSSProperties
+        }
         onClick={() => {
           onSelect(node);
           if (hasKids && !open) {

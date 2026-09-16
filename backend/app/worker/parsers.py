@@ -303,6 +303,164 @@ def parse_npz_smpl(path: Path) -> dict:
     }
 
 
+def load_smpl_motion(path: Path, max_frames: int = 900) -> dict:
+    """解析 SMPL/SMPL-X/SMPL-H 动作 npz，返回骨架播放所需的 poses/trans/fps。
+
+    poses 统一成 (T,72)（24 关节 × 3 轴角）；trans 为 (T,3) 根节点位移。
+    """
+    data = np.load(path, allow_pickle=True)
+    keys = list(data.keys())
+
+    poses = None
+    for k in ("poses", "pose", "smpl_poses", "body_pose"):
+        if k in data:
+            poses = np.asarray(data[k], dtype=np.float32)
+            break
+    if poses is None:
+        raise ValueError("npz 中没有 poses/pose 数据")
+
+    # (T,24,3) 或 (T,72) 都统一成 (T,72)
+    if poses.ndim == 3:
+        poses = poses.reshape(poses.shape[0], -1)
+    if poses.ndim != 2:
+        raise ValueError(f"poses 形状异常：{poses.shape}")
+
+    trans = None
+    for k in ("trans", "root_trans", "translation", "root_translation"):
+        if k in data:
+            trans = np.asarray(data[k], dtype=np.float32).reshape(poses.shape[0], -1)[:, :3]
+            break
+
+    fps = None
+    for k in ("fps", "mocap_framerate", "mocap_frame_rate", "frame_rate"):
+        if k in data:
+            try:
+                fps = float(np.asarray(data[k]).reshape(-1)[0])
+            except Exception:
+                pass
+    if not fps or fps <= 0:
+        fps = 30.0
+
+    betas = None
+    if "betas" in data:
+        betas = np.asarray(data["betas"], dtype=np.float32).reshape(-1).tolist()
+
+    frames = int(poses.shape[0])
+    step = max(1, frames // max_frames)
+    idx = np.arange(0, frames, step)
+    out_poses = poses[idx].astype(np.float32).tolist()
+    out = {
+        "poses": out_poses,
+        "fps": fps,
+        "frame_count": frames,
+        "duration_sec": _duration(fps, frames),
+        "betas": betas,
+        "keys": keys,
+    }
+    if trans is not None:
+        out["trans"] = trans[idx].astype(np.float32).tolist()
+    return out
+
+
+def _smpl_dense(value) -> np.ndarray | None:
+    if value is None:
+        return None
+    if hasattr(value, "toarray"):
+        value = value.toarray()
+    elif hasattr(value, "todense"):
+        value = np.asarray(value.todense())
+    try:
+        arr = np.asarray(value)
+    except Exception:
+        return None
+    if arr.dtype == object or arr.size == 0:
+        return None
+    return arr
+
+
+def _smpl_pick(obj, keys: tuple[str, ...]):
+    if obj is None:
+        return None
+    for key in keys:
+        try:
+            if key in obj:
+                return obj[key]
+        except Exception:
+            continue
+    return None
+
+
+def load_smpl_model(path: Path) -> dict:
+    """解析 SMPL/SMPL-X/SMPL-H 身体模型（pkl 或 npz），返回模板网格 v_template + faces。
+
+    官方 pkl 是 Python2 pickle，需 encoding='latin1'；里面可能含 scipy 稀疏矩阵，
+    没有 scipy 时退回到只挑能反序列化的对象。若有 weights / J，一并返回供前端蒙皮。
+    """
+    suffix = path.suffix.lower()
+    raw = None
+
+    if suffix == ".npz":
+        raw = np.load(path, allow_pickle=True)
+    else:
+        import pickle
+
+        with open(path, "rb") as fp:
+            try:
+                obj = pickle.load(fp, encoding="latin1")
+            except Exception:
+                class _Pickler(pickle.Unpickler):
+                    def find_class(self, module, name):
+                        try:
+                            return super().find_class(module, name)
+                        except Exception:
+                            return type(name, (), {})
+
+                fp.seek(0)
+                obj = _Pickler(fp, encoding="latin1").load()
+        raw = obj if isinstance(obj, dict) else None
+
+    v_template = _smpl_dense(_smpl_pick(raw, ("v_template", "v", "vertices", "template")))
+    faces = _smpl_dense(_smpl_pick(raw, ("f", "faces", "triangles")))
+    if v_template is not None:
+        v_template = v_template.astype(np.float32)
+    if faces is not None:
+        faces = faces.astype(np.int64)
+
+    if v_template is None or faces is None:
+        raise ValueError("模型文件中没有 v_template/faces（可能不是有效的 SMPL 模型）")
+
+    weights = _smpl_dense(_smpl_pick(raw, ("weights", "lbs_weights", "blend_weights")))
+    joints = _smpl_dense(_smpl_pick(raw, ("J", "joints")))
+    regressor = _smpl_dense(_smpl_pick(raw, ("J_regressor", "j_regressor")))
+    if joints is None and regressor is not None and regressor.ndim == 2:
+        if regressor.shape[1] == v_template.shape[0]:
+            joints = regressor.astype(np.float32) @ v_template
+        elif regressor.shape[0] == v_template.shape[0]:
+            joints = v_template.T @ regressor.astype(np.float32)
+            joints = joints.T
+    if joints is not None:
+        joints = np.asarray(joints, dtype=np.float32).reshape(-1, 3)
+    if weights is not None:
+        weights = np.asarray(weights, dtype=np.float32)
+        if weights.ndim != 2:
+            weights = None
+        elif weights.shape[0] != v_template.shape[0] and weights.shape[1] == v_template.shape[0]:
+            weights = weights.T
+
+    out = {
+        "vertices": v_template.astype(np.float32).tolist(),
+        "faces": faces.astype(np.int64).tolist(),
+        "vertex_count": int(v_template.shape[0]),
+        "face_count": int(faces.shape[0]),
+    }
+    if joints is not None and joints.size:
+        out["joints"] = joints.astype(np.float32).tolist()
+        out["joint_count"] = int(joints.shape[0])
+    if weights is not None:
+        out["weights"] = weights.astype(np.float32).tolist()
+    return out
+
+
 def parse_fbx_stub(path: Path) -> dict:
     """FBX binary parsing is complex; store size-based stub and let frontend load original via three.js."""
     size = path.stat().st_size

@@ -1,5 +1,5 @@
 import { Canvas, useFrame } from "@react-three/fiber";
-import { Grid, Html, OrbitControls } from "@react-three/drei";
+import { Html, OrbitControls } from "@react-three/drei";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
@@ -12,6 +12,32 @@ import {
 } from "./RobotStyleFields";
 import type { ModelInstance, StorageFile } from "../types";
 import { parseCsvFps } from "../types";
+import { FrameFigure, ViewerSceneChrome } from "./ViewerSceneChrome";
+import {
+  cycleUpAxisMode,
+  detectUpAxisFromBox,
+  resolveUpAxis,
+  upAxisModeLabel,
+  upAxisToRotationX,
+  useUpAxisMode,
+  type UpAxis,
+} from "../viewerUpAxis";
+
+const _robotBox = new THREE.Box3();
+
+function centerFromFrames(frames: RobotCsvFrame[], rotationX: number): [number, number, number] {
+  let sumX = 0;
+  let sumZ = 0;
+  const c = Math.cos(rotationX);
+  const s = Math.sin(rotationX);
+  for (const frame of frames) {
+    const [x, y, z] = frame.root;
+    sumX += x;
+    sumZ += y * s + z * c;
+  }
+  const n = frames.length || 1;
+  return [-sumX / n, 0, -sumZ / n];
+}
 
 const ROOT_COLS = 7;
 const FLOATING_JOINT = /floor_2_base|floating_base|floatingbase|root_joint|base_joint|world_to_/i;
@@ -90,8 +116,10 @@ function RobotCsvScene({
   fpsHint,
   durationHint,
   time,
+  rotationX = 0,
   onReady,
   onError,
+  onDetectedUpAxis,
 }: {
   csvUrl: string;
   urdfPath: string;
@@ -99,10 +127,13 @@ function RobotCsvScene({
   fpsHint?: number | null;
   durationHint?: number | null;
   time: number;
+  rotationX?: number;
   onReady: (info: { duration: number; fps: number; jointCount: number; note: string }) => void;
   onError: (message: string) => void;
+  onDetectedUpAxis?: (up: UpAxis) => void;
 }) {
   const robotRef = useRef<URDFRobot | null>(null);
+  const figureRef = useRef<THREE.Group>(null);
   const framesRef = useRef<RobotCsvFrame[]>([]);
   const namesRef = useRef<string[]>([]);
   const fpsRef = useRef(30);
@@ -112,8 +143,10 @@ function RobotCsvScene({
   const [error, setError] = useState("");
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
+  const onDetectedRef = useRef(onDetectedUpAxis);
   onReadyRef.current = onReady;
   onErrorRef.current = onError;
+  onDetectedRef.current = onDetectedUpAxis;
 
   useEffect(() => {
     let cancelled = false;
@@ -155,18 +188,17 @@ function RobotCsvScene({
 
         const model = loader.parse(urdfText);
         applyFrame(model, parsed.frames[0], jointNames);
+        model.updateMatrixWorld(true);
+        _robotBox.setFromObject(model);
+        if (!_robotBox.isEmpty()) {
+          onDetectedRef.current?.(detectUpAxisFromBox(_robotBox));
+        }
         const fps = fpsHint || parsed.fps || 30;
         const duration =
           durationHint && durationHint > 0
             ? durationHint
             : parsed.frames.length / Math.max(fps, 1);
-        let sumX = 0;
-        let sumZ = 0;
-        parsed.frames.forEach((frame) => {
-          sumX += frame.root[0];
-          sumZ += -frame.root[1];
-        });
-        setCenter([-sumX / parsed.frames.length, 0, -sumZ / parsed.frames.length]);
+        setCenter(centerFromFrames(parsed.frames, rotationX));
 
         framesRef.current = parsed.frames;
         namesRef.current = jointNames;
@@ -198,6 +230,11 @@ function RobotCsvScene({
     };
   }, [csvUrl, urdfPath, packageRoot, fpsHint, durationHint]);
 
+  useEffect(() => {
+    if (!framesRef.current.length) return;
+    setCenter(centerFromFrames(framesRef.current, rotationX));
+  }, [rotationX, robot]);
+
   useFrame(() => {
     const model = robotRef.current;
     const frames = framesRef.current;
@@ -210,8 +247,13 @@ function RobotCsvScene({
   });
 
   return (
-    <group position={center}>
-      <group rotation={[-Math.PI / 2, 0, 0]}>{robot && <primitive object={robot} />}</group>
+    <group ref={figureRef} position={center}>
+      <group rotation={[rotationX, 0, 0]}>{robot && <primitive object={robot} />}</group>
+      <FrameFigure
+        objectRef={figureRef}
+        ready={status === "ready"}
+        resetKey={`${csvUrl}:${rotationX}`}
+      />
       {status === "loading" && (
         <Html center style={{ pointerEvents: "none" }}>
           <div className="muted animation-format-status">机器人 CSV 加载中…</div>
@@ -234,7 +276,10 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
   const [speed, setSpeed] = useState(1);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [note, setNote] = useState("");
+  const [upAxisMode, setUpAxisMode] = useUpAxisMode();
+  const [detectedUp, setDetectedUp] = useState<UpAxis>("z");
   const duration = mediaDuration || file.duration_sec || 1;
+  const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
   const style = String(file.annotation?.robot_style || "");
   const instance = instances.find((item) => item.name === style);
   const versions = robotDescriptionVersions(instance);
@@ -268,6 +313,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
     setPlaying(true);
     setMediaDuration(0);
     setNote("");
+    setDetectedUp("z");
   }, [file.path, style, version]);
 
   useEffect(() => {
@@ -313,11 +359,13 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
             ，保存后再预览
           </div>
         ) : (
-          <Canvas camera={{ position: [2.4, 1.6, 3.2], fov: 50 }}>
-            <color attach="background" args={["#0b0d12"]} />
-            <ambientLight intensity={0.75} />
-            <directionalLight position={[3, 5, 2]} intensity={1.15} />
-            <Grid args={[10, 10]} cellColor="#334" sectionColor="#556" fadeDistance={20} />
+          <Canvas
+            camera={{ position: [2.4, 1.6, 3.2], fov: 50 }}
+            style={{ width: "100%", height: "100%", display: "block" }}
+            resize={{ debounce: 0 }}
+            gl={{ antialias: true, alpha: false }}
+          >
+            <ViewerSceneChrome />
             <RobotCsvScene
               key={`${file.path}:${urdfFile.path}:${parseCsvFps(file.annotation?.fps ?? file.fps)}`}
               csvUrl={api.storageFileUrl(file.path)}
@@ -326,8 +374,10 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
               fpsHint={parseCsvFps(file.annotation?.fps ?? file.fps)}
               durationHint={null}
               time={time}
+              rotationX={rotationX}
               onReady={handleReady}
               onError={() => undefined}
+              onDetectedUpAxis={setDetectedUp}
             />
             <OrbitControls makeDefault />
           </Canvas>
@@ -382,6 +432,15 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
           <option value={1.5}>1.5×</option>
           <option value={2}>2×</option>
         </select>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="切换坐标系方向：自动识别 / Y-up / Z-up"
+          disabled={missingStyle}
+          onClick={() => setUpAxisMode(cycleUpAxisMode(upAxisMode))}
+        >
+          {upAxisModeLabel(upAxisMode, detectedUp)}
+        </button>
       </div>
       {note ? <div className="muted animation-format-note">{note}</div> : null}
     </div>

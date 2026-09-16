@@ -465,6 +465,10 @@ export const api = {
     request<import("./types").RepoFile[]>("/api/repo/upload-zip", { method: "POST", body: form }),
 
   previewUrl: (kind: "human" | "robot", id: number) => `/api/previews/${kind}/${id}`,
+  smplMotionUrl: (id: number) => `/api/previews/human/${id}/smpl`,
+  storageSmplMotionUrl: (path: string) =>
+    `/api/storage/smpl-motion?path=${encodeURIComponent(path)}`,
+  smplModelUrl: (path: string) => `/api/storage/smpl-model?path=${encodeURIComponent(path)}`,
   fileUrl: (kind: "human" | "robot" | "video" | "shared", id: number) =>
     `/api/files/${kind}/${id}`,
   thumbUrl: (clipId: number) => `/api/thumbnails/${clipId}`,

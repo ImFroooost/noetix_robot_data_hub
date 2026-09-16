@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { StorageFile } from "../types";
 import { usePreview } from "../preview/PreviewContext";
+import { BUILD_ID } from "../buildId";
 import { FilePreview } from "./FilePreview";
 
 export function FilePreviewDock({
@@ -64,6 +65,14 @@ export function FilePreviewDock({
     setFocused((current) => current.filter((index) => index < preview.slots.length));
   }, [preview.slots.length]);
 
+  useEffect(() => {
+    if (overlayOpen) return;
+    const id = window.requestAnimationFrame(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [overlayOpen]);
+
   return (
     <section
       className={`storage-preview-section ${overlayOpen ? "is-fullscreen" : ""}`}
@@ -75,6 +84,8 @@ export function FilePreviewDock({
             可同时打开任意批次、任意单元中的文件；切换左侧列表不会清空。已打开{" "}
             {preview.filledCount} 个
             {overlayOpen ? " · Esc 退出全屏" : ""}
+            {" · 构建 "}
+            {BUILD_ID}
           </p>
         </div>
         <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
