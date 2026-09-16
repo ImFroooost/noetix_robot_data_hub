@@ -7,6 +7,7 @@ import {
 import { api } from "../api";
 import type { TaxonomyNode, TaxonomyScheme } from "../types";
 import { taxonomySchemeLabel } from "../types";
+import { useUndoOptional } from "../undo/UndoContext";
 
 const DND_TAXONOMY = "application/x-noetix-taxonomy-id";
 
@@ -518,6 +519,7 @@ export function TaxonomySelect({
   /** 新建成功后刷新节点列表 */
   onNodesReload?: () => Promise<void> | void;
 }) {
+  const history = useUndoOptional();
   const [addingParentId, setAddingParentId] = useState<number | null | undefined>(
     undefined
   );
@@ -619,15 +621,30 @@ export function TaxonomySelect({
     setBusy(true);
     setLocalError("");
     try {
-      const created = await api.createTaxonomyNode({
-        scheme: resolvedScheme,
-        parent_id: addingParentId,
-        name,
-      });
-      setNewName("");
-      setAddingParentId(undefined);
-      await onNodesReload?.();
-      onChange(created.id);
+      let createdId = 0;
+      const run = async () => {
+        const created = await api.createTaxonomyNode({
+          scheme: resolvedScheme,
+          parent_id: addingParentId,
+          name,
+        });
+        createdId = created.id;
+        setNewName("");
+        setAddingParentId(undefined);
+        await onNodesReload?.();
+      };
+      if (history) {
+        await history.execute({
+          label: `新建分类「${name}」`,
+          do: run,
+          undo: async () => {
+            if (createdId) await api.deleteTaxonomyNode(createdId);
+          },
+        });
+      } else {
+        await run();
+      }
+      if (createdId) onChange(createdId);
     } catch (e) {
       setLocalError(e instanceof Error ? e.message : "创建失败");
     } finally {

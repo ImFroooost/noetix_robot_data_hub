@@ -413,6 +413,7 @@ body {
 [data-theme="dark"] button.secondary,
 [data-theme="dark"] .btn.secondary,
 [data-theme="dark"] .icon-btn,
+[data-theme="dark"] .icon-button,
 [data-theme="dark"] .ghost-link,
 [data-theme="dark"] .sidebar-toggle,
 [data-theme="dark"] .nav-open,
@@ -421,6 +422,37 @@ body {
 [data-theme="dark"] .storage-tree-all,
 [data-theme="dark"] .theme-toggle button {
   color: var(--text);
+}
+
+[data-theme="dark"] .playback-controls {
+  background: var(--bg-elev);
+  border-color: var(--border);
+}
+
+[data-theme="dark"] .playback-controls .icon-button,
+[data-theme="dark"] .playback-controls .follow-root-toggle,
+[data-theme="dark"] .playback-controls .speed-select {
+  background: #46525e;
+  border: 1px solid #8a9aa8;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+[data-theme="dark"] .playback-controls .icon-button:hover:not(:disabled),
+[data-theme="dark"] .playback-controls .follow-root-toggle:hover:not(:disabled),
+[data-theme="dark"] .playback-controls .speed-select:hover:not(:disabled) {
+  background: #55636f;
+  border-color: var(--accent);
+}
+
+[data-theme="dark"] .playback-controls .play-button {
+  background: var(--accent);
+  color: var(--btn-fg);
+  box-shadow: 0 0 10px rgba(198, 240, 77, 0.35);
+}
+
+[data-theme="dark"] .playback-controls .frame-readout {
+  color: var(--muted);
 }
 
 [data-theme="dark"] button.danger {

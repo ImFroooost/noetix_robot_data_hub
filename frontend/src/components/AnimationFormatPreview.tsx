@@ -7,7 +7,6 @@ import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { getToken } from "../api";
 import {
   applyViewerFigureColors,
-  figureScale,
   FrameFigure,
   SkeletonLines,
   useViewerLook,
@@ -22,10 +21,23 @@ import {
   useUpAxisMode,
   type UpAxis,
 } from "../viewerUpAxis";
+import {
+  cycleLengthUnitMode,
+  detectLengthUnit,
+  detectLengthUnitFromExtents,
+  lengthUnitModeLabel,
+  lengthUnitToScale,
+  resolveLengthUnit,
+  useLengthUnitMode,
+  type LengthUnit,
+  type LengthUnitMode,
+} from "../viewerUnits";
 
 const _bvhHips = new THREE.Vector3();
 const _bvhBox = new THREE.Box3();
 const _bvhPt = new THREE.Vector3();
+const _meshBox = new THREE.Box3();
+const _meshSize = new THREE.Vector3();
 
 /** WebGL 不可用或渲染出错时给出提示，而不是留下空白画布。 */
 class CanvasErrorBoundary extends Component<{ children: ReactNode }, { error: string }> {
@@ -69,7 +81,9 @@ export function BvhScene({
   onDuration,
   viewNonce = 0,
   rotationX = 0,
+  unitMode = "auto",
   onDetectedUpAxis,
+  onDetectedLengthUnit,
 }: {
   url: string;
   time: number;
@@ -77,7 +91,9 @@ export function BvhScene({
   onDuration?: (sec: number) => void;
   viewNonce?: number;
   rotationX?: number;
+  unitMode?: LengthUnitMode;
   onDetectedUpAxis?: (up: UpAxis) => void;
+  onDetectedLengthUnit?: (unit: LengthUnit) => void;
 }) {
   const centerRef = useRef<THREE.Group>(null);
   const boneRootRef = useRef<THREE.Bone | null>(null);
@@ -90,6 +106,10 @@ export function BvhScene({
   onDurationRef.current = onDuration;
   const onDetectedRef = useRef(onDetectedUpAxis);
   onDetectedRef.current = onDetectedUpAxis;
+  const onDetectedUnitRef = useRef(onDetectedLengthUnit);
+  onDetectedUnitRef.current = onDetectedLengthUnit;
+  const layoutRef = useRef({ x: 0, minY: 0, z: 0 });
+  const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const [boneRoot, setBoneRoot] = useState<THREE.Bone | null>(null);
   const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
   const [scale, setScale] = useState(0.01);
@@ -175,7 +195,11 @@ export function BvhScene({
         if (!Number.isFinite(minY)) minY = 0;
         const maxHeight = Math.max(spanY, spanZ);
         onDetectedRef.current?.(detectUpAxisFromExtents(spanY, spanZ, midY / Math.max(samples, 1), midZ / Math.max(samples, 1)));
-        const nextScale = figureScale(maxHeight);
+        const unit = detectLengthUnit(maxHeight);
+        setDetectedUnit(unit);
+        onDetectedUnitRef.current?.(unit);
+        const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, unit));
+        layoutRef.current = { x: meanX, minY, z: meanZ };
         fixedOffset.current.set(
           -meanX * nextScale,
           -minY * nextScale,
@@ -183,9 +207,7 @@ export function BvhScene({
         );
         offsetReady.current = true;
 
-        // Radius is in BVH local units. A fixed 2.2 worked for centimetre
-        // files but swallowed metre-scale skeletons (height ≈ 1–2).
-        const jointRadius = Math.max(maxHeight * 0.016, 0.002);
+        const jointRadius = Math.max((maxHeight || 1) * 0.016, 1e-4);
         const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
         const jointMat = new THREE.MeshBasicMaterial({
           color: look.joint,
@@ -248,6 +270,14 @@ export function BvhScene({
       }
     };
   }, [url]);
+
+  useEffect(() => {
+    const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, detectedUnit));
+    const { x, minY, z } = layoutRef.current;
+    fixedOffset.current.set(-x * nextScale, -minY * nextScale, -z * nextScale);
+    setScale(nextScale);
+    setOffset([fixedOffset.current.x, fixedOffset.current.y, fixedOffset.current.z]);
+  }, [unitMode, detectedUnit]);
 
   useEffect(() => {
     applyViewerFigureColors(helperRef.current, boneRootRef.current, look);
@@ -324,8 +354,90 @@ function styleSkeletonHelper(helper: THREE.SkeletonHelper, look?: { bone: string
   return helper;
 }
 
-function attachJointDots(root: THREE.Object3D, height: number, look?: { joint: string; jointEmissive: string }) {
-  const jointRadius = Math.max(height * 0.016, 0.002);
+function expandMeshBox(root: THREE.Object3D, box: THREE.Box3) {
+  box.makeEmpty();
+  root.updateMatrixWorld(true);
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh || mesh.name === "__joint_dot" || !mesh.geometry?.attributes?.position?.count) {
+      return;
+    }
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+    const local = mesh.geometry.boundingBox;
+    if (!local || local.isEmpty()) return;
+    box.expandByPoint(_bvhPt.copy(local.min).applyMatrix4(mesh.matrixWorld));
+    box.expandByPoint(_bvhPt.copy(local.max).applyMatrix4(mesh.matrixWorld));
+  });
+}
+
+function applyFbxMeshMaterials(root: THREE.Object3D, look: { bone: string; joint: string }) {
+  const meshMat = new THREE.MeshStandardMaterial({
+    color: 0x8a9aa8,
+    metalness: 0.2,
+    roughness: 0.6,
+    transparent: true,
+    opacity: 0.55,
+    side: THREE.DoubleSide,
+  });
+  const markerMat = new THREE.MeshBasicMaterial({
+    color: 0xff8800,
+  transparent: true,
+    opacity: 0.85,
+  });
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.isMesh && mesh.name !== "__joint_dot") {
+      if (!mesh.geometry || !mesh.geometry.attributes?.position?.count) return;
+      mesh.material = meshMat;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.frustumCulled = false;
+      return;
+    }
+    // 非 Mesh、非 Bone 的节点（FBX 里的 Null/Empty/Marker）画一个小球标位
+    if ((obj as THREE.Bone).isBone) return;
+    if (obj === root) return;
+    if (obj.children.length > 0) return; // 只给叶子空节点加标记
+    // 排除已添加的标记
+    if (obj.userData.__marker_added) return;
+    obj.userData.__marker_added = true;
+    const markerGeo = new THREE.SphereGeometry(1, 8, 8);
+    const dot = new THREE.Mesh(markerGeo, markerMat);
+    dot.name = "__fbx_marker";
+    dot.frustumCulled = false;
+    obj.add(dot);
+  });
+}
+
+function detachFbxMarkers(root: THREE.Object3D | null) {
+  if (!root) return;
+  let disposedGeo: THREE.BufferGeometry | null = null;
+  let disposedMat: THREE.Material | null = null;
+  root.traverse((obj) => {
+    if (!obj.userData.__marker_added) return;
+    obj.userData.__marker_added = false;
+    obj.children
+      .filter((child) => child.name === "__fbx_marker")
+      .forEach((child) => {
+        obj.remove(child);
+        if (child.geometry && child.geometry !== disposedGeo) {
+          disposedGeo = child.geometry;
+          disposedGeo.dispose();
+        }
+        if (child.material && child.material !== disposedMat) {
+          disposedMat = child.material as THREE.Material;
+          disposedMat.dispose();
+        }
+      });
+  });
+}
+
+function attachJointDots(
+  root: THREE.Object3D,
+  height: number,
+  look?: { joint: string; jointEmissive: string }
+) {
+  const jointRadius = Math.max((height || 1) * 0.016, 1e-4);
   const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
   const jointMat = new THREE.MeshBasicMaterial({
     color: look?.joint ?? 0xffb454,
@@ -364,7 +476,9 @@ export function FbxScene({
   onDuration,
   viewNonce = 0,
   rotationX = 0,
+  unitMode = "auto",
   onDetectedUpAxis,
+  onDetectedLengthUnit,
 }: {
   url: string;
   time: number;
@@ -372,7 +486,9 @@ export function FbxScene({
   onDuration?: (sec: number) => void;
   viewNonce?: number;
   rotationX?: number;
+  unitMode?: LengthUnitMode;
   onDetectedUpAxis?: (up: UpAxis) => void;
+  onDetectedLengthUnit?: (unit: LengthUnit) => void;
 }) {
   const centerRef = useRef<THREE.Group>(null);
   const objectRef = useRef<THREE.Group | null>(null);
@@ -385,6 +501,10 @@ export function FbxScene({
   onDurationRef.current = onDuration;
   const onDetectedRef = useRef(onDetectedUpAxis);
   onDetectedRef.current = onDetectedUpAxis;
+  const onDetectedUnitRef = useRef(onDetectedLengthUnit);
+  onDetectedUnitRef.current = onDetectedLengthUnit;
+  const layoutRef = useRef({ x: 0, minY: 0, z: 0 });
+  const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const [object, setObject] = useState<THREE.Group | null>(null);
   const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
   const [scale, setScale] = useState(0.01);
@@ -469,11 +589,30 @@ export function FbxScene({
         const meanX = samples ? sumX / samples : 0;
         const meanZ = samples ? sumZ / samples : 0;
         if (!Number.isFinite(minY)) minY = 0;
-        const maxHeight = Math.max(spanY, spanZ);
+        const skelHeight = Math.max(spanY, spanZ);
+        expandMeshBox(obj, _meshBox);
+        const meshHeight = _meshBox.isEmpty()
+          ? 0
+          : Math.max(
+              _meshBox.max.x - _meshBox.min.x,
+              _meshBox.max.y - _meshBox.min.y,
+              _meshBox.max.z - _meshBox.min.z
+            );
         onDetectedRef.current?.(
           detectUpAxisFromExtents(spanY, spanZ, midY / Math.max(samples, 1), midZ / Math.max(samples, 1))
         );
-        const nextScale = figureScale(maxHeight);
+        const unit = detectLengthUnitFromExtents(skelHeight, meshHeight);
+        setDetectedUnit(unit);
+        onDetectedUnitRef.current?.(unit);
+        const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, unit));
+        const charHeight = skelHeight > 1e-6 ? skelHeight : meshHeight;
+        layoutRef.current = { x: meanX, minY, z: meanZ };
+        if (_meshBox.isEmpty() && Number.isFinite(minY)) {
+          /* keep bone-based floor */
+        } else if (!_meshBox.isEmpty()) {
+          minY = Math.min(minY, _meshBox.min.y);
+          layoutRef.current.minY = minY;
+        }
         fixedOffset.current.set(
           -meanX * nextScale,
           -minY * nextScale,
@@ -481,8 +620,13 @@ export function FbxScene({
         );
         offsetReady.current = true;
 
-        if (boneCount && !meshCount) {
-          attachJointDots(obj, maxHeight || 1, look);
+        const skelMeters = skelHeight * nextScale;
+        const meshMeters = meshHeight * nextScale;
+        if (meshCount) {
+          applyFbxMeshMaterials(obj, look);
+        }
+        if (boneCount) {
+          attachJointDots(obj, charHeight || 1, look);
         }
         let nextHelper: THREE.SkeletonHelper | null = null;
         if (boneCount) {
@@ -519,8 +663,17 @@ export function FbxScene({
         helperRef.current = null;
       }
       detachJointDots(objectRef.current);
+      detachFbxMarkers(objectRef.current);
     };
   }, [url]);
+
+  useEffect(() => {
+    const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, detectedUnit));
+    const { x, minY, z } = layoutRef.current;
+    fixedOffset.current.set(-x * nextScale, -minY * nextScale, -z * nextScale);
+    setScale(nextScale);
+    setOffset([fixedOffset.current.x, fixedOffset.current.y, fixedOffset.current.z]);
+  }, [unitMode, detectedUnit]);
 
   useEffect(() => {
     applyViewerFigureColors(helperRef.current, objectRef.current, look);
@@ -596,6 +749,8 @@ export function AnimationFormatPreview({
   const [viewNonce, setViewNonce] = useState(0);
   const [upAxisMode, setUpAxisMode] = useUpAxisMode();
   const [detectedUp, setDetectedUp] = useState<UpAxis>("y");
+  const [unitMode, setUnitMode] = useLengthUnitMode();
+  const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const duration = mediaDuration || durationHint || 1;
   const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
 
@@ -605,6 +760,7 @@ export function AnimationFormatPreview({
     setMediaDuration(0);
     setGlProblem("");
     setDetectedUp("y");
+    setDetectedUnit("m");
   }, [url]);
 
   useEffect(() => {
@@ -674,7 +830,9 @@ export function AnimationFormatPreview({
               onDuration={setMediaDuration}
               viewNonce={viewNonce}
               rotationX={rotationX}
+              unitMode={unitMode}
               onDetectedUpAxis={setDetectedUp}
+              onDetectedLengthUnit={setDetectedUnit}
             />
           ) : (
             <FbxScene
@@ -684,7 +842,9 @@ export function AnimationFormatPreview({
               onDuration={setMediaDuration}
               viewNonce={viewNonce}
               rotationX={rotationX}
+              unitMode={unitMode}
               onDetectedUpAxis={setDetectedUp}
+              onDetectedLengthUnit={setDetectedUnit}
             />
           )}
           <OrbitControls makeDefault />
@@ -755,6 +915,17 @@ export function AnimationFormatPreview({
           }}
         >
           {upAxisModeLabel(upAxisMode, detectedUp)}
+        </button>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="切换长度单位：自动识别 / 米 / 厘米 / 毫米"
+          onClick={() => {
+            setUnitMode(cycleLengthUnitMode(unitMode));
+            setViewNonce((n) => n + 1);
+          }}
+        >
+          {lengthUnitModeLabel(unitMode, detectedUnit)}
         </button>
       </div>
     </div>

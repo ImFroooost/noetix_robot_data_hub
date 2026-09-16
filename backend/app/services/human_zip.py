@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .unit_names import normalize_unit_stem
 from .zip_names import decode_zip_filename
 
 
@@ -26,12 +27,6 @@ HUMAN_EXTS = frozenset(
 )
 _SKIP_EXTS = frozenset({"", "zip", "ds_store"})
 
-# BVH exports often append _Skeleton0 / .bvh_Skeleton0 / " Skeleton 001".
-_STRIP_SUFFIXES = (
-    re.compile(r"(?:\.[A-Za-z0-9]{1,8})?[\s_]+Skeleton(?:[\s._-]?\d+)?$", re.I),
-    re.compile(r"[\s_]*Skeleton(?:\s+\d+)?$", re.I),
-)
-
 _IGNORE_NAMES = re.compile(r"^(?:\.DS_Store|Thumbs\.db|desktop\.ini)$", re.I)
 
 
@@ -46,9 +41,7 @@ class GroupedMotion:
 
 def normalize_motion_stem(filename: str) -> str:
     stem = Path(filename).stem.strip()
-    for pat in _STRIP_SUFFIXES:
-        stem = pat.sub("", stem)
-    return stem.strip()
+    return normalize_unit_stem(stem) or stem
 
 
 def infer_human_format(ext: str) -> str:

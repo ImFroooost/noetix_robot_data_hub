@@ -28,7 +28,7 @@ const _lineB = new THREE.Vector3();
 /** 把任意单位的骨架缩到约 1.7m，避免厘米/毫米文件在固定相机下看不见。 */
 export function figureScale(maxHeight: number) {
   if (!Number.isFinite(maxHeight) || maxHeight < 1e-6) return 1;
-  return 1.7 / maxHeight;
+  return Math.min(Math.max(1.7 / maxHeight, 0.001), 200);
 }
 
 function expandVisibleBox(root: THREE.Object3D, box: THREE.Box3) {
@@ -41,7 +41,7 @@ function expandVisibleBox(root: THREE.Object3D, box: THREE.Box3) {
       return;
     }
     const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh && mesh.geometry) {
+    if (mesh.isMesh && mesh.visible && mesh.geometry) {
       if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
       const local = mesh.geometry.boundingBox;
       if (!local || local.isEmpty()) return;

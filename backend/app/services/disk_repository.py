@@ -24,6 +24,7 @@ from typing import Any, BinaryIO
 
 from ..config import settings
 from .media_probe import probe_file, public_media
+from .unit_names import cluster_unit_names, normalize_unit_stem, stems_same_unit
 from .zip_names import decode_zip_filename
 
 ProgressFn = Callable[[str, int, str], None]
@@ -170,67 +171,6 @@ def update_metadata(mutator) -> dict[str, Any]:
 
 def unit_key(batch: str, unit_name: str) -> str:
     return f"{batch}::{unit_name}"
-
-
-_SOFT_SUFFIX_MAX_LEN = 32
-_SOFT_SUFFIX_MAX_SEGS = 3
-_EXPORTER_SKELETON_SUFFIX = re.compile(
-    r"(?:\.[A-Za-z0-9]{1,8})?[\s_]+Skeleton(?:[\s._-]?\d+)?$",
-    re.I,
-)
-
-
-def normalize_unit_stem(name: str) -> str:
-    """Strip BVH exporter suffixes such as ``.bvh_Skeleton0`` / ``_Skeleton 001``."""
-    stem = str(name or "").strip()
-    if not stem:
-        return ""
-    cleaned = _EXPORTER_SKELETON_SUFFIX.sub("", stem).strip(" ._")
-    return cleaned or stem
-
-
-def stems_same_unit(left: str, right: str) -> bool:
-    """Treat near-identical stems as one unit, e.g. name vs name_locomotion_test."""
-    left = normalize_unit_stem(left)
-    right = normalize_unit_stem(right)
-    if left == right:
-        return True
-    short, long = (left, right) if len(left) <= len(right) else (right, left)
-    if not long.startswith(short):
-        return False
-    extra = long[len(short) :]
-    if not extra or extra[0] not in "-_." or len(extra) > _SOFT_SUFFIX_MAX_LEN:
-        return False
-    segs = [part for part in re.split(r"[-_.]+", extra) if part]
-    return 1 <= len(segs) <= _SOFT_SUFFIX_MAX_SEGS
-
-
-def cluster_unit_names(names: list[str]) -> dict[str, str]:
-    """Map each stem to the shortest name in its compatibility cluster."""
-    unique = list(dict.fromkeys(names))
-    parent = {name: name for name in unique}
-
-    def find(name: str) -> str:
-        while parent[name] != name:
-            parent[name] = parent[parent[name]]
-            name = parent[name]
-        return name
-
-    def union(left: str, right: str) -> None:
-        root_left, root_right = find(left), find(right)
-        if root_left == root_right:
-            return
-        if len(root_left) > len(root_right) or (
-            len(root_left) == len(root_right) and root_left > root_right
-        ):
-            root_left, root_right = root_right, root_left
-        parent[root_right] = root_left
-
-    for index, left in enumerate(unique):
-        for right in unique[index + 1 :]:
-            if stems_same_unit(left, right):
-                union(left, right)
-    return {name: find(name) for name in unique}
 
 
 def _unit_meta_for_names(
@@ -581,8 +521,8 @@ def _scan_data_live(
 ) -> dict[str, Any]:
     """Scan files and group by batch plus filename stem into data units.
 
-    Near-identical stems (``name`` vs ``name_locomotion_test``) collapse to
-    the shortest name so different formats of the same take share one unit.
+    Role suffixes such as ``skeleton``, ``rigid body`` and ``marker`` are
+    stripped, so ``XXXX_skeleton_0`` and ``XXXX_marker003`` share unit ``XXXX``.
     """
     base = root()
     metadata = read_metadata()
@@ -638,6 +578,9 @@ def _scan_data_live(
         aliases_by_unit[key].append(original)
         if canon != original:
             aliases_by_unit[key].append(canon)
+    for batch, mapping in canon_by_batch.items():
+        for raw, canon in mapping.items():
+            aliases_by_unit[unit_key(batch, canon)].append(raw)
 
     batch_names = {rec["batch"] for rec in files}
     if include_empty:
@@ -1694,7 +1637,11 @@ def save_data_file(
 ) -> dict[str, Any]:
     unit_name = safe_name(normalize_unit_stem(unit_name) or unit_name, label="数据单元名")
     suffix = Path(original_name).suffix or f".{fmt.lstrip('.')}"
-    filename = f"{unit_name}{suffix}"
+    original_stem = Path(original_name).stem
+    if original_stem and (normalize_unit_stem(original_stem) or original_stem) == unit_name:
+        filename = f"{safe_name(original_stem, label='文件名')}{suffix}"
+    else:
+        filename = f"{unit_name}{suffix}"
     dest = data_destination(
         ontology=ontology,
         modality=modality,
@@ -1753,6 +1700,11 @@ def _remap_path_keys(data: dict[str, Any], mapping: dict[str, str]) -> None:
         for old, new in mapping.items():
             if old in rows:
                 rows[new] = rows.pop(old)
+    for row in data.get("upload_sessions") or []:
+        paths = [str(path) for path in (row.get("paths") or []) if path]
+        if not paths:
+            continue
+        row["paths"] = [mapping.get(path, path) for path in paths]
 
 
 def _cleanup_empty_parents(parent: Path) -> None:
@@ -1865,6 +1817,62 @@ def rename_unit(batch: str, old_name: str, new_name: str) -> dict[str, Any]:
     return renamed
 
 
+def _renamed_filename(old_name: str, new_name: str) -> str:
+    """Sanitize a user-supplied file name while keeping the original suffix."""
+    suffix = Path(old_name).suffix
+    raw = (new_name or "").strip()
+    if suffix and raw.lower().endswith(suffix.lower()):
+        raw = raw[: -len(suffix)]
+    stem = safe_name(raw, label="文件名")
+    return f"{stem}{suffix}"
+
+
+def rename_file(rel_path: str, new_name: str) -> dict[str, Any]:
+    record = inspect_data_file(rel_path)
+    if not record:
+        raise FileNotFoundError(rel_path)
+    src = resolve_repo_file(rel_path)
+    filename = _renamed_filename(src.name, new_name)
+    if filename == src.name:
+        return record
+
+    snapshot = scan_data()
+    clustered = next((item for item in snapshot["files"] if item["path"] == rel_path), None)
+    old_unit = str((clustered or record).get("unit_name") or record["unit_name"])
+    batch = str(record.get("batch") or "")
+    only_file = not any(
+        item["path"] != rel_path
+        and item.get("batch") == batch
+        and item.get("unit_name") == old_unit
+        for item in snapshot["files"]
+    )
+    dest = src.with_name(filename)
+    moved = _relocate_files({rel_path: dest})
+    new_rel = moved[rel_path]
+    new_unit = normalize_unit_stem(Path(filename).stem) or Path(filename).stem
+
+    def mutate(data):
+        _remap_path_keys(data, moved)
+        if not batch or old_unit == new_unit:
+            return
+        units = data.setdefault("units", {})
+        old_key = unit_key(batch, old_unit)
+        new_key = unit_key(batch, new_unit)
+        if old_key not in units or old_key == new_key:
+            return
+        if only_file:
+            units[new_key] = units.pop(old_key)
+        elif new_key not in units:
+            units[new_key] = dict(units[old_key])
+
+    update_metadata(mutate)
+    rebuild_catalog()
+    updated = inspect_data_file(new_rel)
+    if updated is None:
+        raise FileNotFoundError(new_rel)
+    return updated
+
+
 def delete_batches(names: list[str]) -> list[str]:
     removed: list[str] = []
     deleted_paths: list[str] = []
@@ -1929,11 +1937,21 @@ def delete_units(items: list[tuple[str, str]]) -> list[str]:
     return removed
 
 
+def _file_robot_style(record: dict[str, Any], unit: dict[str, Any] | None = None) -> str:
+    own = str(((record.get("annotation") or {}).get("robot_style") or "")).strip()
+    if own:
+        return own
+    if unit:
+        return str(((unit.get("annotation") or {}).get("robot_style") or "")).strip()
+    return ""
+
+
 def collect_archive_entries(
     *,
     batches: list[str] | None = None,
     units: list[tuple[str, str]] | None = None,
     kinds: list[tuple[str, str] | tuple[str, str, str | None]] | None = None,
+    robot_styles: list[str] | None = None,
     accept: Any | None = None,
 ) -> list[tuple[Path, str]]:
     snapshot = scan_data(include_empty=True)
@@ -1951,6 +1969,13 @@ def collect_archive_entries(
             wanted_formats.add((ontology, modality, fmt))
         else:
             wanted_any.add((ontology, modality))
+    wanted_robot_styles = (
+        None if robot_styles is None else {str(style) for style in robot_styles}
+    )
+    unit_by_key = {
+        str(item.get("key") or unit_key(item.get("batch") or "", item.get("name") or "")): item
+        for item in snapshot.get("units") or []
+    }
     entries: list[tuple[Path, str]] = []
     seen: set[str] = set()
     for rec in snapshot["files"]:
@@ -1961,6 +1986,10 @@ def collect_archive_entries(
             rec_fmt = str(rec.get("format") or "").lower()
             kind = (rec["ontology"], rec["modality"])
             if kind not in wanted_any and (*kind, rec_fmt) not in wanted_formats:
+                continue
+        if wanted_robot_styles is not None and rec.get("ontology") == "robot":
+            style = _file_robot_style(rec, unit_by_key.get(key))
+            if style not in wanted_robot_styles:
                 continue
         if accept is not None and not accept(rec):
             continue

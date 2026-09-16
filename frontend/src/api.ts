@@ -172,6 +172,11 @@ export const api = {
   modelAssetDownloadUrl: (id: number) => `/api/model-assets/${id}/download`,
 
   listUsers: () => request<import("./types").User[]>("/api/users"),
+  changePassword: (oldPassword: string, newPassword: string) =>
+    request<{ ok: boolean }>("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+    }),
   createUser: (body: Record<string, unknown>) =>
     request("/api/users", { method: "POST", body: JSON.stringify(body) }),
   updateUser: (id: number, body: Record<string, unknown>) =>
@@ -384,6 +389,11 @@ export const api = {
     request<import("./types").StorageFolderUploadResult>(
       "/api/storage/data/upload-zip",
       { method: "POST", body: form }
+    ),
+  storageRenameFile: (path: string, next: string) =>
+    request<import("./types").StorageFile>(
+      `/api/storage/file/rename?path=${encodeURIComponent(path)}`,
+      { method: "POST", body: JSON.stringify({ name: next }) }
     ),
   storageDeleteFile: (path: string) =>
     request<{ ok: boolean }>(

@@ -371,6 +371,10 @@ button:disabled {
 }
 
 .storage-left-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   padding: 12px;
 }
 
@@ -428,11 +432,24 @@ button:disabled {
   --tree-sticky-row: 46px;
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   gap: 8px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.storage-tree-scroll {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .storage-tree-node {
   min-width: 0;
+  overflow: visible;
   padding: 4px;
   border: 1px solid transparent;
   border-radius: 10px;
@@ -446,7 +463,7 @@ button:disabled {
 
 .storage-tree-node.is-open > .storage-tree-row,
 .storage-tree-nested.is-open > .storage-tree-row {
-  background: color-mix(in srgb, var(--accent) 22%, var(--bg-elev));
+  background: color-mix(in srgb, var(--accent) 28%, var(--bg-elev));
 }
 
 .storage-tree-row,
@@ -468,8 +485,9 @@ button:disabled {
   text-align: left;
   position: sticky;
   top: calc(var(--tree-depth, 0) * var(--tree-sticky-row, 46px));
-  z-index: calc(18 - var(--tree-depth, 0));
+  z-index: calc(24 - var(--tree-depth, 0));
   box-shadow: 0 1px 0 color-mix(in srgb, var(--border) 70%, transparent);
+  scroll-margin-top: 8px;
 }
 
 .storage-tree-row:hover .storage-tree-item {
@@ -565,10 +583,13 @@ button:disabled {
 }
 
 .storage-tree-toolbar-wrap {
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-bottom: 8px;
+  margin: 0;
+  padding: 0 0 4px;
+  background: var(--bg-elev);
 }
 
 .storage-tree-toolbar-wrap .storage-tree-toolbar {
@@ -580,6 +601,22 @@ button:disabled {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+
+.storage-tree-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 4px;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.storage-tree-select-all .storage-tree-check {
+  margin: 0;
 }
 
 .storage-tree-manage button {
@@ -1204,7 +1241,7 @@ button:disabled {
 }
 
 .storage-download-modal {
-  width: min(760px, 100%);
+  width: min(820px, 100%);
 }
 
 .storage-download-row {

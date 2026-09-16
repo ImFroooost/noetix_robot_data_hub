@@ -178,9 +178,9 @@ async def import_human_zip(
 ):
     """Upload a ZIP of human motion files (bvh/csv/fbx/tak/…).
 
-    Files are grouped by normalized basename (``_Skeleton`` stripped) so that
-    ``walk_Skeleton.bvh`` + ``walk.csv`` + ``walk.fbx`` + ``walk.tak`` become
-    one clip with four human formats.
+    Files are grouped by filename stem. Role suffixes such as ``skeleton``,
+    ``rigid body`` and ``marker`` are stripped, so ``walk_skeleton_0.bvh`` and
+    ``walk_marker003.csv`` become one unit.
 
     Destination folder defaults to the ZIP basename (e.g. ``260729.zip`` → ``/260729/``).
     ``folder_id`` is treated as the *parent* under which that folder is created/reused.

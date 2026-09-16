@@ -303,6 +303,37 @@
   padding-top: 0.15rem;
 }
 
+.history-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.history-btn {
+  min-height: 2.4rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+[data-theme="dark"] .history-btn {
+  color: #ffffff;
+}
+
+.history-btn:hover:not(:disabled) {
+  background: var(--accent-softer);
+  border-color: var(--accent);
+  box-shadow: 0 0 8px var(--accent-soft);
+  color: var(--text);
+}
+
+.history-btn:disabled {
+  opacity: 0.45;
+}
+
 .app-content {
   flex: 1;
   min-height: 0;

@@ -19,6 +19,7 @@ import {
   isSuperRole,
   taxonomySchemeLabel,
 } from "../types";
+import { useHistoryReload, useUndo } from "../undo/UndoContext";
 
 const CAPABILITY_LABEL: Record<string, string> = {
   browse: "浏览",
@@ -46,12 +47,17 @@ function PermissionEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
+  const { execute } = useUndo();
+  const [savedItems, setSavedItems] = useState<PermissionItem[]>([]);
 
   useEffect(() => {
     setLoading(true);
     api
       .getUserPermissions(user.id)
-      .then((p) => setItems(p))
+      .then((p) => {
+        setItems(p);
+        setSavedItems(p);
+      })
       .catch((e) => setError(e instanceof Error ? e.message : "加载权限失败"))
       .finally(() => setLoading(false));
   }, [user.id]);
@@ -73,11 +79,22 @@ function PermissionEditor({
     setSaving(true);
     setError("");
     setMsg("");
+    const prev = savedItems.map((item) => ({ ...item }));
+    const next = items.map((item) => ({ ...item }));
     try {
-      const saved = await api.putUserPermissions(user.id, items);
-      setItems(saved);
-      setMsg("权限已保存（管理数据包含同范围的浏览 / 下载 / 标注 / 上传；其它能力会自动附带浏览）");
-      onSaved();
+      await execute({
+        label: `保存 ${user.username} 的权限`,
+        do: async () => {
+          const saved = await api.putUserPermissions(user.id, next);
+          setItems(saved);
+          setSavedItems(saved);
+          setMsg("权限已保存（管理数据包含同范围的浏览 / 下载 / 标注 / 上传；其它能力会自动附带浏览）");
+          onSaved();
+        },
+        undo: async () => {
+          await api.putUserPermissions(user.id, prev);
+        },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -187,6 +204,7 @@ function PermissionEditor({
 
 export function UsersPage() {
   const { hasPerm, user: me, impersonate } = useAuth();
+  const { execute } = useUndo();
   const canManageUsers = hasPerm("manage_users");
   const [users, setUsers] = useState<User[]>([]);
   const [folderPaths, setFolderPaths] = useState<string[]>([]);
@@ -198,6 +216,9 @@ export function UsersPage() {
   const [viewBusy, setViewBusy] = useState<number | null>(null);
 
   const reload = () => api.listUsers().then(setUsers);
+  useHistoryReload(() => {
+    void reload();
+  });
 
   useEffect(() => {
     if (!canManageUsers) return;
@@ -224,14 +245,25 @@ export function UsersPage() {
     e.preventDefault();
     const el = e.currentTarget;
     const fd = new FormData(el);
+    const body = {
+      username: fd.get("username"),
+      password: fd.get("password"),
+      role: fd.get("role"),
+    };
+    let createdId = 0;
     try {
-      await api.createUser({
-        username: fd.get("username"),
-        password: fd.get("password"),
-        role: fd.get("role"),
+      await execute({
+        label: `创建用户 ${String(body.username || "")}`,
+        do: async () => {
+          const created = (await api.createUser(body)) as User;
+          createdId = created.id;
+          el.reset();
+          await reload();
+        },
+        undo: async () => {
+          if (createdId) await api.deleteUser(createdId);
+        },
       });
-      el.reset();
-      await reload();
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建失败");
     }
@@ -292,8 +324,18 @@ export function UsersPage() {
                     <select
                       value={u.role}
                       onChange={async (e) => {
-                        await api.updateUser(u.id, { role: e.target.value as Role });
-                        await reload();
+                        const prev = u.role;
+                        const next = e.target.value as Role;
+                        await execute({
+                          label: `将 ${u.username} 改为${ROLE_LABEL[next] || next}`,
+                          do: async () => {
+                            await api.updateUser(u.id, { role: next });
+                            await reload();
+                          },
+                          undo: async () => {
+                            await api.updateUser(u.id, { role: prev });
+                          },
+                        });
                       }}
                     >
                       {ROLE_OPTIONS.map((r) => (
@@ -312,8 +354,17 @@ export function UsersPage() {
                       <button
                         className="secondary"
                         onClick={async () => {
-                          await api.updateUser(u.id, { is_active: !u.is_active });
-                          await reload();
+                          const prev = u.is_active;
+                          await execute({
+                            label: prev ? `禁用 ${u.username}` : `启用 ${u.username}`,
+                            do: async () => {
+                              await api.updateUser(u.id, { is_active: !prev });
+                              await reload();
+                            },
+                            undo: async () => {
+                              await api.updateUser(u.id, { is_active: prev });
+                            },
+                          });
                         }}
                       >
                         {u.is_active ? "禁用" : "启用"}

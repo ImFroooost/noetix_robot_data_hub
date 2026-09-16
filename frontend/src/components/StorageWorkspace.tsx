@@ -1,4 +1,4 @@
-import { Children, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Children, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { api, downloadAuth, downloadAuthPost } from "../api";
 import { useAuth } from "../auth";
 import { usePreview } from "../preview/PreviewContext";
@@ -19,6 +19,8 @@ import {
 } from "./RobotStyleFields";
 import { TaxonomySelect } from "./TaxonomyTree";
 import { fetchStorageOverview, INDEX_UPDATED_EVENT } from "../storageOverviewCache";
+import { useUndo } from "../undo/UndoContext";
+import { patchStorageMeta, type StorageMetaTarget } from "../undo/storageMeta";
 import { formatFromFileName } from "../utils/folderUpload";
 import type {
   ModelInstance,
@@ -166,20 +168,64 @@ function TreeAllButton({
   );
 }
 
+function TreeSelectAll({
+  total,
+  selected,
+  disabled,
+  onChange,
+}: {
+  total: number;
+  selected: number;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  const allOn = total > 0 && selected >= total;
+  const someOn = selected > 0 && selected < total;
+  return (
+    <label className="storage-tree-select-all">
+      <input
+        type="checkbox"
+        className="storage-tree-check"
+        disabled={disabled || total === 0}
+        checked={allOn}
+        ref={(el) => {
+          if (el) el.indeterminate = someOn;
+        }}
+        onChange={(e) => onChange(e.target.checked)}
+        aria-label="全选"
+      />
+      全选
+    </label>
+  );
+}
+
 function DownloadToolbar({
   count,
+  total,
+  selectedForAll,
   canDownload,
   onDownload,
   onClear,
+  onSelectAll,
 }: {
   count: number;
+  total?: number;
+  selectedForAll?: number;
   canDownload?: boolean;
   onDownload?: () => void;
   onClear: () => void;
+  onSelectAll?: (checked: boolean) => void;
 }) {
   if (!canDownload) return null;
   return (
     <div className="storage-tree-manage">
+      {onSelectAll && total != null && (
+        <TreeSelectAll
+          total={total}
+          selected={selectedForAll ?? count}
+          onChange={onSelectAll}
+        />
+      )}
       <span className="muted">已选 {count} 项</span>
       <button
         type="button"
@@ -209,33 +255,38 @@ function TreeToolbar({
   onCollapseAll,
   onExpandAll,
   extra,
+  children,
 }: {
   onCollapseAll: () => void;
   onExpandAll: () => void;
   extra?: ReactNode;
+  children?: ReactNode;
 }) {
   return (
-    <div className="storage-tree-toolbar-wrap">
-      <div className="storage-tree-toolbar">
-        <button
-          type="button"
-          className="secondary"
-          title="展开上级目录，收起数据单元"
-          onClick={onCollapseAll}
-        >
-          全部折叠
-        </button>
-        <button
-          type="button"
-          className="secondary"
-          title="展开上级目录和数据单元"
-          onClick={onExpandAll}
-        >
-          全部展开
-        </button>
+    <>
+      <div className="storage-tree-toolbar-wrap">
+        <div className="storage-tree-toolbar">
+          <button
+            type="button"
+            className="secondary"
+            title="展开上级目录，收起数据单元"
+            onClick={onCollapseAll}
+          >
+            全部折叠
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            title="展开上级目录和数据单元"
+            onClick={onExpandAll}
+          >
+            全部展开
+          </button>
+        </div>
+        {extra}
       </div>
-      {extra}
-    </div>
+      <div className="storage-tree-scroll">{children}</div>
+    </>
   );
 }
 
@@ -305,10 +356,18 @@ function TreeGroup({
   onCheck?: (checked: boolean) => void;
   actions?: ReactNode;
 }) {
+  const nodeRef = useRef<HTMLDivElement>(null);
+  const pinOnCollapse = useRef(false);
   const activate = () => {
+    if (open) pinOnCollapse.current = true;
     onToggle();
     onSelect();
   };
+  useLayoutEffect(() => {
+    if (open || !pinOnCollapse.current) return;
+    pinOnCollapse.current = false;
+    nodeRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [open]);
   const body = (
     <>
       <div className={`storage-tree-row ${selected ? "is-selected" : ""} ${checked ? "is-checked" : ""}`}>
@@ -351,13 +410,13 @@ function TreeGroup({
   const wrapStyle = { "--tree-depth": depth } as CSSProperties;
   if (nested) {
     return (
-      <div className={`storage-tree-nested ${open ? "is-open" : ""}`} style={wrapStyle}>
+      <div ref={nodeRef} className={`storage-tree-nested ${open ? "is-open" : ""}`} style={wrapStyle}>
         {body}
       </div>
     );
   }
   return (
-    <div className={`storage-tree-node ${open ? "is-open" : ""}`} style={wrapStyle}>
+    <div ref={nodeRef} className={`storage-tree-node ${open ? "is-open" : ""}`} style={wrapStyle}>
       {body}
     </div>
   );
@@ -472,6 +531,20 @@ function UnitTree({
         extra={
           canManage ? (
             <div className="storage-tree-manage">
+              <TreeSelectAll
+                total={data.batches.length}
+                selected={selectedBatches.length}
+                onChange={(checked) => {
+                  if (checked) {
+                    setCheckedBatches(
+                      Object.fromEntries(data.batches.map((batch) => [batch.name, true]))
+                    );
+                    return;
+                  }
+                  setCheckedBatches({});
+                  setCheckedUnits({});
+                }}
+              />
               <span className="muted">已选 {selectedCount} 项</span>
               {canDownloadAny && (
                 <button
@@ -520,7 +593,7 @@ function UnitTree({
             </div>
           ) : null
         }
-      />
+      >
       {data.batches.map((batch) => {
         const open = expanded[batch.name] === true;
         return (
@@ -592,6 +665,7 @@ function UnitTree({
             : "没有匹配的数据批次"}
         </div>
       )}
+      </TreeToolbar>
     </div>
   );
 }
@@ -643,7 +717,19 @@ function UploaderTreePanel({
         extra={
           <DownloadToolbar
             count={selectedCount}
+            total={uploaders.length}
+            selectedForAll={selectedUploaders.length}
             canDownload={canDownloadAny}
+            onSelectAll={(checked) => {
+              if (checked) {
+                setCheckedUploaders(
+                  Object.fromEntries(uploaders.map((item) => [String(item.id), true]))
+                );
+                return;
+              }
+              setCheckedUploaders({});
+              setCheckedUnits({});
+            }}
             onDownload={() =>
               onDownload?.(
                 uniqueUnits([
@@ -658,7 +744,7 @@ function UploaderTreePanel({
             }}
           />
         }
-      />
+      >
       <TreeAllButton selected={selectedId == null} onClick={() => onSelect(null)}>
         全部上传用户
       </TreeAllButton>
@@ -730,6 +816,7 @@ function UploaderTreePanel({
           </TreeGroup>
         );
       })}
+      </TreeToolbar>
     </div>
   );
 }
@@ -820,7 +907,19 @@ function UploadSessionTree({
         extra={
           <DownloadToolbar
             count={selectedCount}
+            total={sessions.length}
+            selectedForAll={selectedSessions.length}
             canDownload={canDownloadAny}
+            onSelectAll={(checked) => {
+              if (checked) {
+                setCheckedSessions(
+                  Object.fromEntries(sessions.map((item) => [item.id, true]))
+                );
+                return;
+              }
+              setCheckedSessions({});
+              setCheckedUnits({});
+            }}
             onDownload={() =>
               onDownload?.(
                 uniqueUnits([
@@ -835,7 +934,7 @@ function UploadSessionTree({
             }}
           />
         }
-      />
+      >
       {sessions.map((session) => {
         const sessionUnits = unitsOf(session);
         const open = expanded[session.id] === true;
@@ -937,6 +1036,7 @@ function UploadSessionTree({
         );
       })}
       {!sessions.length && <div className="muted">还没有上传记录</div>}
+      </TreeToolbar>
     </div>
   );
 }
@@ -964,8 +1064,12 @@ function TaxonomyTreePanel({
   currentUserId?: number;
   onDownload?: (units: StorageUnit[]) => void;
 }) {
-  const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
-  const [unspecifiedOpen, setUnspecifiedOpen] = useState<Record<number, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<number, boolean>>(() =>
+    Object.fromEntries(nodes.map((node) => [node.id, false]))
+  );
+  const [unspecifiedOpen, setUnspecifiedOpen] = useState<Record<number, boolean>>(() =>
+    Object.fromEntries(nodes.map((node) => [node.id, false]))
+  );
   const [checkedNodes, setCheckedNodes] = useState<Record<number, boolean>>({});
   const [checkedUnspecified, setCheckedUnspecified] = useState<Record<number, boolean>>({});
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
@@ -979,6 +1083,10 @@ function TaxonomyTreePanel({
     list.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name))
   );
   const scheme = nodes[0]?.scheme || "";
+  // 唯一根节点时隐藏它，直接展示其子节点作为顶层
+  const rootNodes = children.get(null) || [];
+  const topLevelParentId: number | null =
+    rootNodes.length === 1 ? rootNodes[0].id : null;
   const unitsUnder = (node: TaxonomyNode) =>
     units.filter((unit) => {
       const taggedId = unit.taxonomy_tag_ids?.[scheme];
@@ -997,7 +1105,7 @@ function TaxonomyTreePanel({
 
   const renderUnspecified = (node: TaxonomyNode, depth: number) => {
     const bucket = unspecifiedUnitsOf(node);
-    const open = unspecifiedOpen[node.id] !== false;
+    const open = unspecifiedOpen[node.id] === true;
     return (
       <TreeGroup
         key={`unspecified:${node.id}`}
@@ -1065,7 +1173,7 @@ function TaxonomyTreePanel({
   const renderNodes = (parentId: number | null, depth = 0): ReactNode =>
     (children.get(parentId) || []).map((node) => {
       const nodeUnits = unitsUnder(node);
-      const dirOpen = collapsed[node.id] !== true;
+      const dirOpen = expanded[node.id] === true;
       return (
         <TreeGroup
           key={node.id}
@@ -1077,7 +1185,7 @@ function TaxonomyTreePanel({
           meta={<span>{nodeUnits.length} 个单元</span>}
           toggleLabel={dirOpen ? "收起分类" : "展开分类"}
           onToggle={() =>
-            setCollapsed((current) => ({ ...current, [node.id]: dirOpen }))
+            setExpanded((current) => ({ ...current, [node.id]: !dirOpen }))
           }
           onSelect={() => onSelect(node.id, false)}
           checked={!!checkedNodes[node.id]}
@@ -1108,17 +1216,28 @@ function TaxonomyTreePanel({
     <div className="storage-tree storage-structure-tree">
       <TreeToolbar
         onCollapseAll={() => {
-          setCollapsed(Object.fromEntries(nodes.map((node) => [node.id, true])));
+          setExpanded(Object.fromEntries(nodes.map((node) => [node.id, false])));
           setUnspecifiedOpen(Object.fromEntries(nodes.map((node) => [node.id, false])));
         }}
         onExpandAll={() => {
-          setCollapsed({});
+          setExpanded(Object.fromEntries(nodes.map((node) => [node.id, true])));
           setUnspecifiedOpen(Object.fromEntries(nodes.map((node) => [node.id, true])));
         }}
         extra={
           <DownloadToolbar
             count={selectedCount}
+            total={nodes.length}
+            selectedForAll={selectedNodes.length}
             canDownload={canDownloadAny}
+            onSelectAll={(checked) => {
+              if (checked) {
+                setCheckedNodes(Object.fromEntries(nodes.map((node) => [node.id, true])));
+                return;
+              }
+              setCheckedNodes({});
+              setCheckedUnspecified({});
+              setCheckedUnits({});
+            }}
             onDownload={() =>
               onDownload?.(
                 uniqueUnits([
@@ -1135,12 +1254,13 @@ function TaxonomyTreePanel({
             }}
           />
         }
-      />
+      >
       <TreeAllButton selected={selectedId == null} onClick={() => onSelect(null)}>
         全部分类节点
       </TreeAllButton>
-      {renderNodes(null)}
+      {renderNodes(topLevelParentId)}
       {!nodes.length && <div className="muted">该分类标准暂无节点</div>}
+      </TreeToolbar>
     </div>
   );
 }
@@ -1170,6 +1290,7 @@ function QuickUpload({
   const [gender, setGender] = useState("");
   const [height, setHeight] = useState("");
   const [fps, setFps] = useState("30");
+  const { execute } = useUndo();
   const [motionKind, setMotionKind] = useState<MotionKind>(
     resolveMotionKind(preset?.motionKind)
   );
@@ -1251,8 +1372,18 @@ function QuickUpload({
         })
       );
       form.set("file", file);
-      await api.storageUpload(form);
-      onUploaded();
+      let uploadedPath = "";
+      await execute({
+        label: `上传 ${file.name}`,
+        do: async () => {
+          const uploaded = await api.storageUpload(form);
+          uploadedPath = uploaded.path;
+          onUploaded();
+        },
+        undo: async () => {
+          if (uploadedPath) await api.storageDeleteFile(uploadedPath);
+        },
+      });
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : "上传失败");
@@ -1511,6 +1642,26 @@ function EntityDetailPanel({
   const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const { execute } = useUndo();
+
+  const metaTarget = (): StorageMetaTarget | null => {
+    if (kind === "batch" && batch) return { kind: "batch", name: batch.name };
+    if (kind === "unit" && unit) return { kind: "unit", batch: unit.batch, name: unit.name };
+    if (kind === "file" && file) return { kind: "file", path: file.path };
+    if (kind === "upload_session" && session) {
+      return { kind: "upload_session", id: session.id, paths: session.paths };
+    }
+    return null;
+  };
+
+  const ownTagIds =
+    kind === "file"
+      ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
+      : kind === "unit"
+        ? unit?.taxonomy_tag_ids || {}
+        : kind === "upload_session"
+          ? session?.taxonomy_tag_ids || {}
+          : batch?.taxonomy_tag_ids || {};
 
   useEffect(() => {
     if (kind !== "file" || !file) {
@@ -1734,27 +1885,29 @@ function EntityDetailPanel({
         annotation:
           kind === "file" || kind === "upload_session" ? fileAnnotation : { note },
       };
-      if (kind === "batch" && batch) {
-        await api.storageUpdateBatch(batch.name, body);
-      } else if (kind === "unit" && unit) {
-        await api.storageUpdateUnit(unit.batch, unit.name, body);
-      } else if (kind === "file" && file) {
-        await api.storageUpdateFileMeta(file.path, body);
-        const row = await api.storageFileDetail(file.path);
-        setDetail(row);
-      } else if (kind === "upload_session" && session) {
-        await api.storageUpdateUploadSession(session.id, {
-          ...body,
-          paths: session.paths,
-        });
-      }
-      setSaved(true);
-      onMessage(
-        kind === "upload_session"
-          ? "本次上传参数已保存，已同步到该次上传的文件"
-          : "标签已保存"
-      );
-      await onReload();
+      const target = metaTarget();
+      if (!target) return;
+      const prevBody = { annotation: { ...annotation } };
+      await execute({
+        label: kind === "upload_session" ? "保存上传参数" : "保存标注",
+        do: async () => {
+          await patchStorageMeta(target, body);
+          if (kind === "file" && file) {
+            const row = await api.storageFileDetail(file.path);
+            setDetail(row);
+          }
+          setSaved(true);
+          onMessage(
+            kind === "upload_session"
+              ? "本次上传参数已保存，已同步到该次上传的文件"
+              : "标签已保存"
+          );
+          await onReload();
+        },
+        undo: async () => {
+          await patchStorageMeta(target, prevBody);
+        },
+      });
     } catch (e) {
       onError(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -1764,29 +1917,31 @@ function EntityDetailPanel({
 
   const saveTaxonomy = async (scheme: string, raw: number | "") => {
     try {
-      const body = { taxonomy_tag_ids: { [scheme]: raw === "" ? null : raw } };
-      if (kind === "batch" && batch) {
-        await api.storageUpdateBatch(batch.name, body);
-      } else if (kind === "unit" && unit) {
-        await api.storageUpdateUnit(unit.batch, unit.name, body);
-      } else if (kind === "file" && file) {
-        await api.storageUpdateFileMeta(file.path, body);
-      } else if (kind === "upload_session" && session) {
-        await api.storageUpdateUploadSession(session.id, {
-          ...body,
-          paths: session.paths,
-        });
-      }
-      onMessage(
-        kind === "batch"
-          ? "分类标签已更新，已同步到该批次下的数据单元和文件"
-          : kind === "unit"
-            ? "分类标签已更新，已同步到该数据单元下的文件"
-            : kind === "upload_session"
-              ? "分类标签已更新，已同步到这次上传的数据单元和文件"
-              : "分类标签已更新"
-      );
-      await onReload();
+      const target = metaTarget();
+      if (!target) return;
+      const nextId = raw === "" ? null : raw;
+      const prevId = ownTagIds[scheme] ?? null;
+      if (nextId === prevId) return;
+      const schemeName = taxonomySchemeLabel(scheme, schemes);
+      await execute({
+        label: `更新${schemeName}分类`,
+        do: async () => {
+          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: nextId } });
+          onMessage(
+            kind === "batch"
+              ? "分类标签已更新，已同步到该批次下的数据单元和文件"
+              : kind === "unit"
+                ? "分类标签已更新，已同步到该数据单元下的文件"
+                : kind === "upload_session"
+                  ? "分类标签已更新，已同步到这次上传的数据单元和文件"
+                  : "分类标签已更新"
+          );
+          await onReload();
+        },
+        undo: async () => {
+          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: prevId } });
+        },
+      });
     } catch (e) {
       onError(e instanceof Error ? e.message : "更新失败");
     }
@@ -2157,17 +2312,32 @@ function fileFormatOf(file: StorageFile) {
 function filesFromDownloadTargets(batches: StorageBatch[], units: StorageUnit[]) {
   const covered = new Set(batches.map((item) => item.name));
   const leftover = units.filter((unit) => !covered.has(unit.batch));
-  const files = [
-    ...batches.flatMap((batch) => batch.units.flatMap((unit) => unit.files)),
-    ...leftover.flatMap((unit) => unit.files),
-  ];
+  const unitByPath = new Map<string, StorageUnit>();
+  const files: StorageFile[] = [];
   const seen = new Set<string>();
-  return files.filter((file) => {
-    if (seen.has(file.path)) return false;
-    seen.add(file.path);
-    return true;
-  });
+  const addUnit = (unit: StorageUnit) => {
+    for (const file of unit.files) {
+      unitByPath.set(file.path, unit);
+      if (seen.has(file.path)) continue;
+      seen.add(file.path);
+      files.push(file);
+    }
+  };
+  for (const batch of batches) {
+    for (const unit of batch.units) addUnit(unit);
+  }
+  for (const unit of leftover) addUnit(unit);
+  return { leftover, files, unitByPath };
 }
+
+function fileRobotStyle(file: StorageFile, unit?: StorageUnit | null) {
+  return String(file.annotation?.robot_style || unit?.annotation?.robot_style || "").trim();
+}
+
+type DownloadConfirm = {
+  kinds: { ontology: string; modality: string; format: string }[];
+  robotStyles?: string[];
+};
 
 function DownloadPicker({
   batches,
@@ -2180,32 +2350,49 @@ function DownloadPicker({
   units: StorageUnit[];
   busy: boolean;
   onClose: () => void;
-  onConfirm: (kinds: { ontology: string; modality: string; format: string }[]) => void;
+  onConfirm: (payload: DownloadConfirm) => void;
 }) {
-  const leftover = units.filter(
-    (unit) => !batches.some((batch) => batch.name === unit.batch)
-  );
-  const files = filesFromDownloadTargets(batches, leftover);
+  const { leftover, files, unitByPath } = filesFromDownloadTargets(batches, units);
   const available = new Set(
     files.map((file) => downloadKindKey(file.ontology, file.modality, fileFormatOf(file)))
   );
   const [checked, setChecked] = useState<Record<string, boolean>>(() =>
     Object.fromEntries([...available].map((key) => [key, true]))
   );
+  const robotFiles = files.filter((file) => file.ontology === "robot");
+  const robotStyleKeys = [
+    ...new Set(robotFiles.map((file) => fileRobotStyle(file, unitByPath.get(file.path)))),
+  ].sort((left, right) => {
+    if (!left) return 1;
+    if (!right) return -1;
+    return left.localeCompare(right, "zh");
+  });
+  const showRobotStyles = robotStyleKeys.some(Boolean);
+  const [checkedStyles, setCheckedStyles] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(robotStyleKeys.map((style) => [style, true]))
+  );
+  const selectedStyles = showRobotStyles
+    ? robotStyleKeys.filter((style) => checkedStyles[style])
+    : undefined;
+  const fileIncluded = (file: StorageFile) => {
+    if (!checked[downloadKindKey(file.ontology, file.modality, fileFormatOf(file))]) {
+      return false;
+    }
+    if (!showRobotStyles || file.ontology !== "robot") return true;
+    return !!checkedStyles[fileRobotStyle(file, unitByPath.get(file.path))];
+  };
   const selectedKinds = files
+    .filter(fileIncluded)
     .map((file) => ({
       ontology: file.ontology,
       modality: file.modality,
       format: fileFormatOf(file),
     }))
-    .filter((kind) => checked[downloadKindKey(kind.ontology, kind.modality, kind.format)])
     .filter((kind, index, list) => {
       const key = downloadKindKey(kind.ontology, kind.modality, kind.format);
       return list.findIndex((item) => downloadKindKey(item.ontology, item.modality, item.format) === key) === index;
     });
-  const selectedCount = files.filter((file) =>
-    checked[downloadKindKey(file.ontology, file.modality, fileFormatOf(file))]
-  ).length;
+  const selectedCount = files.filter(fileIncluded).length;
   const title =
     batches.length === 1 && !leftover.length
       ? batches[0].name
@@ -2222,6 +2409,7 @@ function DownloadPicker({
         <h3 style={{ margin: 0 }}>选择下载内容</h3>
         <p className="muted" style={{ margin: 0 }}>
           {title} · 共 {files.length} 个文件，已选 {selectedCount} 个
+          {showRobotStyles ? "。机器人数据可按款式再筛选" : ""}
         </p>
         <div className="storage-unit-matrix">
           {ONTOLOGIES.map((ontology) => (
@@ -2265,9 +2453,11 @@ function DownloadPicker({
                       {enabled ? (
                         formats.map((format) => {
                           const key = downloadKindKey(ontology, modality, format);
-                          const count = rowFiles.filter(
-                            (file) => fileFormatOf(file) === format
-                          ).length;
+                          const count = rowFiles.filter((file) => {
+                            if (fileFormatOf(file) !== format) return false;
+                            if (!showRobotStyles || file.ontology !== "robot") return true;
+                            return !!checkedStyles[fileRobotStyle(file, unitByPath.get(file.path))];
+                          }).length;
                           return (
                             <label key={format} className="storage-download-format">
                               <input
@@ -2293,6 +2483,56 @@ function DownloadPicker({
                   </div>
                 );
               })}
+              {ontology === "robot" && showRobotStyles && (
+                <div className="storage-download-row">
+                  <input
+                    type="checkbox"
+                    disabled={busy}
+                    checked={
+                      robotStyleKeys.length > 0 &&
+                      robotStyleKeys.every((style) => checkedStyles[style])
+                    }
+                    ref={(el) => {
+                      if (!el) return;
+                      const selected = robotStyleKeys.filter((style) => checkedStyles[style]);
+                      el.indeterminate =
+                        selected.length > 0 && selected.length < robotStyleKeys.length;
+                    }}
+                    onChange={(e) =>
+                      setCheckedStyles(
+                        Object.fromEntries(
+                          robotStyleKeys.map((style) => [style, e.target.checked])
+                        )
+                      )
+                    }
+                  />
+                  <span className="storage-modality-name">机器人款式</span>
+                  <span className="storage-download-formats">
+                    {robotStyleKeys.map((style) => {
+                      const count = robotFiles.filter(
+                        (file) => fileRobotStyle(file, unitByPath.get(file.path)) === style
+                      ).length;
+                      return (
+                        <label key={style || "__none__"} className="storage-download-format">
+                          <input
+                            type="checkbox"
+                            disabled={busy}
+                            checked={!!checkedStyles[style]}
+                            onChange={(e) =>
+                              setCheckedStyles((current) => ({
+                                ...current,
+                                [style]: e.target.checked,
+                              }))
+                            }
+                          />
+                          {style || "未标注"}
+                          <span className="muted">{count}</span>
+                        </label>
+                      );
+                    })}
+                  </span>
+                </div>
+              )}
             </section>
           ))}
         </div>
@@ -2302,8 +2542,8 @@ function DownloadPicker({
           </button>
           <button
             type="button"
-            disabled={busy || !selectedKinds.length}
-            onClick={() => onConfirm(selectedKinds)}
+            disabled={busy || !selectedCount}
+            onClick={() => onConfirm({ kinds: selectedKinds, robotStyles: selectedStyles })}
           >
             {busy ? "打包中…" : "开始下载"}
           </button>
@@ -2378,6 +2618,7 @@ function UnitMatrix({
                     >
                       {file.channel ? `${file.channel}/` : ""}
                       {file.format}
+                      <span className="storage-file-uploader">{file.name}</span>
                       <span className="storage-file-uploader">
                         {file.uploader?.username || "未知用户"}
                       </span>
@@ -2423,6 +2664,7 @@ export function StorageWorkspace({
   variant?: WorkspaceVariant;
 }) {
   const { user, hasPerm } = useAuth();
+  const { execute } = useUndo();
   const [data, setData] = useState<StorageOverview | null>(null);
   const [classificationUnits, setClassificationUnits] = useState<StorageUnit[]>([]);
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
@@ -2556,17 +2798,20 @@ export function StorageWorkspace({
 
   const displayData = useMemo(() => {
     if (!data) return null;
-    const timestamp = (unit: StorageUnit) =>
-      Math.max(
-        0,
-        ...unit.files.map((file) => Date.parse(file.modified_at) || 0)
-      );
+    const createdTimestamp = (unit: StorageUnit) => {
+      const times = unit.files.map((file) => Date.parse(file.modified_at) || 0);
+      return times.length ? Math.min(...times) : 0;
+    };
+    const modifiedTimestamp = (unit: StorageUnit) => {
+      const times = unit.files.map((file) => Date.parse(file.modified_at) || 0);
+      return times.length ? Math.max(...times) : 0;
+    };
     const compareUnits = (a: StorageUnit, b: StorageUnit) => {
       if (sortMode === "name_desc") return b.name.localeCompare(a.name);
-      if (sortMode === "modified_desc") return timestamp(b) - timestamp(a);
-      if (sortMode === "modified_asc") return timestamp(a) - timestamp(b);
-      if (sortMode === "created_desc") return timestamp(b) - timestamp(a);
-      if (sortMode === "created_asc") return timestamp(a) - timestamp(b);
+      if (sortMode === "modified_desc") return modifiedTimestamp(b) - modifiedTimestamp(a);
+      if (sortMode === "modified_asc") return modifiedTimestamp(a) - modifiedTimestamp(b);
+      if (sortMode === "created_desc") return createdTimestamp(b) - createdTimestamp(a);
+      if (sortMode === "created_asc") return createdTimestamp(a) - createdTimestamp(b);
       return a.name.localeCompare(b.name);
     };
     const known = new Set(data.batches.map((batch) => batch.name));
@@ -2644,11 +2889,21 @@ export function StorageWorkspace({
   const handleRenameBatch = async (batch: StorageBatch) => {
     const next = promptName("新的数据批次名称", batch.name);
     if (!next || next === batch.name) return;
+    const prev = batch.name;
     try {
-      await api.storageRenameBatch(batch.name, next);
-      setMessage(`批次已重命名为 ${next}`);
-      setFocus({ kind: "batch", key: next });
-      await load();
+      await execute({
+        label: `重命名批次为 ${next}`,
+        do: async () => {
+          await api.storageRenameBatch(prev, next);
+          setMessage(`批次已重命名为 ${next}`);
+          setFocus({ kind: "batch", key: next });
+          await load();
+        },
+        undo: async () => {
+          await api.storageRenameBatch(next, prev);
+          setFocus({ kind: "batch", key: prev });
+        },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "重命名失败");
     }
@@ -2657,12 +2912,54 @@ export function StorageWorkspace({
   const handleRenameUnit = async (unit: StorageUnit) => {
     const next = promptName("新的数据单元名称", unit.name);
     if (!next || next === unit.name) return;
+    const prev = unit.name;
+    const batchName = unit.batch;
     try {
-      await api.storageRenameUnit(unit.batch, unit.name, next);
-      setMessage(`数据单元已重命名为 ${next}`);
-      setSelectedKey(`${unit.batch}::${next}`);
-      setFocus({ kind: "unit", key: `${unit.batch}::${next}` });
-      await load();
+      await execute({
+        label: `重命名数据单元为 ${next}`,
+        do: async () => {
+          await api.storageRenameUnit(batchName, prev, next);
+          setMessage(`数据单元已重命名为 ${next}`);
+          setSelectedKey(`${batchName}::${next}`);
+          setFocus({ kind: "unit", key: `${batchName}::${next}` });
+          await load();
+        },
+        undo: async () => {
+          await api.storageRenameUnit(batchName, next, prev);
+          setSelectedKey(`${batchName}::${prev}`);
+          setFocus({ kind: "unit", key: `${batchName}::${prev}` });
+        },
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "重命名失败");
+    }
+  };
+
+  const handleRenameFile = async (file: StorageFile) => {
+    const next = promptName("新的文件名（扩展名会保留）", file.name);
+    if (!next || next === file.name) return;
+    const prevName = file.name;
+    let currentPath = file.path;
+    try {
+      await execute({
+        label: `重命名文件为 ${next}`,
+        do: async () => {
+          const renamed = await api.storageRenameFile(currentPath, next);
+          preview.replaceByPath(currentPath, renamed);
+          currentPath = renamed.path;
+          setMessage(`文件已重命名为 ${renamed.name}`);
+          setSelectedKey(`${renamed.batch}::${renamed.unit_name}`);
+          setFocus({ kind: "file", key: renamed.path });
+          await load();
+        },
+        undo: async () => {
+          const restored = await api.storageRenameFile(currentPath, prevName);
+          preview.replaceByPath(currentPath, restored);
+          currentPath = restored.path;
+          setSelectedKey(`${restored.batch}::${restored.unit_name}`);
+          setFocus({ kind: "file", key: restored.path });
+        },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "重命名失败");
     }
@@ -2740,9 +3037,7 @@ export function StorageWorkspace({
     setDownloadPick({ batches, units: leftover });
   };
 
-  const confirmDownload = async (
-    kinds: { ontology: string; modality: string; format: string }[]
-  ) => {
+  const confirmDownload = async ({ kinds, robotStyles }: DownloadConfirm) => {
     if (!downloadPick || !kinds.length) return;
     const { batches, units } = downloadPick;
     const filename =
@@ -2759,6 +3054,7 @@ export function StorageWorkspace({
           batches: batches.map((item) => item.name),
           units: units.map((unit) => ({ batch: unit.batch, name: unit.name })),
           kinds,
+          robot_styles: robotStyles,
         },
         filename
       );
@@ -3204,6 +3500,15 @@ export function StorageWorkspace({
                       下载当前文件
                     </button>
                   )}
+                  {selectedFile && canManageItems && (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void handleRenameFile(selectedFile)}
+                    >
+                      重命名当前文件
+                    </button>
+                  )}
                   {selectedFile &&
                     (canDelete ||
                       !!(
@@ -3294,7 +3599,7 @@ export function StorageWorkspace({
           onClose={() => {
             if (!downloadBusy) setDownloadPick(null);
           }}
-          onConfirm={(kinds) => void confirmDownload(kinds)}
+          onConfirm={(payload) => void confirmDownload(payload)}
         />
       )}
       {selected && quickPreset && (

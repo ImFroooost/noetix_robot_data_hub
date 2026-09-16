@@ -3,10 +3,12 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import type { StorageFile } from "../types";
+import { useUndoOptional } from "../undo/UndoContext";
 
 const MIN_SLOTS = 2;
 
@@ -20,6 +22,7 @@ type PreviewContextValue = {
   add: (file: StorageFile) => void;
   removeAt: (index: number) => void;
   removeByPaths: (paths: string[]) => void;
+  replaceByPath: (oldPath: string, file: StorageFile) => void;
   syncFromOverview: (files: StorageFile[], units: { files: StorageFile[] }[]) => void;
   setActive: (index: number) => void;
   addSlot: () => void;
@@ -35,43 +38,79 @@ function trimSlots(slots: PreviewSlot[]) {
 }
 
 export function PreviewProvider({ children }: { children: ReactNode }) {
+  const history = useUndoOptional();
   const [slots, setSlots] = useState<PreviewSlot[]>(() =>
     Array.from({ length: MIN_SLOTS }, () => null)
   );
   const [activeIndex, setActiveIndex] = useState(0);
+  const slotsRef = useRef(slots);
+  const activeRef = useRef(activeIndex);
+  slotsRef.current = slots;
+  activeRef.current = activeIndex;
+
+  const restore = useCallback((nextSlots: PreviewSlot[], nextActive: number) => {
+    setSlots(nextSlots);
+    setActiveIndex(nextActive);
+  }, []);
 
   const add = useCallback((file: StorageFile) => {
-    setSlots((current) => {
-      const existing = current.findIndex((item) => item?.id === file.id);
-      if (existing >= 0) {
-        setActiveIndex(existing);
-        return current;
-      }
-      const emptyActive = current[activeIndex] == null ? activeIndex : -1;
-      const empty = current.findIndex((item) => item == null);
-      const target = emptyActive >= 0 ? emptyActive : empty;
-      if (target >= 0) {
-        setActiveIndex(target);
-        return current.map((item, index) => (index === target ? file : item));
-      }
-      setActiveIndex(current.length);
-      return [...current, file];
+    const prevSlots = slotsRef.current;
+    const prevActive = activeRef.current;
+    const existing = prevSlots.findIndex((item) => item?.id === file.id);
+    if (existing >= 0) {
+      setActiveIndex(existing);
+      return;
+    }
+    const emptyActive = prevSlots[prevActive] == null ? prevActive : -1;
+    const empty = prevSlots.findIndex((item) => item == null);
+    const target = emptyActive >= 0 ? emptyActive : empty;
+    const nextSlots =
+      target >= 0
+        ? prevSlots.map((item, index) => (index === target ? file : item))
+        : [...prevSlots, file];
+    const nextActive = target >= 0 ? target : prevSlots.length;
+    slotsRef.current = nextSlots;
+    activeRef.current = nextActive;
+    setSlots(nextSlots);
+    setActiveIndex(nextActive);
+    void history?.execute({
+      label: `预览 ${file.name}`,
+      refresh: false,
+      do: () => restore(nextSlots, nextActive),
+      undo: () => restore(prevSlots, prevActive),
     });
-  }, [activeIndex]);
+  }, [history, restore]);
 
   const removeAt = useCallback((index: number) => {
-    setSlots((current) => {
-      const next = current.map((item, itemIndex) => (itemIndex === index ? null : item));
-      return trimSlots(next);
+    const prevSlots = slotsRef.current;
+    const prevActive = activeRef.current;
+    const nextSlots = trimSlots(prevSlots.map((item, itemIndex) => (itemIndex === index ? null : item)));
+    const nextActive = prevActive === index ? 0 : prevActive;
+    slotsRef.current = nextSlots;
+    activeRef.current = nextActive;
+    setSlots(nextSlots);
+    setActiveIndex(nextActive);
+    void history?.execute({
+      label: "关闭预览",
+      refresh: false,
+      do: () => restore(nextSlots, nextActive),
+      undo: () => restore(prevSlots, prevActive),
     });
-    setActiveIndex((current) => (current === index ? 0 : current));
-  }, []);
+  }, [history, restore]);
 
   const removeByPaths = useCallback((paths: string[]) => {
     const gone = new Set(paths);
     setSlots((current) =>
       trimSlots(current.map((item) => (item && gone.has(item.path) ? null : item)))
     );
+  }, []);
+
+  const replaceByPath = useCallback((oldPath: string, file: StorageFile) => {
+    setSlots((current) => {
+      const next = current.map((item) => (item && item.path === oldPath ? file : item));
+      slotsRef.current = next;
+      return next;
+    });
   }, []);
 
   const syncFromOverview = useCallback(
@@ -91,16 +130,37 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
   );
 
   const addSlot = useCallback(() => {
-    setSlots((current) => {
-      setActiveIndex(current.length);
-      return [...current, null];
+    const prevSlots = slotsRef.current;
+    const prevActive = activeRef.current;
+    const nextSlots = [...prevSlots, null];
+    const nextActive = prevSlots.length;
+    slotsRef.current = nextSlots;
+    activeRef.current = nextActive;
+    setSlots(nextSlots);
+    setActiveIndex(nextActive);
+    void history?.execute({
+      label: "添加预览窗口",
+      refresh: false,
+      do: () => restore(nextSlots, nextActive),
+      undo: () => restore(prevSlots, prevActive),
     });
-  }, []);
+  }, [history, restore]);
 
   const clear = useCallback(() => {
-    setSlots(Array.from({ length: MIN_SLOTS }, () => null));
+    const prevSlots = slotsRef.current;
+    const prevActive = activeRef.current;
+    const nextSlots = Array.from({ length: MIN_SLOTS }, () => null);
+    slotsRef.current = nextSlots;
+    activeRef.current = 0;
+    setSlots(nextSlots);
     setActiveIndex(0);
-  }, []);
+    void history?.execute({
+      label: "清空预览",
+      refresh: false,
+      do: () => restore(nextSlots, 0),
+      undo: () => restore(prevSlots, prevActive),
+    });
+  }, [history, restore]);
 
   const value = useMemo<PreviewContextValue>(
     () => ({
@@ -111,12 +171,13 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
       add,
       removeAt,
       removeByPaths,
+      replaceByPath,
       syncFromOverview,
       setActive: setActiveIndex,
       addSlot,
       clear,
     }),
-    [slots, activeIndex, add, removeAt, removeByPaths, syncFromOverview, addSlot, clear]
+    [slots, activeIndex, add, removeAt, removeByPaths, replaceByPath, syncFromOverview, addSlot, clear]
   );
 
   return <PreviewContext.Provider value={value}>{children}</PreviewContext.Provider>;

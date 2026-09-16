@@ -15,6 +15,13 @@ import {
   useUpAxisMode,
   type UpAxis,
 } from "../viewerUpAxis";
+import {
+  cycleLengthUnitMode,
+  lengthUnitModeLabel,
+  useLengthUnitMode,
+  type LengthUnit,
+  type LengthUnitMode,
+} from "../viewerUnits";
 import type { Clip, HumanFile, RobotFile, RobotModel, RobotStage } from "../types";
 import {
   STAGE_LABEL,
@@ -185,8 +192,10 @@ function SceneContent({
   time,
   duration,
   rotationX,
+  unitMode,
   onMediaDuration,
   onDetectedUpAxis,
+  onDetectedLengthUnit,
 }: {
   humanFile: HumanFile | null;
   humanPreview: HumanPreview | null;
@@ -196,8 +205,10 @@ function SceneContent({
   time: number;
   duration: number;
   rotationX: number;
+  unitMode: LengthUnitMode;
   onMediaDuration?: (sec: number) => void;
   onDetectedUpAxis?: (up: UpAxis) => void;
+  onDetectedLengthUnit?: (unit: LengthUnit) => void;
 }) {
   const fmt = (humanFile?.format || "").toLowerCase();
   const humanIsBvh = fmt === "bvh";
@@ -236,7 +247,9 @@ function SceneContent({
             duration={duration}
             onDuration={onMediaDuration}
             rotationX={rotationX}
+            unitMode={unitMode}
             onDetectedUpAxis={onDetectedUpAxis}
+            onDetectedLengthUnit={onDetectedLengthUnit}
           />
         )}
         {humanIsFbx && humanFile && (
@@ -245,7 +258,9 @@ function SceneContent({
             time={time}
             onDuration={onMediaDuration}
             rotationX={rotationX}
+            unitMode={unitMode}
             onDetectedUpAxis={onDetectedUpAxis}
+            onDetectedLengthUnit={onDetectedLengthUnit}
           />
         )}
         {humanIsSmpl && humanPreview?.pose_preview && (
@@ -329,6 +344,8 @@ export function MotionViewer({
   const [mediaDuration, setMediaDuration] = useState(0);
   const [upAxisMode, setUpAxisMode] = useUpAxisMode();
   const [detectedUp, setDetectedUp] = useState<UpAxis>("y");
+  const [unitMode, setUnitMode] = useLengthUnitMode();
+  const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
 
   const lockedHuman = humanFileId != null;
@@ -357,6 +374,7 @@ export function MotionViewer({
     setPlaying(true);
     setMediaDuration(0);
     setDetectedUp("y");
+    setDetectedUnit("m");
   }, [humanFileId, robotFileId, humanId]);
 
   const humanFile =
@@ -534,8 +552,10 @@ export function MotionViewer({
             time={time}
             duration={duration}
             rotationX={rotationX}
+            unitMode={unitMode}
             onMediaDuration={setMediaDuration}
             onDetectedUpAxis={setDetectedUp}
+            onDetectedLengthUnit={setDetectedUnit}
           />
         </Canvas>
       </div>
@@ -601,6 +621,14 @@ export function MotionViewer({
           onClick={() => setUpAxisMode(cycleUpAxisMode(upAxisMode))}
         >
           {upAxisModeLabel(upAxisMode, detectedUp)}
+        </button>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="切换长度单位：自动识别 / 米 / 厘米 / 毫米"
+          onClick={() => setUnitMode(cycleLengthUnitMode(unitMode))}
+        >
+          {lengthUnitModeLabel(unitMode, detectedUnit)}
         </button>
       </div>
 

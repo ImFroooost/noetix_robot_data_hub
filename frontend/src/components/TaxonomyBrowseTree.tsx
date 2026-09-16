@@ -204,6 +204,8 @@ export function TaxonomyBrowseTree({
   extraFilters = {},
 }: Props) {
   const tree = useMemo(() => buildTree(nodes), [nodes]);
+  // 唯一根节点时隐藏它，直接展示其子节点作为顶层
+  const visibleRoots = tree.length === 1 ? tree[0].children : tree;
   const [openIds, setOpenIds] = useState<Set<number>>(() => new Set());
   const [clipsByNode, setClipsByNode] = useState<
     Record<number, ClipListItem[] | undefined>
@@ -214,10 +216,7 @@ export function TaxonomyBrowseTree({
 
   useEffect(() => {
     if (!tree.length) return;
-    setOpenIds((prev) => {
-      if (prev.size) return prev;
-      return new Set(tree.slice(0, 4).map((n) => n.id));
-    });
+    // 默认全部折叠，不自动展开
   }, [tree]);
 
   useEffect(() => {
@@ -288,7 +287,7 @@ export function TaxonomyBrowseTree({
         <span className="folder-name">全部（本分类标准）</span>
       </div>
       <div className="folder-tree-list browse-tree-list">
-        {tree.map((n) => (
+        {visibleRoots.map((n) => (
           <NodeBranch
             key={n.id}
             node={n}
@@ -306,7 +305,7 @@ export function TaxonomyBrowseTree({
             extraFilters={extraFilters}
           />
         ))}
-        {!tree.length && <div className="muted">暂无分类节点</div>}
+        {!visibleRoots.length && <div className="muted">暂无分类节点</div>}
       </div>
     </div>
   );

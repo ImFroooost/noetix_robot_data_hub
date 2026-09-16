@@ -5,6 +5,7 @@ import { FolderDropZone } from "../components/FolderDropZone";
 import { ModelFilePreview, modelPreviewKind } from "../components/ModelFilePreview";
 import type { ModelInstance, ModelRepositoryOverview } from "../types";
 import { INDEX_UPDATED_EVENT } from "../storageOverviewCache";
+import { useUndo } from "../undo/UndoContext";
 import { zipRelFiles, type RelFile } from "../utils/folderUpload";
 
 const KIND_LABEL: Record<string, string> = {
@@ -17,6 +18,7 @@ const KIND_LABEL: Record<string, string> = {
 
 export function RepositoryModelsPage() {
   const { hasPerm } = useAuth();
+  const { execute } = useUndo();
   const canUpload = hasPerm("upload");
   const canDelete = hasPerm("manage_data");
   const [data, setData] = useState<ModelRepositoryOverview | null>(null);
@@ -82,11 +84,20 @@ export function RepositoryModelsPage() {
   const createInstance = async () => {
     const name = prompt(`新建${ontology === "human" ? "人体" : "机器人"}实例名称：`);
     if (!name?.trim()) return;
+    const instanceName = name.trim();
     try {
-      const result = await api.storageCreateModelInstance(ontology, name.trim());
-      await load();
-      setSelectedKey(result.key);
-      setMessage(`已创建实例 ${result.name}`);
+      await execute({
+        label: `新建模型实例 ${instanceName}`,
+        do: async () => {
+          const result = await api.storageCreateModelInstance(ontology, instanceName);
+          await load();
+          setSelectedKey(result.key);
+          setMessage(`已创建实例 ${result.name}`);
+        },
+        undo: async () => {
+          await api.storageDeleteModelInstance(ontology, instanceName);
+        },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "创建失败");
     }
@@ -121,17 +132,28 @@ export function RepositoryModelsPage() {
       form.set("instance", selected.name);
       form.set("kind", kind);
       form.set("file", uploadFile);
-      const result = (await api.storageUploadModel(form)) as {
-        validation?: Record<string, number>;
-      };
-      await load();
-      setFile(null);
-      setFolderFiles([]);
-      setMessage(
-        result.validation
-          ? `标准描述结构校验通过：meshes ${result.validation.meshes}，mjcf ${result.validation.mjcf}，urdf ${result.validation.urdf}`
-          : "模型文件已上传"
-      );
+      let uploadedPath = "";
+      await execute({
+        label: `上传模型到 ${selected.name}`,
+        do: async () => {
+          const result = (await api.storageUploadModel(form)) as {
+            validation?: Record<string, number>;
+            path?: string;
+          };
+          uploadedPath = result.path || "";
+          await load();
+          setFile(null);
+          setFolderFiles([]);
+          setMessage(
+            result.validation
+              ? `标准描述结构校验通过：meshes ${result.validation.meshes}，mjcf ${result.validation.mjcf}，urdf ${result.validation.urdf}`
+              : "模型文件已上传"
+          );
+        },
+        undo: async () => {
+          if (uploadedPath) await api.storageDeleteModelFile(uploadedPath);
+        },
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "上传失败");
     } finally {

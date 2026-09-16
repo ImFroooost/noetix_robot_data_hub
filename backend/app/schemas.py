@@ -53,6 +53,11 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=4, max_length=128)
+
+
 class UserOut(ORMModel):
     id: int
     username: str

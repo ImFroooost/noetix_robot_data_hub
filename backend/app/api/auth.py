@@ -2,11 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..core.deps import get_acting_super_manager, get_current_user, impersonator_id_of
-from ..core.security import create_access_token, verify_password
+from ..core.security import create_access_token, hash_password, verify_password
 from ..database import get_db
 from ..models import User
 from ..models.enums import is_super_manager_role
-from ..schemas import ImpersonatorOut, LoginIn, PermissionItem, TokenOut, UserOut
+from ..schemas import ChangePasswordIn, ImpersonatorOut, LoginIn, PermissionItem, TokenOut, UserOut
 from ..services.audit import write_audit
 from ..services.permissions import permission_summary
 
@@ -67,6 +67,28 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return _user_out(db, user)
+
+
+@router.post("/change-password")
+def change_password(
+    body: ChangePasswordIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(body.old_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="原密码错误")
+    if body.new_password == body.old_password:
+        raise HTTPException(status_code=400, detail="新密码不能与原密码相同")
+    user.password_hash = hash_password(body.new_password)
+    write_audit(
+        db,
+        user_id=user.id,
+        action="change_password",
+        entity_type="user",
+        entity_id=user.id,
+    )
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/impersonate/{user_id}", response_model=TokenOut)

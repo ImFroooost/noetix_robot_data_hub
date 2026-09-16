@@ -43,6 +43,7 @@ from ..services.disk_repository import (
     record_upload_session,
     resolve_import_zip,
     rename_batch,
+    rename_file,
     rename_unit,
     resolve_repo_file,
     save_data_file,
@@ -122,6 +123,7 @@ class StorageSelectionIn(BaseModel):
     batches: list[str] = Field(default_factory=list)
     units: list[UnitRefIn] = Field(default_factory=list)
     kinds: list[DataKindIn] = Field(default_factory=list)
+    robot_styles: list[str] | None = None
 
 
 def _parse_annotation_form(raw: str) -> dict[str, Any]:
@@ -1083,6 +1085,7 @@ def archive_selection(
             batches=batches,
             units=units,
             kinds=kinds or None,
+            robot_styles=body.robot_styles,
             accept=accept,
         ),
         filename,
@@ -1831,6 +1834,38 @@ def get_smpl_motion_by_path(
         return load_smpl_motion(file_path)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"SMPL 解析失败：{exc}") from exc
+
+
+@router.post("/file/rename")
+def rename_file_api(
+    path: str = Query(...),
+    body: RenameIn = ...,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = scan_data()
+    unit = _unit_for_file(snapshot, path)
+    if not unit:
+        raise HTTPException(status_code=404, detail="文件未纳入数据单元")
+    _require_unit(db, user, Capability.edit, unit)
+    try:
+        result = rename_file(path, body.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result["taxonomy_tags"] = _taxonomy_briefs(
+        db, result.get("taxonomy_tag_ids") or {}
+    )
+    write_audit(
+        db,
+        user_id=user.id,
+        action="rename",
+        entity_type="storage_file",
+        detail={"path": path, "name": body.name, "next_path": result.get("path")},
+    )
+    db.commit()
+    return result
 
 
 @router.delete("/file")

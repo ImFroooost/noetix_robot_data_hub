@@ -43,7 +43,7 @@
 
 ### 导入时的规则
 
-- `xxx.bvh` 与 `xxx.bvh_Skeleton0` 会自动算同一数据单元。
+- 同名文件属于同一数据单元。文件名里带 `skeleton` / `rigid body` / `marker` 时，按这些词前面的部分归组，例如 `XXXX_skeleton_0`、`XXXX_RigidBody_01`、`XXXX_marker003` 都归到 `XXXX`。
 - 未登记的后缀（如 `.c3d`）会按后缀建成新格式，不必先登记。
 - 只有**机器人 CSV** 需要手填帧率（默认 30 Hz）。人体 CSV 不要求手填。
 

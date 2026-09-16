@@ -101,6 +101,8 @@ export function RepoTaxonomyNav(props: {
 }) {
   const { nodes, selectedId, onSelect } = props;
   const tree = useMemo(() => buildTree(nodes), [nodes]);
+  // 唯一根节点时隐藏它，直接展示其子节点作为顶层
+  const visibleRoots = tree.length === 1 ? tree[0].children : tree;
   const [openIds, setOpenIds] = useState<Set<number>>(() => new Set());
 
   if (!nodes.length) {
@@ -117,7 +119,7 @@ export function RepoTaxonomyNav(props: {
       >
         全部（当前标准）
       </button>
-      {tree.map((n) => (
+      {visibleRoots.map((n) => (
         <Branch
           key={n.id}
           node={n}

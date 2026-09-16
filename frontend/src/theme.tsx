@@ -80,7 +80,7 @@ export function ThemeToggle() {
         onClick={() => setTheme("light")}
       >
         <SunIcon />
-        白天
+        浅色
       </button>
       <button
         type="button"
@@ -89,7 +89,7 @@ export function ThemeToggle() {
         onClick={() => setTheme("dark")}
       >
         <MoonIcon />
-        夜间
+        深色
       </button>
     </div>
   );

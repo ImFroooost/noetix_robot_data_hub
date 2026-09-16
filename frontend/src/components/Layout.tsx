@@ -6,6 +6,8 @@ import { ThemeToggle } from "../theme";
 import { IndexRefreshControl } from "./IndexRefreshControl";
 import { RoleHelpDialog, useRoleHelpAutoOpen } from "./RoleHelpDialog";
 import { PreviewProvider } from "../preview/PreviewContext";
+import { HistoryButtons, UndoProvider } from "../undo/UndoContext";
+import { ChangePasswordDialog } from "./ChangePasswordDialog";
 import { ROLE_LABEL } from "../types";
 import type { User } from "../types";
 
@@ -36,6 +38,7 @@ export function Layout() {
     }
   });
   const { open: helpOpen, setOpen: setHelpOpen } = useRoleHelpAutoOpen(user?.role);
+  const [pwOpen, setPwOpen] = useState(false);
   const page = PAGES[location.pathname] || PAGES["/"];
 
   const toggleCollapsed = () => {
@@ -87,6 +90,7 @@ export function Layout() {
   };
 
   return (
+    <UndoProvider>
     <div className="app-frame">
       {impersonating && user?.impersonated_by && (
         <div className="impersonate-bar">
@@ -201,6 +205,7 @@ export function Layout() {
               <p>{page.subtitle}</p>
             </div>
             <div className="app-top-actions">
+              <HistoryButtons />
               <IndexRefreshControl className="btn-primary" />
               <button
                 type="button"
@@ -222,6 +227,14 @@ export function Layout() {
                     {impersonating ? " ·视角" : ""}
                   </em>
                 </span>
+                <button
+                  type="button"
+                  className="ghost-link"
+                  title="修改密码"
+                  onClick={() => setPwOpen(true)}
+                >
+                  改密
+                </button>
                 <button type="button" className="ghost-link" onClick={logout}>
                   退出
                 </button>
@@ -241,7 +254,9 @@ export function Layout() {
         open={helpOpen}
         onClose={() => setHelpOpen(false)}
       />
+      <ChangePasswordDialog open={pwOpen} onClose={() => setPwOpen(false)} />
     </div>
+    </UndoProvider>
   );
 }
 

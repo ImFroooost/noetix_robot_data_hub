@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
 import { fetchStorageOverview, invalidateStorageOverview } from "../storageOverviewCache";
+import { useUndo } from "../undo/UndoContext";
+import { undoUploadSession } from "../undo/storageMeta";
 import { DEFAULT_HUMAN_MODEL, HumanModelFields, resolveHumanModelName } from "./HumanModelFields";
 import { MotionKindFields } from "./MotionKindFields";
 import { RobotStyleFields } from "./RobotStyleFields";
@@ -90,10 +92,12 @@ type FolderImportDraft = {
 const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 
 function normalizeUnitStem(name: string) {
-  const cleaned = name.replace(
-    /(?:\.[A-Za-z0-9]{1,8})?[\s_]+Skeleton(?:[\s._-]?\d+)?$/i,
-    ""
-  ).replace(/[ .\t_]+$/, "");
+  const cleaned = name
+    .replace(
+      /(?:[\s._-]+|\.[A-Za-z0-9]{1,8}[\s._-]*)(?:skeleton|rigid[\s._-]*bod(?:y|ies)|marker).*$/i,
+      ""
+    )
+    .replace(/[ .\t_]+$/, "");
   return cleaned || name;
 }
 
@@ -105,13 +109,7 @@ function fileUnitName(file: RelFile) {
 function stemsSameUnit(left: string, right: string) {
   const a = normalizeUnitStem(left);
   const b = normalizeUnitStem(right);
-  if (a === b) return true;
-  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
-  if (!long.startsWith(short)) return false;
-  const extra = long.slice(short.length);
-  if (!extra || !/^[-_.]/.test(extra) || extra.length > 32) return false;
-  const segs = extra.split(/[-_.]+/).filter(Boolean);
-  return segs.length >= 1 && segs.length <= 3;
+  return Boolean(a) && a === b;
 }
 
 function matchExistingUnit<T extends { name: string }>(
@@ -221,6 +219,7 @@ export function FolderBatchImport({
   onError: (message: string) => void;
   onMessage: (message: string) => void;
 }) {
+  const { execute } = useUndo();
   const [overview, setOverview] = useState<StorageOverview | null>(null);
   const [folderDraft, setFolderDraft] = useState<FolderImportDraft | null>(null);
   const [zipDraft, setZipDraft] = useState<ZipImportDraft | null>(null);
@@ -298,7 +297,7 @@ export function FolderBatchImport({
       file,
       localPath,
       folderName,
-      batchChoice: batchExists ? "" : "new",
+      batchChoice: batchExists ? "existing" : "new",
       batchName: batchExists ? nextAvailableBatchName(folderName, storage.batches) : folderName,
       ontology: "human",
       modality: "motion",
@@ -343,7 +342,7 @@ export function FolderBatchImport({
     setFolderDraft({
       files,
       folderName,
-      batchChoice: batchExists ? "" : "new",
+      batchChoice: batchExists ? "existing" : "new",
       batchName: batchExists ? nextAvailableBatchName(folderName, storage.batches) : folderName,
       ontology: "human",
       modality: "motion",
@@ -365,13 +364,22 @@ export function FolderBatchImport({
   const createBatch = async () => {
     const name = prompt("新数据批次名称：");
     if (!name?.trim()) return;
+    const batchName = name.trim();
     try {
-      await api.storageCreateBatch(name.trim(), {
-        taxonomy_tag_ids: taxonomyPayload,
+      await execute({
+        label: `新建批次 ${batchName}`,
+        do: async () => {
+          await api.storageCreateBatch(batchName, {
+            taxonomy_tag_ids: taxonomyPayload,
+          });
+          onMessage(`已创建批次 ${batchName}`);
+          invalidateStorageOverview();
+          onImported(batchName);
+        },
+        undo: async () => {
+          await api.storageDeleteBatch(batchName);
+        },
       });
-      onMessage(`已创建批次 ${name.trim()}`);
-      invalidateStorageOverview();
-      onImported(name.trim());
     } catch (e) {
       onError(e instanceof Error ? e.message : "创建失败");
     }
@@ -456,15 +464,31 @@ export function FolderBatchImport({
         setFolderBusy(false);
         return;
       }
-      const result = await api.storageUploadZip(form);
-      setFolderResult(result);
-      invalidateStorageOverview();
-      onImported(targetBatch, result.upload_session_id || undefined);
-      if (!result.failed) {
-        onMessage(
-          `Zip 导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
-        );
-      }
+      let sessionId: string | undefined;
+      const uploadedPaths: string[] = [];
+      await execute({
+        label: `导入 Zip 到 ${targetBatch}`,
+        do: async () => {
+          const result = await api.storageUploadZip(form);
+          sessionId = result.upload_session_id || undefined;
+          uploadedPaths.splice(
+            0,
+            uploadedPaths.length,
+            ...result.items.map((item) => item.file?.path).filter((path): path is string => !!path)
+          );
+          setFolderResult(result);
+          invalidateStorageOverview();
+          onImported(targetBatch, sessionId);
+          if (!result.failed) {
+            onMessage(
+              `Zip 导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
+            );
+          }
+        },
+        undo: async () => {
+          await undoUploadSession(sessionId, uploadedPaths);
+        },
+      });
     } catch (e) {
       setFolderError(e instanceof Error ? e.message : "Zip 导入失败");
     } finally {
@@ -586,15 +610,31 @@ export function FolderBatchImport({
       folderRows.forEach((row) =>
         form.append("files", row.relFile.file, row.relFile.file.name)
       );
-      const result = await api.storageUploadFolder(form);
-      setFolderResult(result);
-      invalidateStorageOverview();
-      onImported(targetBatch, result.upload_session_id || undefined);
-      if (!result.failed) {
-        onMessage(
-          `文件夹导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
-        );
-      }
+      let sessionId: string | undefined;
+      const uploadedPaths: string[] = [];
+      await execute({
+        label: `导入文件夹到 ${targetBatch}`,
+        do: async () => {
+          const result = await api.storageUploadFolder(form);
+          sessionId = result.upload_session_id || undefined;
+          uploadedPaths.splice(
+            0,
+            uploadedPaths.length,
+            ...result.items.map((item) => item.file?.path).filter((path): path is string => !!path)
+          );
+          setFolderResult(result);
+          invalidateStorageOverview();
+          onImported(targetBatch, sessionId);
+          if (!result.failed) {
+            onMessage(
+              `文件夹导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
+            );
+          }
+        },
+        undo: async () => {
+          await undoUploadSession(sessionId, uploadedPaths);
+        },
+      });
     } catch (e) {
       setFolderError(e instanceof Error ? e.message : "文件夹导入失败");
     } finally {

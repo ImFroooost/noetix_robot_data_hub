@@ -37,7 +37,7 @@
 
 ![上传记录](/help/images/ui-upload-session.png)
 
-`xxx.bvh` 与带 `_Skeleton0` 的文件会合成一个单元。新后缀按扩展名建格式目录。机器人 CSV 可手填帧率，人体不必。
+同名文件属于同一数据单元；文件名里的 `skeleton` / `rigid body` / `marker` 及后面内容会去掉后再归组。新后缀按扩展名建格式目录。机器人 CSV 可手填帧率，人体不必。
 
 ---
 
