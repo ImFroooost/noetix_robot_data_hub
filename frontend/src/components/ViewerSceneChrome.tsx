@@ -174,28 +174,77 @@ export function useViewerLook() {
   return useMemo(() => viewerLook(theme), [theme]);
 }
 
+function GroundFloor({ color }: { color: string }) {
+  const ref = useRef<THREE.Mesh>(null);
+  useFrame(({ camera }) => {
+    const floor = ref.current;
+    if (!floor) return;
+    floor.position.x = camera.position.x;
+    floor.position.z = camera.position.z;
+  });
+  return (
+    <mesh ref={ref} rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.02, 0]} renderOrder={-1}>
+      <planeGeometry args={[240, 240]} />
+      <meshBasicMaterial
+        color={color}
+        polygonOffset
+        polygonOffsetFactor={2}
+        polygonOffsetUnits={2}
+      />
+    </mesh>
+  );
+}
+
+/** 近裁剪面切到地面时，斜视角下会缺一块网格；把 near/far 收在相机距离附近。 */
+function CameraClip() {
+  const camera = useThree((state) => state.camera) as THREE.PerspectiveCamera;
+  useFrame(() => {
+    const dist = Math.max(camera.position.length(), 0.5);
+    const nextNear = Math.min(0.08, Math.max(0.01, dist / 2500));
+    const nextFar = Math.max(240, dist * 30);
+    if (Math.abs(camera.near - nextNear) > 1e-4 || Math.abs(camera.far - nextFar) > 1) {
+      camera.near = nextNear;
+      camera.far = nextFar;
+      camera.updateProjectionMatrix();
+    }
+  });
+  return null;
+}
+
 export function ViewerSceneChrome({ hemisphere = false }: { hemisphere?: boolean }) {
   const look = useViewerLook();
+  const gridRef = useRef<THREE.Mesh>(null);
+  useEffect(() => {
+    const mat = gridRef.current?.material as THREE.Material | undefined;
+    if (!mat) return;
+    mat.depthWrite = false;
+    mat.polygonOffset = true;
+    mat.polygonOffsetFactor = -1;
+    mat.polygonOffsetUnits = -1;
+  }, [look]);
   return (
     <>
       <color attach="background" args={[look.background]} />
+      <CameraClip />
       <ambientLight intensity={look.ambient} />
       <directionalLight position={[3, 5, 2]} intensity={look.directional} />
       {hemisphere ? <hemisphereLight args={[look.hemiSky, look.hemiGround, 0.4]} /> : null}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.002, 0]}>
-        <planeGeometry args={[24, 24]} />
-        <meshBasicMaterial color={look.hemiGround} />
-      </mesh>
+      <GroundFloor color={look.hemiGround} />
       <Grid
-        args={[20, 20]}
+        ref={gridRef}
+        args={[12, 12]}
+        side={THREE.DoubleSide}
+        followCamera
+        infiniteGrid
         cellSize={0.5}
         cellThickness={0.7}
         sectionSize={1}
         sectionThickness={1.15}
         cellColor={look.cell}
         sectionColor={look.section}
-        fadeDistance={48}
-        infiniteGrid
+        fadeDistance={24}
+        fadeStrength={1.35}
+        renderOrder={1}
       />
     </>
   );

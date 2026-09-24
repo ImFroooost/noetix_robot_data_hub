@@ -8,6 +8,17 @@ import { INDEX_UPDATED_EVENT } from "../storageOverviewCache";
 import { useUndo } from "../undo/UndoContext";
 import { zipRelFiles, type RelFile } from "../utils/folderUpload";
 
+function defaultDescriptionFile(instance: ModelInstance | null) {
+  if (!instance) return null;
+  const rel = String(instance.meta?.default_description_file || "").trim();
+  if (!rel) return null;
+  return (
+    instance.files.find(
+      (item) => item.kind === "standard_description" && item.relative_path === rel
+    ) || null
+  );
+}
+
 const KIND_LABEL: Record<string, string> = {
   fbx: "FBX",
   bvh: "BVH",
@@ -64,6 +75,12 @@ export function RepositoryModelsPage() {
     selected?.files.find((item) => item.id === previewId) || null;
 
   useEffect(() => {
+    const fallback = defaultDescriptionFile(selected);
+    if (fallback) {
+      setKind("standard_description");
+      setPreviewId(fallback.id);
+      return;
+    }
     const preferred =
       (selected &&
         kinds.find((item) => selected.files.some((file) => file.kind === item))) ||
@@ -199,7 +216,13 @@ export function RepositoryModelsPage() {
               type="button"
               key={instance.key}
               className={selected?.key === instance.key ? "active" : "secondary"}
-              onClick={() => setSelectedKey(instance.key)}
+              onClick={() => {
+                setSelectedKey(instance.key);
+                const fallback = defaultDescriptionFile(instance);
+                if (!fallback) return;
+                setKind("standard_description");
+                setPreviewId(fallback.id);
+              }}
             >
               {instance.name}
               <small>{instance.files.length} 个文件</small>
@@ -254,7 +277,11 @@ export function RepositoryModelsPage() {
                         setKind(item);
                         setFile(null);
                         setFolderFiles([]);
-                        setPreviewId(null);
+                        setPreviewId(
+                          item === "standard_description"
+                            ? defaultDescriptionFile(selected)?.id || null
+                            : null
+                        );
                       }}
                     >
                       {KIND_LABEL[item] || item}

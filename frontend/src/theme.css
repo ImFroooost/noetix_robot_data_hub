@@ -158,6 +158,14 @@ body {
   background: var(--viewer-bg);
 }
 
+.storage-preview-section:not(.is-fullscreen) .animation-format-canvas.viewer-panel {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  min-height: 460px;
+  max-height: 68vh;
+}
+
 .table tr:hover td,
 .table tr:hover td {
   background: var(--hover-wash);
@@ -541,4 +549,93 @@ body {
 .browse-folder-row.active,
 .browse-folder-row.active:hover {
   background: color-mix(in srgb, var(--accent) 28%, var(--bg-elev));
+}
+
+.facet-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.facet-pop input[type="checkbox"],
+.facet-check input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  min-height: 0;
+  max-width: 13px;
+  margin: 0;
+  padding: 0;
+  flex: none;
+  border-radius: 2px;
+}
+
+button.facet-twist,
+button.browse-picker-head,
+button.browse-picker-option,
+button.facet-chip {
+  flex: none;
+  min-height: 0;
+  min-width: 0;
+}
+
+button.browse-picker-option {
+  width: 100%;
+  height: auto;
+  padding: 3px 10px;
+  line-height: 1.4;
+  font-size: 1rem;
+}
+
+.browse-picker-menu {
+  right: 0;
+  left: auto;
+  width: max-content;
+  min-width: 0;
+  max-width: 16rem;
+  max-height: 9.5rem;
+  padding: 2px;
+  background: var(--bg-elev);
+}
+
+[data-theme="dark"] button.facet-chip,
+[data-theme="dark"] button.browse-picker-head,
+[data-theme="dark"] button.browse-picker-option,
+[data-theme="dark"] button.facet-twist,
+[data-theme="dark"] button.facet-clear,
+[data-theme="dark"] .facet-check,
+[data-theme="dark"] .facet-title,
+[data-theme="dark"] .browse-picker-label,
+[data-theme="dark"] .browse-picker-value,
+[data-theme="dark"] .facet-summary,
+[data-theme="dark"] .facet-chevron,
+[data-theme="dark"] .browse-picker-chevron {
+  color: var(--text);
+}
+
+[data-theme="dark"] .facet-title,
+[data-theme="dark"] .facet-summary,
+[data-theme="dark"] .facet-chevron,
+[data-theme="dark"] .browse-picker-label,
+[data-theme="dark"] .browse-picker-chevron,
+[data-theme="dark"] button.facet-twist {
+  color: var(--muted);
+}
+
+[data-theme="dark"] button.facet-chip.is-picked,
+[data-theme="dark"] button.facet-chip.is-open,
+[data-theme="dark"] .browse-picker-option.is-current {
+  color: var(--text);
+}
+
+[data-theme="dark"] .facet-pop,
+[data-theme="dark"] .browse-picker-menu {
+  background: var(--bg-elev);
+  color: var(--text);
 }

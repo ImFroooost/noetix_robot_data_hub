@@ -43,6 +43,7 @@ export function Layout() {
   const [loadingActive, setLoadingActive] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState("");
   const [searchParams] = useSearchParams();
+  const onHub = location.pathname === "/";
   const currentMode = searchParams.get("mode") || "browse";
 
   useEffect(() => {
@@ -164,21 +165,21 @@ export function Layout() {
             </button>
           </div>
           <nav className="sidebar-nav">
-            <SideLink to="/?mode=browse" icon={<IconBrowse />} onClick={() => setNavOpen(false)} activeMode={currentMode === "browse"}>
+            <SideLink to="/?mode=browse" icon={<IconBrowse />} onClick={() => setNavOpen(false)} activeMode={onHub && currentMode === "browse"}>
               浏览
             </SideLink>
             {hasPerm("upload") && (
-              <SideLink to="/?mode=upload" icon={<IconUpload />} onClick={() => setNavOpen(false)} activeMode={currentMode === "upload"}>
+              <SideLink to="/?mode=upload" icon={<IconUpload />} onClick={() => setNavOpen(false)} activeMode={onHub && currentMode === "upload"}>
                 上传
               </SideLink>
             )}
             {hasPerm("annotate") && (
-              <SideLink to="/?mode=annotate" icon={<IconAnnotate />} onClick={() => setNavOpen(false)} activeMode={currentMode === "annotate"}>
+              <SideLink to="/?mode=annotate" icon={<IconAnnotate />} onClick={() => setNavOpen(false)} activeMode={onHub && currentMode === "annotate"}>
                 标注
               </SideLink>
             )}
             {hasPerm("manage_data") && (
-              <SideLink to="/?mode=manage" icon={<IconManage />} onClick={() => setNavOpen(false)} activeMode={currentMode === "manage"}>
+              <SideLink to="/?mode=manage" icon={<IconManage />} onClick={() => setNavOpen(false)} activeMode={onHub && currentMode === "manage"}>
                 数据管理
               </SideLink>
             )}
@@ -299,7 +300,7 @@ function SideLink({
       to={to}
       title={label}
       onClick={onClick}
-      className={() => (activeMode ? "is-active" : undefined)}
+      className={({ isActive }) => ((activeMode !== undefined ? activeMode : isActive) ? "is-active" : undefined)}
     >
       {icon}
       <span>{children}</span>

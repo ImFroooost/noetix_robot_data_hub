@@ -198,6 +198,10 @@ def _sync_scheme_code_prefixes_to_sort_order(db: Session) -> None:
     rows = list_schemes(db)
     if not rows:
         return
+    # code_prefix is unique. Assign placeholders first so swapping A↔B does not collide.
+    for idx, row in enumerate(rows):
+        row.code_prefix = f"~{idx}"
+    db.flush()
     for idx, row in enumerate(rows):
         row.code_prefix = _letter_for_scheme_index(idx)
     db.flush()

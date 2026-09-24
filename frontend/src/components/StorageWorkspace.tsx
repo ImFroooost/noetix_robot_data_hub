@@ -3240,6 +3240,265 @@ function sortBatchNames(names: string[], units: StorageUnit[], sortMode: string)
   );
 }
 
+function nodeCovers(ancestor: TaxonomyNode, tag: TaxonomyNode) {
+  if (ancestor.id === tag.id) return true;
+  const base = ancestor.path.endsWith("/") ? ancestor.path : `${ancestor.path}/`;
+  return tag.path === ancestor.path || tag.path.startsWith(base);
+}
+
+function unitMatchesSchemeFilters(
+  unit: StorageUnit,
+  batch: { taxonomy_tag_ids?: Record<string, number> } | undefined,
+  filters: Record<string, number[]>,
+  nodes: TaxonomyNode[]
+) {
+  for (const [scheme, ids] of Object.entries(filters)) {
+    if (!ids.length) continue;
+    const tagId = unit.taxonomy_tag_ids?.[scheme] ?? batch?.taxonomy_tag_ids?.[scheme];
+    const tag = nodes.find((node) => node.id === tagId);
+    const selected = nodes.filter((node) => ids.includes(node.id));
+    if (!tag || !selected.some((node) => nodeCovers(node, tag))) return false;
+  }
+  return true;
+}
+
+type FacetNode = { id: string; name: string; children?: FacetNode[] };
+
+function fileModalityKey(file: StorageFile) {
+  return file.modality === "motion"
+    ? `motion:${resolveMotionKind(file.annotation?.motion_kind)}`
+    : file.modality;
+}
+
+function fileMatchesSubject(file: StorageFile, selected: string[]) {
+  const ontology = file.ontology;
+  const instance =
+    ontology === "robot"
+      ? String(file.robot_style || file.annotation?.robot_style || "")
+      : String(file.annotation?.human_model || "");
+  const version =
+    ontology === "robot"
+      ? String(file.annotation?.robot_version || "")
+      : String(file.annotation?.human_model_file || "");
+  return selected.some((id) => {
+    const [onto, inst, ver] = id.split("|");
+    if (onto !== ontology) return false;
+    if (!inst) return true;
+    if (inst !== instance) return false;
+    if (!ver) return true;
+    return ver === version || version.endsWith(ver) || ver.endsWith(version);
+  });
+}
+
+function unitMatchesExtraFilters(unit: StorageUnit, checks: Record<string, string[]>) {
+  for (const [key, ids] of Object.entries(checks)) {
+    if (!ids.length) continue;
+    if (key === "uploader") {
+      const have = new Set<string>();
+      unit.uploaders.forEach((item) => have.add(String(item.id)));
+      unit.files.forEach((file) => {
+        if (file.uploader) have.add(String(file.uploader.id));
+      });
+      if (!ids.some((id) => have.has(id))) return false;
+    } else if (key === "format") {
+      const have = new Set(unit.files.map((file) => (file.format || "").toLowerCase()));
+      if (!ids.some((id) => have.has(id.toLowerCase()))) return false;
+    } else if (key === "modality") {
+      const have = new Set(unit.files.map(fileModalityKey));
+      if (!ids.some((id) => have.has(id))) return false;
+    } else if (key === "subject") {
+      if (!unit.files.some((file) => fileMatchesSubject(file, ids))) return false;
+    }
+  }
+  return true;
+}
+
+function subjectFacetNodes(instances: ModelInstance[]): FacetNode[] {
+  const branch = (ontology: "human" | "robot", label: string): FacetNode => ({
+    id: ontology,
+    name: label,
+    children: instances
+      .filter((item) => item.ontology === ontology)
+      .map((item) => {
+        const versions =
+          ontology === "robot" ? robotDescriptionVersions(item) : humanModelFiles(item);
+        return {
+          id: `${ontology}|${item.name}`,
+          name: item.name,
+          children: versions.map((file) => ({
+            id: `${ontology}|${item.name}|${file.relative_path}`,
+            name: file.name,
+          })),
+        };
+      }),
+  });
+  return [branch("human", "人体"), branch("robot", "机器人")];
+}
+
+function StringCheckTree({
+  nodes,
+  checked,
+  onToggle,
+}: {
+  nodes: FacetNode[];
+  checked: string[];
+  onToggle: (id: string) => void;
+}) {
+  const [open, setOpen] = useState<Record<string, boolean>>({});
+  const renderNode = (node: FacetNode, depth: number) => {
+    const kids = node.children || [];
+    const expanded = open[node.id] === true;
+    return (
+      <div key={node.id}>
+        <label className="facet-check" style={{ paddingLeft: depth * 16 }}>
+          {kids.length ? (
+            <button
+              type="button"
+              className="facet-twist"
+              aria-label={expanded ? "收起" : "展开"}
+              onClick={(event) => {
+                event.preventDefault();
+                setOpen((current) => ({ ...current, [node.id]: !expanded }));
+              }}
+            >
+              {expanded ? "▾" : "▸"}
+            </button>
+          ) : (
+            <span className="facet-twist" />
+          )}
+          <input type="checkbox" checked={checked.includes(node.id)} onChange={() => onToggle(node.id)} />
+          <span>{node.name}</span>
+        </label>
+        {kids.length > 0 && expanded && kids.map((child) => renderNode(child, depth + 1))}
+      </div>
+    );
+  };
+  if (!nodes.length) return <div className="muted">暂无可选项</div>;
+  return <div className="facet-tree">{nodes.map((node) => renderNode(node, 0))}</div>;
+}
+
+function facetNameSummary(ids: string[], nodes: FacetNode[]) {
+  const names: string[] = [];
+  const walk = (list: FacetNode[]) => {
+    list.forEach((node) => {
+      if (ids.includes(node.id)) names.push(node.name);
+      if (node.children) walk(node.children);
+    });
+  };
+  walk(nodes);
+  if (!names.length) return "";
+  if (names.length === 1) return names[0];
+  return `${names[0]} +${names.length - 1}`;
+}
+
+function filterSummary(ids: number[], nodes: TaxonomyNode[]) {
+  const names = ids
+    .map((id) => nodes.find((node) => node.id === id)?.name)
+    .filter((name): name is string => !!name);
+  if (!names.length) return "";
+  if (names.length === 1) return names[0];
+  return `${names[0]} +${names.length - 1}`;
+}
+
+function FilterCheckTree({
+  nodes,
+  checked,
+  onToggle,
+}: {
+  nodes: TaxonomyNode[];
+  checked: number[];
+  onToggle: (id: number) => void;
+}) {
+  const [open, setOpen] = useState<Record<number, boolean>>({});
+  const children = new Map<number | null, TaxonomyNode[]>();
+  nodes.forEach((node) => {
+    const list = children.get(node.parent_id) || [];
+    list.push(node);
+    children.set(node.parent_id, list);
+  });
+  children.forEach((list) =>
+    list.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name, "zh"))
+  );
+  const roots = children.get(null) || [];
+  const top = roots.length === 1 ? children.get(roots[0].id) || [] : roots;
+
+  const renderNode = (node: TaxonomyNode, depth: number) => {
+    const kids = children.get(node.id) || [];
+    const expanded = open[node.id] === true;
+    return (
+      <div key={node.id}>
+        <label className="facet-check" style={{ paddingLeft: depth * 16 }}>
+          {kids.length ? (
+            <button
+              type="button"
+              className="facet-twist"
+              aria-label={expanded ? "收起" : "展开"}
+              onClick={(event) => {
+                event.preventDefault();
+                setOpen((current) => ({ ...current, [node.id]: !expanded }));
+              }}
+            >
+              {expanded ? "▾" : "▸"}
+            </button>
+          ) : (
+            <span className="facet-twist" />
+          )}
+          <input
+            type="checkbox"
+            checked={checked.includes(node.id)}
+            onChange={() => onToggle(node.id)}
+          />
+          <span>{node.name}</span>
+        </label>
+        {kids.length > 0 && expanded && kids.map((child) => renderNode(child, depth + 1))}
+      </div>
+    );
+  };
+
+  if (!nodes.length) return <div className="muted">该维度暂无分类</div>;
+  return <div className="facet-tree">{top.map((node) => renderNode(node, 0))}</div>;
+}
+
+function BrowsePicker({
+  label,
+  value,
+  open,
+  options,
+  onToggle,
+  onPick,
+}: {
+  label: string;
+  value: string;
+  open: boolean;
+  options: { id: string; label: string }[];
+  onToggle: () => void;
+  onPick: (id: string) => void;
+}) {
+  return (
+    <div className={`browse-picker${open ? " is-open" : ""}`}>
+      <button type="button" className="browse-picker-head" onClick={onToggle}>
+        <span className="browse-picker-label">{label}</span>
+        <span className="browse-picker-value">{value}</span>
+        <span className="browse-picker-chevron">{open ? "▴" : "▾"}</span>
+      </button>
+      {open && (
+        <div className="browse-picker-menu">
+          {options.map((option) => (
+            <button
+              type="button"
+              key={option.id}
+              className={`browse-picker-option${option.label === value ? " is-current" : ""}`}
+              onClick={() => onPick(option.id)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function compareByStorageSort<T>(
   left: T,
   right: T,
@@ -3274,6 +3533,21 @@ export function StorageWorkspace({
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [nodes, setNodes] = useState<TaxonomyNode[]>([]);
   const [mode, setMode] = useState("folder");
+  const [openFilterScheme, setOpenFilterScheme] = useState<string | null>(null);
+  const [filterNodeIds, setFilterNodeIds] = useState<Record<string, number[]>>({});
+  const [extraChecks, setExtraChecks] = useState<Record<string, string[]>>({});
+  const [modelInstances, setModelInstances] = useState<ModelInstance[]>([]);
+  const [browseMenu, setBrowseMenu] = useState<"standard" | "sort" | null>(null);
+  useEffect(() => {
+    if (!browseMenu && !openFilterScheme) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const node = event.target instanceof Element ? event.target : null;
+      if (browseMenu && !node?.closest(".browse-picker")) setBrowseMenu(null);
+      if (openFilterScheme && !node?.closest(".facet-item")) setOpenFilterScheme(null);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [browseMenu, openFilterScheme]);
   const [tagId, setTagId] = useState<number | null>(null);
   const [tagExact, setTagExact] = useState(false);
   const selectTag = (id: number | null, exact = false) => {
@@ -3375,13 +3649,44 @@ export function StorageWorkspace({
   };
 
   useEffect(() => {
-    Promise.all([api.listTaxonomySchemes(), api.listTaxonomies()])
-      .then(([schemeRows, nodeRows]) => {
-        setSchemes(schemeRows);
-        setNodes(nodeRows);
+    let cancelled = false;
+    const loadTaxonomies = () => {
+      Promise.all([api.listTaxonomySchemes(), api.listTaxonomies()])
+        .then(([schemeRows, nodeRows]) => {
+          if (cancelled) return;
+          setSchemes(
+            [...schemeRows].sort(
+              (a, b) =>
+                (a.sort_order ?? 0) - (b.sort_order ?? 0) ||
+                a.key.localeCompare(b.key)
+            )
+          );
+          setNodes(nodeRows);
+        })
+        .catch(() => undefined);
+    };
+    loadTaxonomies();
+    const onFocus = () => loadTaxonomies();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (variant === "upload") return;
+    let cancelled = false;
+    api
+      .storageModels()
+      .then((overview) => {
+        if (!cancelled) setModelInstances(overview.instances);
       })
       .catch(() => undefined);
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [variant]);
 
   useEffect(() => {
     void load(true, false);
@@ -3419,12 +3724,33 @@ export function StorageWorkspace({
         annotation: {},
       }));
     const batches = [...data.batches, ...placeholderBatches]
-      .map((batch) => ({ ...batch, units: [...batch.units].sort(compareUnits) }))
+      .map((batch) => {
+        const units = batch.units
+          .filter(
+            (unit) =>
+              unitMatchesSchemeFilters(unit, batch, filterNodeIds, nodes) &&
+              unitMatchesExtraFilters(unit, extraChecks)
+          )
+          .sort(compareUnits);
+        return {
+          ...batch,
+          units,
+          unit_count: units.length,
+          file_count: units.reduce((sum, unit) => sum + unit.file_count, 0),
+        };
+      })
+      .filter((batch) => batch.units.length > 0 || extraBatches.includes(batch.name))
       .sort((a, b) =>
         compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes)
       );
-    return { ...data, batches };
-  }, [data, extraBatches, sortMode]);
+    return { ...data, batches, units: data.units.filter((unit) => {
+      const batch = data.batches.find((item) => item.name === unit.batch);
+      return (
+        unitMatchesSchemeFilters(unit, batch, filterNodeIds, nodes) &&
+        unitMatchesExtraFilters(unit, extraChecks)
+      );
+    }) };
+  }, [data, extraBatches, sortMode, filterNodeIds, nodes, extraChecks]);
 
   const currentNodes = nodes.filter((node) => node.scheme === mode);
 
@@ -3765,56 +4091,126 @@ export function StorageWorkspace({
       )}
       {variant !== "upload" && (
       <div className="storage-toolbar card">
-        {!structureOnly && (
-          <div className="storage-filter-line">
-            <span className="muted">分类标准：</span>
-            <button
-              type="button"
-              className={mode === "folder" ? "active" : "secondary"}
-              onClick={() => {
-                setMode("folder");
-                selectTag(null);
-              }}
-            >
-              存储结构
-            </button>
-            <button
-              type="button"
-              className={mode === "uploader" ? "active" : "secondary"}
-              onClick={() => {
-                setMode("uploader");
-                selectTag(null);
-              }}
-            >
-              上传用户
-            </button>
-            {schemes.map((scheme) => (
+        <div className="facet-block">
+          <div className="facet-title">
+            <span>筛选维度</span>
+            {(Object.values(filterNodeIds).some((ids) => ids.length > 0) ||
+              Object.values(extraChecks).some((ids) => ids.length > 0)) && (
               <button
                 type="button"
-                key={scheme.key}
-                className={mode === scheme.key ? "active" : "secondary"}
+                className="facet-clear"
                 onClick={() => {
-                  setMode(scheme.key);
-                  selectTag(null);
+                  setFilterNodeIds({});
+                  setExtraChecks({});
                 }}
               >
-                {taxonomySchemeLabel(scheme.key, schemes)}
+                清除
               </button>
-            ))}
+            )}
           </div>
-        )}
-        <div className="storage-filter-line">
-          <span className="muted">排序方式：</span>
-          {STORAGE_SORT_OPTIONS.map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              className={sortMode === value ? "active" : "secondary"}
-              onClick={() => setSortMode(value)}
-            >
-              {label}
-            </button>
-          ))}
+          <div className="facet-list">
+            {(() => {
+              const formatNodes: FacetNode[] = [
+                ...new Set(
+                  (data?.files || [])
+                    .map((file) => (file.format || "").toLowerCase())
+                    .filter(Boolean)
+                ),
+              ]
+                .sort((a, b) => a.localeCompare(b))
+                .map((format) => ({ id: format, name: format }));
+              const modalityNodes: FacetNode[] = matrixRows().map((row) => ({
+                id: row.motionKind ? `${row.modality}:${row.motionKind}` : row.modality,
+                name: row.label,
+              }));
+              const uploaderNodes: FacetNode[] = (data?.uploaders || []).map((item) => ({
+                id: String(item.id),
+                name: item.username,
+              }));
+              const extraFacets: { key: string; label: string; nodes: FacetNode[] }[] = [
+                { key: "uploader", label: "上传用户", nodes: uploaderNodes },
+                { key: "subject", label: "数据主体", nodes: subjectFacetNodes(modelInstances) },
+                { key: "format", label: "数据格式", nodes: formatNodes },
+                { key: "modality", label: "数据模态", nodes: modalityNodes },
+              ];
+              return extraFacets.map((facet) => {
+                const picked = extraChecks[facet.key] || [];
+                const open = openFilterScheme === facet.key;
+                const summary = facetNameSummary(picked, facet.nodes);
+                return (
+                  <div className={`facet-item${open ? " is-open" : ""}`} key={facet.key}>
+                    <button
+                      type="button"
+                      className={`facet-chip${open ? " is-open" : ""}${picked.length ? " is-picked" : ""}`}
+                      onClick={() =>
+                        setOpenFilterScheme((current) => (current === facet.key ? null : facet.key))
+                      }
+                    >
+                      <span>{facet.label}</span>
+                      {summary && <span className="facet-summary">{summary}</span>}
+                      <span className="facet-chevron">{open ? "▴" : "▾"}</span>
+                    </button>
+                    {open && (
+                      <div className="facet-pop">
+                        <StringCheckTree
+                          nodes={facet.nodes}
+                          checked={picked}
+                          onToggle={(id) =>
+                            setExtraChecks((current) => {
+                              const list = current[facet.key] || [];
+                              const next = list.includes(id)
+                                ? list.filter((item) => item !== id)
+                                : [...list, id];
+                              return { ...current, [facet.key]: next };
+                            })
+                          }
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              });
+            })()}
+            {schemes.map((scheme) => {
+              const picked = filterNodeIds[scheme.key] || [];
+              const open = openFilterScheme === scheme.key;
+              const summary = filterSummary(picked, nodes);
+              return (
+                <div className={`facet-item${open ? " is-open" : ""}`} key={scheme.key}>
+                  <button
+                    type="button"
+                    className={`facet-chip${open ? " is-open" : ""}${picked.length ? " is-picked" : ""}`}
+                    onClick={() =>
+                      setOpenFilterScheme((current) => (current === scheme.key ? null : scheme.key))
+                    }
+                  >
+                    <span>{taxonomySchemeLabel(scheme.key, schemes)}</span>
+                    {summary && <span className="facet-summary">{summary}</span>}
+                    <span className="facet-chevron">{open ? "▴" : "▾"}</span>
+                  </button>
+                  {open && (
+                    <div className="facet-pop">
+                      <FilterCheckTree
+                        nodes={nodes.filter((node) => node.scheme === scheme.key)}
+                        checked={picked}
+                        onToggle={(id) =>
+                          setFilterNodeIds((current) => {
+                            const list = current[scheme.key] || [];
+                            const next = list.includes(id)
+                              ? list.filter((item) => item !== id)
+                              : [...list, id];
+                            return { ...current, [scheme.key]: next };
+                          })
+                        }
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="storage-search-line">
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -3822,26 +4218,9 @@ export function StorageWorkspace({
               if (e.key === "Enter") void load(false);
             }}
             placeholder="搜索批次或数据单元"
-            style={{ marginLeft: "auto", minWidth: 210 }}
           />
           <button type="button" onClick={() => void load(false)}>搜索</button>
         </div>
-        {mode !== "folder" && mode !== "uploader" && mode !== "upload_order" && (
-          <div className="storage-filter-line">
-            <span className="muted">{taxonomySchemeLabel(mode, schemes)}：</span>
-            <select
-              value={tagId ?? ""}
-              onChange={(e) => selectTag(e.target.value ? Number(e.target.value) : null)}
-            >
-              <option value="">全部</option>
-              {currentNodes.map((node) => (
-                <option key={node.id} value={node.id}>
-                  {node.path}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
       </div>
       )}
 
@@ -3850,13 +4229,50 @@ export function StorageWorkspace({
 
       <div className="storage-workspace">
         <aside className="card storage-left-pane">
+          {variant !== "upload" && (
+            <div className="browse-pickers">
+              <BrowsePicker
+                label="分类标准"
+                value={
+                  mode === "folder"
+                    ? "存储结构"
+                    : mode === "uploader"
+                      ? "上传用户"
+                      : taxonomySchemeLabel(mode, schemes)
+                }
+                open={browseMenu === "standard"}
+                options={[
+                  { id: "folder", label: "存储结构" },
+                  { id: "uploader", label: "上传用户" },
+                  ...schemes.map((scheme) => ({
+                    id: scheme.key,
+                    label: taxonomySchemeLabel(scheme.key, schemes),
+                  })),
+                ]}
+                onToggle={() => setBrowseMenu((current) => (current === "standard" ? null : "standard"))}
+                onPick={(id) => {
+                  setMode(id);
+                  selectTag(null);
+                  setBrowseMenu(null);
+                }}
+              />
+              <BrowsePicker
+                label="排序方式"
+                value={STORAGE_SORT_OPTIONS.find(([value]) => value === sortMode)?.[1] || sortMode}
+                open={browseMenu === "sort"}
+                options={STORAGE_SORT_OPTIONS.map(([value, label]) => ({ id: value, label }))}
+                onToggle={() => setBrowseMenu((current) => (current === "sort" ? null : "sort"))}
+                onPick={(id) => {
+                  setSortMode(id);
+                  setBrowseMenu(null);
+                }}
+              />
+            </div>
+          )}
           {variant === "upload" && (
             <div className="storage-upload-browse">
               <div className="storage-upload-dock-title">
-                <strong>查看与搜索</strong>
-                <span className="muted">
-                  {mode === "upload_order" ? "上传顺序" : "存储结构"}
-                </span>
+                <strong>我的上传</strong>
               </div>
               <div className="storage-filter-line">
                 <span className="muted">列表：</span>
@@ -3916,7 +4332,7 @@ export function StorageWorkspace({
               </h3>
               <TaxonomyTreePanel
                 nodes={currentNodes}
-                units={classificationUnits}
+                units={displayData?.units || classificationUnits}
                 sortMode={sortMode}
                 selectedId={tagId}
                 selectedExact={tagExact}
@@ -3944,7 +4360,7 @@ export function StorageWorkspace({
               <h3 style={{ marginTop: 0 }}>上传用户</h3>
               <UploaderTreePanel
                 uploaders={data?.uploaders || []}
-                units={data?.units || []}
+                units={displayData?.units || []}
                 sortMode={sortMode}
                 selectedId={tagId}
                 selectedKey={selectedKey}
