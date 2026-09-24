@@ -87,6 +87,7 @@ type FolderImportDraft = {
   fps: string;
   motionKind: MotionKind;
   actions: Record<string, FolderAction>;
+  replace: boolean;
 };
 
 const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
@@ -103,6 +104,10 @@ function normalizeUnitStem(name: string) {
 
 function fileUnitName(file: RelFile) {
   const stem = file.file.name.replace(/\.[^.]+$/, "") || file.file.name;
+  const dir = file.path.split("/").slice(0, -1).join("/");
+  if (dir) {
+    return normalizeUnitStem((dir + "/" + stem).replace(/\//g, "_")) || (dir + "_" + stem).replace(/\//g, "_");
+  }
   return normalizeUnitStem(stem);
 }
 
@@ -226,6 +231,7 @@ export function FolderBatchImport({
   const [folderResult, setFolderResult] = useState<StorageFolderUploadResult | null>(null);
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderError, setFolderError] = useState("");
+  const [fileFilter, setFileFilter] = useState<"all" | "new" | "skipped">("all");
   const [localZipPath, setLocalZipPath] = useState("");
   const [draggingFolder, setDraggingFolder] = useState(false);
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
@@ -358,6 +364,7 @@ export function FolderBatchImport({
       fps: "30",
       motionKind: DEFAULT_MOTION_KIND,
       actions: {},
+      replace: false,
     });
   };
 
@@ -504,30 +511,56 @@ export function FolderBatchImport({
         : folderDraft.batchName.trim();
     const existingUnits =
       overview?.batches.find((item) => item.name === targetBatch)?.units || [];
-    const seenUnits = new Set<string>();
+    const seenUnits = new Map<string, string>();
     return folderDraft.files.map((relFile) => {
-      const unitName = fileUnitName(relFile);
-      const matchedName =
-        [...seenUnits].find((name) => stemsSameUnit(name, unitName)) || unitName;
-      const duplicate = seenUnits.has(matchedName);
-      seenUnits.add(matchedName);
-      const existingConflict = matchExistingUnit(unitName, existingUnits)
-        ?.files.some(
-          (item) =>
-            item.ontology === folderDraft.ontology &&
-            item.modality === folderDraft.modality &&
-            item.channel ===
-              (folderDraft.modality === "fpv_video" ? folderDraft.channel : "") &&
-            item.format === (fileExtension(relFile) || folderDraft.format) &&
-            item.name === relFile.file.name
-        );
+      const baseUnitName = fileUnitName(relFile);
+      let unitName = baseUnitName;
+      let duplicate = false;
+      const prev = [...seenUnits.keys()].find((name) => stemsSameUnit(name, baseUnitName));
+      if (prev) {
+        const prevDir = seenUnits.get(prev) || "";
+        const curDir = relFile.path.split("/").slice(0, -1).join("/");
+        if (prevDir && curDir && prevDir !== curDir) {
+          const parentDir = curDir.split("/").pop() || "";
+          unitName = parentDir ? `${parentDir}_${baseUnitName}` : baseUnitName;
+          const prevParent = prevDir.split("/").pop() || "";
+          if (prevParent && prevParent !== parentDir) {
+            const renamed = `${prevParent}_${prev}`;
+            seenUnits.delete(prev);
+            seenUnits.set(renamed, prevDir);
+          }
+        } else {
+          duplicate = true;
+        }
+      }
+      seenUnits.set(unitName, relFile.path.split("/").slice(0, -1).join("/"));
+      const existingUnit = matchExistingUnit(unitName, existingUnits);
+      const newRobotStyle = folderDraft.ontology === "robot" ? folderDraft.robotStyle.trim() : "";
+      const existingFile = existingUnit?.files.find(
+        (item) =>
+          item.ontology === folderDraft.ontology &&
+          item.modality === folderDraft.modality &&
+          item.channel ===
+            (folderDraft.modality === "fpv_video" ? folderDraft.channel : "") &&
+          item.format === (fileExtension(relFile) || folderDraft.format) &&
+          item.name === relFile.file.name &&
+          String(item.robot_style || item.annotation?.robot_style || "").trim() === newRobotStyle
+      );
+      const existingRobotStyle = existingFile ? String(existingFile.robot_style || existingFile.annotation?.robot_style || "").trim() : "";
+      const styleDiffers =
+        folderDraft.ontology === "robot" &&
+        !!newRobotStyle &&
+        !!existingRobotStyle &&
+        newRobotStyle !== existingRobotStyle;
+      const existingConflict = !!existingFile;
       const defaultAction: FolderAction = duplicate || existingConflict ? "skip" : "upload";
       return {
         relFile,
         unitName,
         duplicate,
-        existingConflict: !!existingConflict,
-        action: folderDraft.actions[relFile.path] || defaultAction,
+        existingConflict,
+        styleDiffers,
+        action: folderDraft.actions[relFile.path] || (folderDraft.replace && existingConflict ? "replace" : defaultAction),
       };
     });
   }, [folderDraft, overview]);
@@ -607,6 +640,11 @@ export function FolderBatchImport({
         })
       );
       form.set("taxonomy_tag_ids", JSON.stringify(taxonomyPayload));
+      const subPaths = folderRows.map((row) => {
+        const dir = row.relFile.path.split("/").slice(0, -1).join("/");
+        return dir || "";
+      });
+      form.set("sub_paths", JSON.stringify(subPaths));
       folderRows.forEach((row) =>
         form.append("files", row.relFile.file, row.relFile.file.name)
       );
@@ -1004,27 +1042,87 @@ export function FolderBatchImport({
             {folderExtensions.length > 0 && (
               <div className="storage-folder-format-warning">
                 {folderDraft.format.trim()
-                  ? `无后缀的文件将按“${folderDraft.format.trim()}”归档；有后缀的文件仍按各自后缀入库（${folderExtensions.join("、")}）。`
+                  ? `无后缀的文件将按"${folderDraft.format.trim()}"归档；有后缀的文件仍按各自后缀入库（${folderExtensions.join("、")}）。`
                   : `将按文件后缀分别入库：${folderExtensions.join("、")}。遇到尚未出现过的后缀会自动作为新格式。`}
               </div>
+            )}
+
+            {folderDraft.batchChoice === "existing" && (
+              <label className="row" style={{ gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={folderDraft.replace}
+                  onChange={(event) =>
+                    updateFolderDraft({ replace: event.target.checked, actions: {} })
+                  }
+                />
+                同路径文件已存在则替换（默认跳过）
+              </label>
             )}
 
             <div className="storage-folder-summary">
               将导入 {folderRows.filter((row) => row.action !== "skip").length} 个，
               跳过 {folderRows.filter((row) => row.action === "skip").length} 个
+              {(() => {
+                const dupCount = folderRows.filter((r) => r.duplicate && r.action === "skip").length;
+                const conflictCount = folderRows.filter((r) => r.existingConflict && !r.duplicate && r.action === "skip").length;
+                const parts: string[] = [];
+                if (dupCount) parts.push(`单元名重复 ${dupCount}`);
+                if (conflictCount) parts.push(`已有文件 ${conflictCount}`);
+                return parts.length ? `（${parts.join("、")}）` : "";
+              })()}
+            </div>
+            <div className="row" style={{ gap: 6, marginBottom: 6 }}>
+              <button
+                type="button"
+                className={fileFilter === "all" ? "active" : "secondary"}
+                style={{ fontSize: "0.75rem", padding: "3px 8px" }}
+                onClick={() => setFileFilter("all")}
+              >
+                全部 {folderRows.length}
+              </button>
+              <button
+                type="button"
+                className={fileFilter === "new" ? "active" : "secondary"}
+                style={{ fontSize: "0.75rem", padding: "3px 8px" }}
+                onClick={() => setFileFilter("new")}
+              >
+                新文件 {folderRows.filter((r) => r.action !== "skip").length}
+              </button>
+              <button
+                type="button"
+                className={fileFilter === "skipped" ? "active" : "secondary"}
+                style={{ fontSize: "0.75rem", padding: "3px 8px" }}
+                onClick={() => setFileFilter("skipped")}
+              >
+                跳过 {folderRows.filter((r) => r.action === "skip").length}
+              </button>
             </div>
             <div className="storage-folder-file-list">
-              {folderRows.map((row) => (
-                <div className="storage-folder-file-row" key={row.relFile.path}>
+              {folderRows
+                .filter((row) => {
+                  if (fileFilter === "new") return row.action !== "skip";
+                  if (fileFilter === "skipped") return row.action === "skip";
+                  return true;
+                })
+                .map((row) => (
+                <div className={`storage-folder-file-row ${row.action === "skip" ? "is-skipped" : ""}`} key={row.relFile.path}>
                   <div>
                     <strong>{row.unitName}</strong>
+                    {row.styleDiffers && (
+                      <span className="storage-folder-status" style={{ marginLeft: 6 }}>
+                        款式不同，同单元新增
+                      </span>
+                    )}
                     <small title={row.relFile.path}>{row.relFile.path}</small>
                   </div>
-                  {row.duplicate ? (
+                  {row.duplicate && row.action === "skip" ? (
                     <span className="storage-folder-status warning">
-                      数据单元名重复，跳过
+                      跳过：数据单元名重复
                     </span>
-                  ) : row.existingConflict ? (
+                  ) : row.styleDiffers ? (
+                    <span className="storage-folder-status">新文件（不同款式）</span>
+                  ) : row.existingConflict && row.action === "skip" ? (
                     <select
                       value={row.action}
                       disabled={folderBusy}
@@ -1037,8 +1135,24 @@ export function FolderBatchImport({
                         })
                       }
                     >
-                      <option value="skip">已有文件：跳过</option>
-                      <option value="replace">已有文件：替换</option>
+                      <option value="skip">跳过：已有同名文件</option>
+                      <option value="replace">替换已有文件</option>
+                    </select>
+                  ) : row.existingConflict && row.action === "replace" ? (
+                    <select
+                      value={row.action}
+                      disabled={folderBusy}
+                      onChange={(event) =>
+                        updateFolderDraft({
+                          actions: {
+                            ...folderDraft.actions,
+                            [row.relFile.path]: event.target.value as FolderAction,
+                          },
+                        })
+                      }
+                    >
+                      <option value="skip">跳过：已有同名文件</option>
+                      <option value="replace">替换已有文件</option>
                     </select>
                   ) : (
                     <span className="storage-folder-status">新文件</span>
@@ -1062,6 +1176,22 @@ export function FolderBatchImport({
               >
                 上传 {folderResult.uploaded}，替换 {folderResult.replaced}，跳过{" "}
                 {folderResult.skipped}，失败 {folderResult.failed}
+                {folderResult.items?.some((item: any) => item.status === "skip") ? (
+                  <details>
+                    <summary className="muted" style={{ cursor: "pointer", marginTop: 4 }}>
+                      查看跳过的文件
+                    </summary>
+                    <ul>
+                      {folderResult.items
+                        .filter((item: any) => item.status === "skip")
+                        .map((item: any) => (
+                          <li key={`${item.name}`}>
+                            {item.name}：已有同名文件
+                          </li>
+                        ))}
+                    </ul>
+                  </details>
+                ) : null}
                 {!!folderResult.failed && (
                   <ul>
                     {folderResult.items

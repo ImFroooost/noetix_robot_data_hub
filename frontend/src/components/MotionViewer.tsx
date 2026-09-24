@@ -375,6 +375,8 @@ export function MotionViewer({
     setMediaDuration(0);
     setDetectedUp("y");
     setDetectedUnit("m");
+    setUpAxisMode("auto");
+    setUnitMode("auto");
   }, [humanFileId, robotFileId, humanId]);
 
   const humanFile =

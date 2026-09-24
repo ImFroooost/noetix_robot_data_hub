@@ -280,13 +280,18 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
   const [detectedUp, setDetectedUp] = useState<UpAxis>("z");
   const duration = mediaDuration || file.duration_sec || 1;
   const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
-  const style = String(file.annotation?.robot_style || "");
+  const style = String(file.robot_style || file.annotation?.robot_style || "");
   const instance = instances.find((item) => item.name === style);
   const versions = robotDescriptionVersions(instance);
-  const version = normalizeRobotVersion(versions, String(file.annotation?.robot_version || ""));
+  const defaultFile = String(instance?.meta?.default_description_file || "");
+  const version = normalizeRobotVersion(versions, String(file.annotation?.robot_version || ""), defaultFile);
   const urdfFile =
     versions.find((item) => item.relative_path === version || item.name === version) ||
-    (versions.length === 1 ? versions[0] : undefined);
+    (versions.length === 1
+      ? versions[0]
+      : defaultFile
+        ? versions.find((item) => item.relative_path === defaultFile || item.name === defaultFile)
+        : undefined);
   const packageRoot = urdfFile
     ? urdfFile.path.slice(0, urdfFile.path.length - urdfFile.relative_path.length).replace(/\/$/, "")
     : "";
@@ -315,6 +320,10 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
     setNote("");
     setDetectedUp("z");
   }, [file.path, style, version]);
+
+  useEffect(() => {
+    setUpAxisMode("auto");
+  }, [file.path]);
 
   useEffect(() => {
     if (!playing) return;

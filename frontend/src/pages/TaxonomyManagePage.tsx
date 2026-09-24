@@ -8,9 +8,10 @@ import { taxonomySchemeLabel } from "../types";
 import { useHistoryReload, useUndo } from "../undo/UndoContext";
 
 export function TaxonomyManagePage() {
-  const { hasPerm } = useAuth();
+  const { hasPerm, isAdmin } = useAuth();
   const { execute } = useUndo();
   const canManageTaxonomy = hasPerm("manage_data");
+  const canEditExisting = !!isAdmin;
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [scheme, setScheme] = useState<string>("style");
   const [nodes, setNodes] = useState<TaxonomyNode[]>([]);
@@ -215,6 +216,81 @@ export function TaxonomyManagePage() {
     }
   };
 
+  const handleCreateChild = async (parent: TaxonomyNode, name: string) => {
+    setError("");
+    setMsg("");
+    let createdId = 0;
+    try {
+      await execute({
+        label: `创建分类「${name}」`,
+        do: async () => {
+          const created = await api.createTaxonomyNode({ scheme, parent_id: parent.id, name });
+          createdId = created.id;
+          await load();
+          setMsg(`已创建「${name}」`);
+        },
+        undo: async () => { if (createdId) await api.deleteTaxonomyNode(createdId); },
+      });
+    } catch (e) { setError(e instanceof Error ? e.message : "创建失败"); }
+  };
+  const handleRename = canEditExisting ? async (node: TaxonomyNode, name: string) => {
+    setError("");
+    const prev = node.name;
+    try {
+      await execute({
+        label: `重命名分类为「${name}」`,
+        do: async () => { await api.updateTaxonomyNode(node.id, { name }); await load(); setMsg("已重命名"); },
+        undo: async () => { await api.updateTaxonomyNode(node.id, { name: prev }); },
+      });
+    } catch (e) { setError(e instanceof Error ? e.message : "重命名失败"); }
+  } : undefined;
+  const handleDelete = canEditExisting ? async (node: TaxonomyNode) => {
+    setError("");
+    const snapshot = { scheme: node.scheme, parent_id: node.parent_id, name: node.name, description: node.description };
+    try {
+      await execute({
+        label: `删除分类「${node.name}」`,
+        do: async () => { await api.deleteTaxonomyNode(node.id); if (selectedId === node.id) setSelectedId(null); await load(); setMsg("已删除"); },
+        undo: async () => { await api.createTaxonomyNode(snapshot); },
+      });
+    } catch (e) { setError(e instanceof Error ? e.message : "删除失败"); }
+  } : undefined;
+  const handleCreateRoot = async (name: string) => {
+    setError("");
+    let createdId = 0;
+    try {
+      await execute({
+        label: `创建根节点「${name}」`,
+        do: async () => { const created = await api.createTaxonomyNode({ scheme, parent_id: null, name }); createdId = created.id; await load(); setMsg(`已创建根节点「${name}」`); },
+        undo: async () => { if (createdId) await api.deleteTaxonomyNode(createdId); },
+      });
+    } catch (e) { setError(e instanceof Error ? e.message : "创建失败"); }
+  };
+  const handleMove = canEditExisting ? async (node: TaxonomyNode, parentId: number | null) => {
+    setError("");
+    setMsg("");
+    const prevParent = node.parent_id;
+    try {
+      await execute({
+        label: `移动分类「${node.name}」`,
+        do: async () => { await api.updateTaxonomyNode(node.id, { parent_id: parentId }); await load(); setMsg("已移动节点（序号已重编）"); },
+        undo: async () => { await api.updateTaxonomyNode(node.id, { parent_id: prevParent }); },
+      });
+    } catch (e) { setError(e instanceof Error ? e.message : "移动失败"); throw e; }
+  } : undefined;
+  const handleReorder = canEditExisting ? async (parentId: number | null, orderedIds: number[]) => {
+    setError("");
+    setMsg("");
+    const prevIds = schemeNodes.filter((item) => item.parent_id === parentId).sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name, "zh")).map((item) => item.id);
+    try {
+      await execute({
+        label: "调整分类排序",
+        do: async () => { await api.reorderTaxonomyNodes(parentId, orderedIds); await load(); setMsg("已调整排序（序号已重编）"); },
+        undo: async () => { await api.reorderTaxonomyNodes(parentId, prevIds); },
+      });
+    } catch (e) { setError(e instanceof Error ? e.message : "排序失败"); throw e; }
+  } : undefined;
+
   return (
     <div className="page stack tax-page">
       <p className="muted" style={{ margin: 0 }}>
@@ -257,7 +333,7 @@ export function TaxonomyManagePage() {
           <button
             type="button"
             className="secondary"
-            disabled={busy || !renameValue.trim() || renameValue.trim() === currentScheme.name}
+            disabled={busy || !canEditExisting || !renameValue.trim() || renameValue.trim() === currentScheme.name}
             onClick={() => void onRenameScheme()}
           >
             重命名
@@ -265,7 +341,7 @@ export function TaxonomyManagePage() {
           <button
             type="button"
             className="secondary"
-            disabled={busy || schemeIndex <= 0}
+            disabled={busy || !canEditExisting || schemeIndex <= 0}
             title="在 Tab 中左移"
             onClick={() => void onMoveScheme(-1)}
           >
@@ -274,13 +350,13 @@ export function TaxonomyManagePage() {
           <button
             type="button"
             className="secondary"
-            disabled={busy || schemeIndex < 0 || schemeIndex >= schemes.length - 1}
+            disabled={busy || !canEditExisting || schemeIndex < 0 || schemeIndex >= schemes.length - 1}
             title="在 Tab 中右移"
             onClick={() => void onMoveScheme(1)}
           >
             右移 →
           </button>
-          {currentScheme.builtin && (
+          {currentScheme.builtin && canEditExisting && (
             <button
               type="button"
               className="secondary"
@@ -300,7 +376,7 @@ export function TaxonomyManagePage() {
             （第 {schemeIndex + 1} 位）
             {currentScheme.builtin ? " ·内置" : " ·自定"}
           </span>
-          {!currentScheme.builtin && (
+          {!currentScheme.builtin && canEditExisting && (
             <button
               type="button"
               className="danger"
@@ -356,144 +432,12 @@ export function TaxonomyManagePage() {
               selectedId={selectedId}
               onSelect={(n) => setSelectedId(n?.id ?? null)}
               manageable
-              onCreateChild={async (parent, name) => {
-                setError("");
-                setMsg("");
-                let createdId = 0;
-                try {
-                  await execute({
-                    label: `创建分类「${name}」`,
-                    do: async () => {
-                      const created = await api.createTaxonomyNode({
-                        scheme,
-                        parent_id: parent.id,
-                        name,
-                      });
-                      createdId = created.id;
-                      await load();
-                      setMsg(`已创建「${name}」`);
-                    },
-                    undo: async () => {
-                      if (createdId) await api.deleteTaxonomyNode(createdId);
-                    },
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "创建失败");
-                }
-              }}
-              onRename={async (node, name) => {
-                setError("");
-                const prev = node.name;
-                try {
-                  await execute({
-                    label: `重命名分类为「${name}」`,
-                    do: async () => {
-                      await api.updateTaxonomyNode(node.id, { name });
-                      await load();
-                      setMsg("已重命名");
-                    },
-                    undo: async () => {
-                      await api.updateTaxonomyNode(node.id, { name: prev });
-                    },
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "重命名失败");
-                }
-              }}
-              onDelete={async (node) => {
-                setError("");
-                const snapshot = {
-                  scheme: node.scheme,
-                  parent_id: node.parent_id,
-                  name: node.name,
-                  description: node.description,
-                };
-                try {
-                  await execute({
-                    label: `删除分类「${node.name}」`,
-                    do: async () => {
-                      await api.deleteTaxonomyNode(node.id);
-                      if (selectedId === node.id) setSelectedId(null);
-                      await load();
-                      setMsg("已删除");
-                    },
-                    undo: async () => {
-                      await api.createTaxonomyNode(snapshot);
-                    },
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "删除失败");
-                }
-              }}
-              onCreateRoot={async (name) => {
-                setError("");
-                let createdId = 0;
-                try {
-                  await execute({
-                    label: `创建根节点「${name}」`,
-                    do: async () => {
-                      const created = await api.createTaxonomyNode({
-                        scheme,
-                        parent_id: null,
-                        name,
-                      });
-                      createdId = created.id;
-                      await load();
-                      setMsg(`已创建根节点「${name}」`);
-                    },
-                    undo: async () => {
-                      if (createdId) await api.deleteTaxonomyNode(createdId);
-                    },
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "创建失败");
-                }
-              }}
-              onMove={async (node, parentId) => {
-                setError("");
-                setMsg("");
-                const prevParent = node.parent_id;
-                try {
-                  await execute({
-                    label: `移动分类「${node.name}」`,
-                    do: async () => {
-                      await api.updateTaxonomyNode(node.id, { parent_id: parentId });
-                      await load();
-                      setMsg("已移动节点（序号已重编）");
-                    },
-                    undo: async () => {
-                      await api.updateTaxonomyNode(node.id, { parent_id: prevParent });
-                    },
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "移动失败");
-                  throw e;
-                }
-              }}
-              onReorder={async (parentId, orderedIds) => {
-                setError("");
-                setMsg("");
-                const prevIds = schemeNodes
-                  .filter((item) => item.parent_id === parentId)
-                  .sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name, "zh"))
-                  .map((item) => item.id);
-                try {
-                  await execute({
-                    label: "调整分类排序",
-                    do: async () => {
-                      await api.reorderTaxonomyNodes(parentId, orderedIds);
-                      await load();
-                      setMsg("已调整排序（序号已重编）");
-                    },
-                    undo: async () => {
-                      await api.reorderTaxonomyNodes(parentId, prevIds);
-                    },
-                  });
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : "排序失败");
-                  throw e;
-                }
-              }}
+              onCreateChild={handleCreateChild}
+              onRename={handleRename}
+              onDelete={handleDelete}
+              onCreateRoot={handleCreateRoot}
+              onMove={handleMove}
+              onReorder={handleReorder}
             />
           </ResizableHeight>
         </div>
@@ -521,8 +465,8 @@ export function TaxonomyManagePage() {
                 <div className="muted">子节点数</div>
                 <div>{selected.child_count}</div>
               </div>
-              {selected.parent_id != null ||
-              schemeNodes.filter((n) => n.parent_id == null).length > 1 ? (
+              {canEditExisting && (selected.parent_id != null ||
+              schemeNodes.filter((n) => n.parent_id == null).length > 1) ? (
                 <label>
                   上级节点
                   <select

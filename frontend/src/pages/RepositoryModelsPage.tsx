@@ -17,10 +17,10 @@ const KIND_LABEL: Record<string, string> = {
 };
 
 export function RepositoryModelsPage() {
-  const { hasPerm } = useAuth();
+  const { hasPerm, isAdmin } = useAuth();
   const { execute } = useUndo();
   const canUpload = hasPerm("upload");
-  const canDelete = hasPerm("manage_data");
+  const canDelete = !!isAdmin;
   const [data, setData] = useState<ModelRepositoryOverview | null>(null);
   const [ontology, setOntology] = useState<"human" | "robot">("human");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -272,7 +272,14 @@ export function RepositoryModelsPage() {
                   </p>
                   {selected.files
                     .filter((item) => item.kind === kind)
-                    .map((item) => (
+                    .map((item) => {
+                      const isDesc =
+                        item.kind === "standard_description" &&
+                        /\.(xml|urdf)$/i.test(item.name);
+                      const isDefault =
+                        String(selected.meta?.default_description_file || "") ===
+                        item.relative_path;
+                      return (
                       <div
                         key={item.id}
                         className={`row storage-model-file ${
@@ -284,6 +291,53 @@ export function RepositoryModelsPage() {
                         <span className="muted">{(item.size / 1024).toFixed(1)} KB</span>
                         {modelPreviewKind(item) !== "unsupported" && (
                           <span className="muted">可预览</span>
+                        )}
+                        {isDefault && (
+                          <span className="storage-model-default-badge">默认</span>
+                        )}
+                        {canUpload && isDesc && !isDefault && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={async (event) => {
+                              event.stopPropagation();
+                              try {
+                                await api.storageUpdateModelInstance(
+                                  selected.ontology,
+                                  selected.name,
+                                  { default_description_file: item.relative_path }
+                                );
+                                await load();
+                                setMessage(`已将 ${item.name} 设为默认描述文件`);
+                              } catch (e) {
+                                setError(e instanceof Error ? e.message : "设置失败");
+                              }
+                            }}
+                          >
+                            设为默认
+                          </button>
+                        )}
+                        {canUpload && isDesc && isDefault && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={async (event) => {
+                              event.stopPropagation();
+                              try {
+                                await api.storageUpdateModelInstance(
+                                  selected.ontology,
+                                  selected.name,
+                                  { default_description_file: "" }
+                                );
+                                await load();
+                                setMessage("已取消默认描述文件");
+                              } catch (e) {
+                                setError(e instanceof Error ? e.message : "取消失败");
+                              }
+                            }}
+                          >
+                            取消默认
+                          </button>
                         )}
                         <button
                           type="button"
@@ -315,7 +369,8 @@ export function RepositoryModelsPage() {
                           </button>
                         )}
                       </div>
-                    ))}
+                      );
+                    })}
                   {!selected.files.some((item) => item.kind === kind) && (
                     <div className="muted">该实例尚未上传此类模型数据</div>
                   )}

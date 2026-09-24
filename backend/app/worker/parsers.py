@@ -349,9 +349,10 @@ def load_smpl_motion(path: Path, max_frames: int = 900) -> dict:
     step = max(1, frames // max_frames)
     idx = np.arange(0, frames, step)
     out_poses = poses[idx].astype(np.float32).tolist()
+    effective_fps = fps / step
     out = {
         "poses": out_poses,
-        "fps": fps,
+        "fps": effective_fps,
         "frame_count": frames,
         "duration_sec": _duration(fps, frames),
         "betas": betas,

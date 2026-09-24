@@ -1,29 +1,12 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 /** 数据里「上」是哪个轴 */
 export type UpAxis = "y" | "z" | "-y" | "-z";
 /** 界面选择：自动识别或手动指定 */
 export type UpAxisMode = "auto" | "y" | "z";
 
-const UP_AXIS_KEY = "hub-viewer-up-axis";
-
 export function useUpAxisMode(): [UpAxisMode, (m: UpAxisMode) => void] {
-  const [mode, setMode] = useState<UpAxisMode>(() => {
-    try {
-      const saved = localStorage.getItem(UP_AXIS_KEY);
-      if (saved === "y" || saved === "z" || saved === "auto") return saved;
-    } catch {
-      /* ignore */
-    }
-    return "auto";
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem(UP_AXIS_KEY, mode);
-    } catch {
-      /* ignore */
-    }
-  }, [mode]);
+  const [mode, setMode] = useState<UpAxisMode>("auto");
   return [mode, setMode];
 }
 

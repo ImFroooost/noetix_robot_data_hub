@@ -1,3 +1,5 @@
+import { startLoading, stopLoading } from "./loadingState";
+
 const TOKEN_KEY = "motion_token";
 const ACTOR_TOKEN_KEY = "motion_actor_token";
 
@@ -20,7 +22,7 @@ export function setActorToken(token: string | null) {
 }
 
 function chineseHttpError(status: number, detail: string): string {
-  if (status === 413) return "文件过大，请压缩 mesh 或拆分后重试（上限约 4GB）";
+  if (status === 413) return "文件过大，请压缩 mesh 或拆分后重试（上限约 16GB）";
   if (status === 401) return "登录已过期，请重新登录";
   if (status === 403) return "权限不足";
   if (status === 404) return "接口不存在";
@@ -36,15 +38,18 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
+  startLoading();
   let res: Response;
   try {
     res = await fetch(path, { ...init, headers });
   } catch {
+    stopLoading();
     throw new Error(
       "无法连接服务器（Failed to fetch）。请确认用 http://服务器IP/ 打开网页，且 docker compose 服务正常；若上传大 zip，请在系统浏览器中重试。"
     );
   }
   if (res.status === 401) {
+    stopLoading();
     const actor = getActorToken();
     setToken(null);
     if (actor && actor !== token && !path.includes("/auth/login")) {
@@ -66,12 +71,21 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       /* ignore */
     }
+    stopLoading();
     const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
     throw new Error(chineseHttpError(res.status, msg));
   }
-  if (res.status === 204) return undefined as T;
+  if (res.status === 204) {
+    stopLoading();
+    return undefined as T;
+  }
   const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return res.json();
+  if (ct.includes("application/json")) {
+    const data = await res.json();
+    stopLoading();
+    return data;
+  }
+  stopLoading();
   return res as unknown as T;
 }
 
@@ -343,6 +357,14 @@ export const api = {
       `/api/storage/units/${encodeURIComponent(batch)}/${encodeURIComponent(unitName)}`,
       { method: "PATCH", body: JSON.stringify(body) }
     ),
+  storageUpdateNodeTaxonomy: (body: {
+    batch: string;
+    units: { name: string; taxonomy_tag_ids: Record<string, number | null> }[];
+  }) =>
+    request<{ updated: number }>("/api/storage/nodes/taxonomy", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   storageRenameBatch: (name: string, next: string) =>
     request<import("./types").StorageBatch>(
       `/api/storage/batches/${encodeURIComponent(name)}/rename`,
@@ -415,6 +437,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ ontology, name }),
     }),
+  storageUpdateModelInstance: (
+    ontology: string,
+    name: string,
+    body: Record<string, unknown>
+  ) =>
+    request<{ ok: boolean; meta: Record<string, unknown> }>(
+      `/api/storage/models/instances/${encodeURIComponent(ontology)}/${encodeURIComponent(name)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    ),
   storageUploadModel: (form: FormData) =>
     request("/api/storage/models/upload", { method: "POST", body: form }),
   storageDeleteModelInstance: (ontology: string, name: string) =>
@@ -487,20 +518,31 @@ export const api = {
 
 export async function fetchJsonAuth(url: string) {
   const token = getToken();
+  startLoading();
   const res = await fetch(url, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
-  if (!res.ok) throw new Error("加载失败");
-  return res.json();
+  if (!res.ok) {
+    stopLoading();
+    throw new Error("加载失败");
+  }
+  const data = await res.json();
+  stopLoading();
+  return data;
 }
 
 export async function downloadAuth(url: string, filename?: string) {
   const token = getToken();
+  startLoading("下载中…");
   const res = await fetch(url, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
-  if (!res.ok) throw new Error("下载失败");
+  if (!res.ok) {
+    stopLoading();
+    throw new Error("下载失败");
+  }
   const blob = await res.blob();
+  stopLoading();
   const obj = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = obj;
@@ -515,6 +557,7 @@ export async function downloadAuthPost(
   filename?: string
 ) {
   const token = getToken();
+  startLoading("下载中…");
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -523,8 +566,12 @@ export async function downloadAuthPost(
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error("下载失败");
+  if (!res.ok) {
+    stopLoading();
+    throw new Error("下载失败");
+  }
   const blob = await res.blob();
+  stopLoading();
   const obj = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = obj;

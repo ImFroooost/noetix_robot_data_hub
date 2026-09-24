@@ -1,11 +1,9 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 /** 文件坐标的长度单位 */
 export type LengthUnit = "m" | "cm" | "mm";
 /** 界面选择：自动识别或手动指定 */
 export type LengthUnitMode = "auto" | LengthUnit;
-
-const UNIT_KEY = "hub-viewer-length-unit";
 
 const UNIT_SCALE: Record<LengthUnit, number> = {
   m: 1,
@@ -20,22 +18,7 @@ const UNIT_NAME: Record<LengthUnit, string> = {
 };
 
 export function useLengthUnitMode(): [LengthUnitMode, (m: LengthUnitMode) => void] {
-  const [mode, setMode] = useState<LengthUnitMode>(() => {
-    try {
-      const saved = localStorage.getItem(UNIT_KEY);
-      if (saved === "m" || saved === "cm" || saved === "mm" || saved === "auto") return saved;
-    } catch {
-      /* ignore */
-    }
-    return "auto";
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem(UNIT_KEY, mode);
-    } catch {
-      /* ignore */
-    }
-  }, [mode]);
+  const [mode, setMode] = useState<LengthUnitMode>("auto");
   return [mode, setMode];
 }
 

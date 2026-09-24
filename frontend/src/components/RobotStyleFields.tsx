@@ -15,10 +15,18 @@ export function robotDescriptionVersions(
 
 export function normalizeRobotVersion(
   versions: ModelInstanceFile[],
-  current = ""
+  current = "",
+  defaultFile = ""
 ): string {
   if (!current) {
-    return versions.length === 1 ? versions[0].relative_path : "";
+    if (versions.length === 1) return versions[0].relative_path;
+    if (defaultFile) {
+      const match = versions.find(
+        (file) => file.relative_path === defaultFile || file.name === defaultFile
+      );
+      if (match) return match.relative_path;
+    }
+    return "";
   }
   const match = versions.find(
     (file) => file.relative_path === current || file.name === current
@@ -57,7 +65,8 @@ export function RobotStyleFields({
   ] as string[];
   const selected = instances.find((item) => item.name === style);
   const versions = robotDescriptionVersions(selected);
-  const value = normalizeRobotVersion(versions, version);
+  const defaultFile = String(selected?.meta?.default_description_file || "");
+  const value = normalizeRobotVersion(versions, version, defaultFile);
   const options =
     value && !versions.some((file) => file.relative_path === value)
       ? [

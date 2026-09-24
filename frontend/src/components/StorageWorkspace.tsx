@@ -2,6 +2,7 @@ import { Children, useEffect, useLayoutEffect, useMemo, useRef, useState, type C
 import { api, downloadAuth, downloadAuthPost } from "../api";
 import { useAuth } from "../auth";
 import { usePreview } from "../preview/PreviewContext";
+import { isVisualizableStorageFile, pickPreviewFile } from "../preview/pickPreviewFile";
 import { FilePreviewDock } from "./FilePreviewDock";
 import { FolderBatchImport, UploadTaxonomyFields } from "./FolderBatchImport";
 import {
@@ -16,6 +17,7 @@ import {
   RobotStyleFields,
   robotDescriptionVersions,
   robotVersionLabel,
+  normalizeRobotVersion,
 } from "./RobotStyleFields";
 import { TaxonomySelect } from "./TaxonomyTree";
 import { fetchStorageOverview, INDEX_UPDATED_EVENT } from "../storageOverviewCache";
@@ -256,11 +258,13 @@ function TreeToolbar({
   onExpandAll,
   extra,
   children,
+  toolbarExtra,
 }: {
   onCollapseAll: () => void;
   onExpandAll: () => void;
   extra?: ReactNode;
   children?: ReactNode;
+  toolbarExtra?: ReactNode;
 }) {
   return (
     <>
@@ -282,6 +286,7 @@ function TreeToolbar({
           >
             全部展开
           </button>
+          {toolbarExtra}
         </div>
         {extra}
       </div>
@@ -470,12 +475,274 @@ function TreeUnitItem({
   );
 }
 
+function unitSubPath(unit: StorageUnit): string {
+  for (const file of unit.files) {
+    if (file.sub_path) return file.sub_path;
+  }
+  return "";
+}
+
+type DirTreeNode = {
+  name: string;
+  path: string;
+  units: StorageUnit[];
+  children: Map<string, DirTreeNode>;
+};
+
+function buildDirTree(units: StorageUnit[]): DirTreeNode {
+  const root: DirTreeNode = { name: "", path: "", units: [], children: new Map() };
+  for (const unit of units) {
+    const subPath = unitSubPath(unit);
+    if (!subPath) {
+      root.units.push(unit);
+      continue;
+    }
+    const segs = subPath.replace(/\\/g, "/").split("/").filter(Boolean);
+    let node = root;
+    let acc = "";
+    for (const seg of segs) {
+      acc = acc ? `${acc}/${seg}` : seg;
+      let child = node.children.get(seg);
+      if (!child) {
+        child = { name: seg, path: acc, units: [], children: new Map() };
+        node.children.set(seg, child);
+      }
+      node = child;
+    }
+    node.units.push(unit);
+  }
+  return root;
+}
+
+function dirUnitCount(node: DirTreeNode): number {
+  let total = node.units.length;
+  for (const child of node.children.values()) total += dirUnitCount(child);
+  return total;
+}
+
+function unitsUnderPath(units: StorageUnit[], dirPath: string): StorageUnit[] {
+  if (!dirPath) return units;
+  return units.filter((unit) => {
+    const subPath = unitSubPath(unit);
+    return subPath === dirPath || subPath.startsWith(`${dirPath}/`);
+  });
+}
+
+function sharedUnitTag(units: StorageUnit[], scheme: string): { id: number | ""; mixed: boolean } {
+  let current: number | null | undefined;
+  for (const unit of units) {
+    const raw = unit.taxonomy_tag_ids?.[scheme];
+    const id = raw == null ? null : raw;
+    if (current === undefined) {
+      current = id;
+      continue;
+    }
+    if (current !== id) return { id: "", mixed: true };
+  }
+  return { id: current == null ? "" : current, mixed: false };
+}
+
+const VIRTUAL_UNIT_ROW = 46;
+const VIRTUAL_UNIT_THRESHOLD = 80;
+
+function VirtualTreeUnits({
+  units,
+  renderUnit,
+}: {
+  units: StorageUnit[];
+  renderUnit: (unit: StorageUnit) => ReactNode;
+}) {
+  const spacerRef = useRef<HTMLDivElement>(null);
+  const [range, setRange] = useState(() => ({
+    start: 0,
+    end: Math.min(units.length, 48),
+  }));
+
+  useLayoutEffect(() => {
+    const spacer = spacerRef.current;
+    const scroll = spacer?.closest(".storage-tree-scroll") as HTMLElement | null;
+    if (!spacer || !scroll) return;
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const scrollRect = scroll.getBoundingClientRect();
+      const spacerRect = spacer.getBoundingClientRect();
+      const into = scrollRect.top - spacerRect.top;
+      const start = Math.max(0, Math.floor(into / VIRTUAL_UNIT_ROW) - 8);
+      const end = Math.min(
+        units.length,
+        start + Math.ceil(scrollRect.height / VIRTUAL_UNIT_ROW) + 20
+      );
+      setRange((current) =>
+        current.start === start && current.end === end ? current : { start, end }
+      );
+    };
+    const onScroll = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(update);
+    };
+    update();
+    scroll.addEventListener("scroll", onScroll, { passive: true });
+    const observer = new ResizeObserver(onScroll);
+    observer.observe(scroll);
+    return () => {
+      scroll.removeEventListener("scroll", onScroll);
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [units.length]);
+
+  return (
+    <div ref={spacerRef} className="storage-tree-virtual" style={{ height: units.length * VIRTUAL_UNIT_ROW }}>
+      {units.slice(range.start, range.end).map((unit, index) => (
+        <div
+          key={unit.key}
+          className="storage-tree-virtual-row"
+          style={{ top: (range.start + index) * VIRTUAL_UNIT_ROW }}
+        >
+          {renderUnit(unit)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function renderDirTree(
+  node: DirTreeNode,
+  batch: StorageBatch,
+  depth: number,
+  expanded: Record<string, boolean>,
+  setExpanded: (fn: (prev: Record<string, boolean>) => Record<string, boolean>) => void,
+  selectedUnit: string | null,
+  selectedNodeKey: string | null,
+  onSelectUnit: (unit: StorageUnit) => void,
+  onSelectNode: (key: string) => void,
+  canManage: boolean,
+  canEdit: boolean | undefined,
+  canDownload: boolean | undefined,
+  currentUserId: number | undefined,
+  checkedUnits: Record<string, boolean>,
+  setCheckedUnits: (fn: (prev: Record<string, boolean>) => Record<string, boolean>) => void,
+  onRenameUnit: (unit: StorageUnit) => void,
+  onDelete: (batches: StorageBatch[], units: StorageUnit[]) => void,
+  onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void
+): ReactNode {
+  const dirEntries = [...node.children.entries()].sort((left, right) =>
+    left[0].localeCompare(right[0], "zh")
+  );
+  return (
+    <>
+      {dirEntries.map(([, child]) => {
+        const nodeKey = `${batch.name}::${child.path}`;
+        const open = expanded[nodeKey] === true;
+        return (
+          <TreeGroup
+            key={nodeKey}
+            nested={depth > 0}
+            depth={depth}
+            open={open}
+            selected={selectedNodeKey === nodeKey}
+            title={child.name}
+            meta={<span>{dirUnitCount(child)} 个单元</span>}
+            toggleLabel={open ? "收起目录" : "展开目录"}
+            onToggle={() =>
+              setExpanded((current) => ({
+                ...current,
+                [nodeKey]: !open,
+              }))
+            }
+            onSelect={() => onSelectNode(nodeKey)}
+          >
+            {open
+              ? renderDirTree(
+                  child,
+                  batch,
+                  depth + 1,
+                  expanded,
+                  setExpanded,
+                  selectedUnit,
+                  selectedNodeKey,
+                  onSelectUnit,
+                  onSelectNode,
+                  canManage,
+                  canEdit,
+                  canDownload,
+                  currentUserId,
+                  checkedUnits,
+                  setCheckedUnits,
+                  onRenameUnit,
+                  onDelete,
+                  onDownload
+                )
+              : null}
+          </TreeGroup>
+        );
+      })}
+      {node.units.length > VIRTUAL_UNIT_THRESHOLD ? (
+        <VirtualTreeUnits
+          units={node.units}
+          renderUnit={(unit) => (
+            <TreeUnitItem
+              title={unit.name}
+              meta={uploaderLabel(unit.uploaders)}
+              selected={selectedUnit === unit.key}
+              onClick={() => onSelectUnit(unit)}
+              checked={!!checkedUnits[unit.key]}
+              onCheck={
+                canManage
+                  ? (value) =>
+                      setCheckedUnits((current) => ({ ...current, [unit.key]: value }))
+                  : undefined
+              }
+              actions={
+                <TreeActions
+                  canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                  canEdit={canEdit}
+                  onDownload={() => onDownload([], [unit])}
+                  onRename={() => onRenameUnit(unit)}
+                  onDelete={() => onDelete([], [unit])}
+                />
+              }
+            />
+          )}
+        />
+      ) : (
+        node.units.map((unit) => (
+          <TreeUnitItem
+            key={unit.key}
+            title={unit.name}
+            meta={uploaderLabel(unit.uploaders)}
+            selected={selectedUnit === unit.key}
+            onClick={() => onSelectUnit(unit)}
+            checked={!!checkedUnits[unit.key]}
+            onCheck={
+              canManage
+                ? (value) =>
+                    setCheckedUnits((current) => ({ ...current, [unit.key]: value }))
+                : undefined
+            }
+            actions={
+              <TreeActions
+                canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                canEdit={canEdit}
+                onDownload={() => onDownload([], [unit])}
+                onRename={() => onRenameUnit(unit)}
+                onDelete={() => onDelete([], [unit])}
+              />
+            }
+          />
+        ))
+      )}
+    </>
+  );
+}
+
 function UnitTree({
   data,
   selectedUnit,
-  selectedBatch,
+  selectedNodeKey,
   onSelectUnit,
-  onSelectBatch,
+  onSelectNode,
   canEdit,
   canDownload,
   currentUserId,
@@ -486,9 +753,9 @@ function UnitTree({
 }: {
   data: StorageOverview;
   selectedUnit: string | null;
-  selectedBatch: string | null;
+  selectedNodeKey: string | null;
   onSelectUnit: (unit: StorageUnit) => void;
-  onSelectBatch: (batch: StorageBatch) => void;
+  onSelectNode: (key: string) => void;
   canEdit?: boolean;
   canDownload?: boolean;
   currentUserId?: number;
@@ -516,9 +783,6 @@ function UnitTree({
 
   const toggleBatch = (name: string, value: boolean) => {
     setCheckedBatches((current) => ({ ...current, [name]: value }));
-  };
-  const toggleUnit = (key: string, value: boolean) => {
-    setCheckedUnits((current) => ({ ...current, [key]: value }));
   };
 
   return (
@@ -600,7 +864,7 @@ function UnitTree({
           <TreeGroup
             key={batch.name}
             open={open}
-            selected={selectedBatch === batch.name && !selectedUnit}
+            selected={selectedNodeKey === `${batch.name}::`}
             title={batch.name}
             meta={
               <>
@@ -615,7 +879,7 @@ function UnitTree({
                 [batch.name]: !open,
               }))
             }
-            onSelect={() => onSelectBatch(batch)}
+            onSelect={() => onSelectNode(`${batch.name}::`)}
             checked={!!checkedBatches[batch.name]}
             onCheck={canManage ? (value) => toggleBatch(batch.name, value) : undefined}
             actions={
@@ -630,27 +894,28 @@ function UnitTree({
           >
             {open ? (
               <>
-                {batch.units.map((unit) => (
-                  <TreeUnitItem
-                    key={unit.key}
-                    title={unit.name}
-                    meta={uploaderLabel(unit.uploaders)}
-                    selected={selectedUnit === unit.key}
-                    onClick={() => onSelectUnit(unit)}
-                    checked={!!checkedUnits[unit.key]}
-                    onCheck={canManage ? (value) => toggleUnit(unit.key, value) : undefined}
-                    actions={
-                      <TreeActions
-                        canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
-                        canEdit={canEdit}
-                        onDownload={() => onDownload([], [unit])}
-                        onRename={() => onRenameUnit(unit)}
-                        onDelete={() => onDelete([], [unit])}
-                      />
-                    }
-                  />
-                ))}
-                {!batch.units.length && (
+                {batch.units.length ? (
+                  renderDirTree(
+                    buildDirTree(batch.units),
+                    batch,
+                    0,
+                    expanded,
+                    setExpanded,
+                    selectedUnit,
+                    selectedNodeKey,
+                    onSelectUnit,
+                    onSelectNode,
+                    canManage,
+                    canEdit,
+                    canDownload,
+                    currentUserId,
+                    checkedUnits,
+                    setCheckedUnits,
+                    onRenameUnit,
+                    onDelete,
+                    onDownload
+                  )
+                ) : (
                   <div className="muted storage-tree-empty">暂无数据单元</div>
                 )}
               </>
@@ -680,6 +945,7 @@ function UploaderTreePanel({
   canDownload,
   currentUserId,
   onDownload,
+  sortMode = "created_desc",
 }: {
   uploaders: StorageUploader[];
   units: StorageUnit[];
@@ -690,6 +956,7 @@ function UploaderTreePanel({
   canDownload?: boolean;
   currentUserId?: number;
   onDownload?: (units: StorageUnit[]) => void;
+  sortMode?: string;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [checkedUploaders, setCheckedUploaders] = useState<Record<string, boolean>>({});
@@ -749,7 +1016,7 @@ function UploaderTreePanel({
         全部上传用户
       </TreeAllButton>
       {uploaders.map((uploader) => {
-        const uploaderUnits = unitsOf(uploader);
+        const uploaderUnits = sortStorageUnits(unitsOf(uploader), sortMode);
         const key = String(uploader.id);
         const open = expanded[key] === true;
         return (
@@ -1052,6 +1319,7 @@ function TaxonomyTreePanel({
   canDownload,
   currentUserId,
   onDownload,
+  sortMode = "created_desc",
 }: {
   nodes: TaxonomyNode[];
   units: StorageUnit[];
@@ -1063,6 +1331,7 @@ function TaxonomyTreePanel({
   canDownload?: boolean;
   currentUserId?: number;
   onDownload?: (units: StorageUnit[]) => void;
+  sortMode?: string;
 }) {
   const [expanded, setExpanded] = useState<Record<number, boolean>>(() =>
     Object.fromEntries(nodes.map((node) => [node.id, false]))
@@ -1070,6 +1339,8 @@ function TaxonomyTreePanel({
   const [unspecifiedOpen, setUnspecifiedOpen] = useState<Record<number, boolean>>(() =>
     Object.fromEntries(nodes.map((node) => [node.id, false]))
   );
+  const [groupByBatch, setGroupByBatch] = useState(true);
+  const [batchExpanded, setBatchExpanded] = useState<Record<string, boolean>>({});
   const [checkedNodes, setCheckedNodes] = useState<Record<number, boolean>>({});
   const [checkedUnspecified, setCheckedUnspecified] = useState<Record<number, boolean>>({});
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
@@ -1106,6 +1377,9 @@ function TaxonomyTreePanel({
   const renderUnspecified = (node: TaxonomyNode, depth: number) => {
     const bucket = unspecifiedUnitsOf(node);
     const open = unspecifiedOpen[node.id] === true;
+    const batches = groupByBatch
+      ? sortBatchNames([...new Set(bucket.map((u) => u.batch))], bucket, sortMode)
+      : [];
     return (
       <TreeGroup
         key={`unspecified:${node.id}`}
@@ -1137,7 +1411,59 @@ function TaxonomyTreePanel({
           />
         }
       >
-        {bucket.map((unit) => (
+        {groupByBatch && open
+          ? batches.map((batchName) => {
+              const batchUnits = sortStorageUnits(
+                bucket.filter((u) => u.batch === batchName),
+                sortMode
+              );
+              const bKey = `${node.id}::${batchName}`;
+              const bOpen = batchExpanded[bKey] === true;
+              return (
+                <TreeGroup
+                  key={bKey}
+                  nested
+                  depth={depth + 1}
+                  open={bOpen}
+                  title={batchName}
+                  meta={<span>{batchUnits.length} 个单元</span>}
+                  toggleLabel={bOpen ? "收起批次" : "展开批次"}
+                  onToggle={() =>
+                    setBatchExpanded((current) => ({ ...current, [bKey]: !bOpen }))
+                  }
+                >
+                  {batchUnits.map((unit) => (
+                    <TreeUnitItem
+                      key={unit.key}
+                      title={unit.name}
+                      meta={unit.batch}
+                      selected={selectedKey === unit.key}
+                      onClick={() => {
+                        onSelect(node.id, true);
+                        onUnitSelect(unit);
+                      }}
+                      checked={!!checkedUnits[unit.key]}
+                      onCheck={
+                        canDownloadAny
+                          ? (value) =>
+                              setCheckedUnits((current) => ({
+                                ...current,
+                                [unit.key]: value,
+                              }))
+                          : undefined
+                      }
+                      actions={
+                        <TreeActions
+                          canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
+                          onDownload={() => onDownload?.([unit])}
+                        />
+                      }
+                    />
+                  ))}
+                </TreeGroup>
+              );
+            })
+          : sortStorageUnits(bucket, sortMode).map((unit) => (
           <TreeUnitItem
             key={unit.key}
             title={unit.name}
@@ -1223,6 +1549,16 @@ function TaxonomyTreePanel({
           setExpanded(Object.fromEntries(nodes.map((node) => [node.id, true])));
           setUnspecifiedOpen(Object.fromEntries(nodes.map((node) => [node.id, true])));
         }}
+        toolbarExtra={
+          <button
+            type="button"
+            className={groupByBatch ? "active" : "secondary"}
+            title="按数据批次折叠数据单元"
+            onClick={() => setGroupByBatch((v) => !v)}
+          >
+            按批次归纳
+          </button>
+        }
         extra={
           <DownloadToolbar
             count={selectedCount}
@@ -1590,7 +1926,13 @@ function DetailRow({
   );
 }
 
-type DetailKind = "batch" | "unit" | "file" | "upload_session";
+type DetailKind = "batch" | "unit" | "file" | "upload_session" | "node";
+
+type StorageNodeFocus = {
+  batchName: string;
+  dirPath: string;
+  units: StorageUnit[];
+};
 
 function schemesForKind(_kind: DetailKind, schemes: TaxonomySchemeDef[]) {
   return schemes;
@@ -1602,6 +1944,7 @@ function EntityDetailPanel({
   unit,
   file,
   session,
+  nodeInfo,
   schemes,
   nodes,
   canEdit,
@@ -1616,6 +1959,7 @@ function EntityDetailPanel({
   unit: StorageUnit | null;
   file: StorageFile | null;
   session: StorageUploadSession | null;
+  nodeInfo: StorageNodeFocus | null;
   schemes: TaxonomySchemeDef[];
   nodes: TaxonomyNode[];
   canEdit: boolean;
@@ -1654,14 +1998,26 @@ function EntityDetailPanel({
     return null;
   };
 
+  const nodeShare: Record<string, { id: number | ""; mixed: boolean }> = {};
+  if (kind === "node" && nodeInfo) {
+    for (const scheme of schemes) {
+      nodeShare[scheme.key] = sharedUnitTag(nodeInfo.units, scheme.key);
+    }
+  }
   const ownTagIds =
-    kind === "file"
-      ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
-      : kind === "unit"
-        ? unit?.taxonomy_tag_ids || {}
-        : kind === "upload_session"
-          ? session?.taxonomy_tag_ids || {}
-          : batch?.taxonomy_tag_ids || {};
+    kind === "node"
+      ? Object.fromEntries(
+          Object.entries(nodeShare)
+            .filter(([, value]) => value.id !== "")
+            .map(([key, value]) => [key, value.id])
+        )
+      : kind === "file"
+        ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
+        : kind === "unit"
+          ? unit?.taxonomy_tag_ids || {}
+          : kind === "upload_session"
+            ? session?.taxonomy_tag_ids || {}
+            : batch?.taxonomy_tag_ids || {};
 
   useEffect(() => {
     if (kind !== "file" || !file) {
@@ -1689,15 +2045,19 @@ function EntityDetailPanel({
 
   const viewFile = detail || file;
   const annotation: StorageAnnotation =
-    kind === "file"
-      ? detail?.annotation || file?.annotation || {}
-      : kind === "unit"
-        ? unit?.annotation || {}
-        : kind === "upload_session"
-          ? session?.annotation || {}
-          : batch?.annotation || {};
+    kind === "node"
+      ? {}
+      : kind === "file"
+        ? detail?.annotation || file?.annotation || {}
+        : kind === "unit"
+          ? unit?.annotation || {}
+          : kind === "upload_session"
+            ? session?.annotation || {}
+            : batch?.annotation || {};
   const tagIds =
-    kind === "file"
+    kind === "node"
+      ? ownTagIds
+      : kind === "file"
       ? {
           ...(detail?.batch_taxonomy_tag_ids || batch?.taxonomy_tag_ids || {}),
           ...(detail?.unit_taxonomy_tag_ids || unit?.taxonomy_tag_ids || {}),
@@ -1712,7 +2072,9 @@ function EntityDetailPanel({
           ? session?.taxonomy_tag_ids || {}
           : batch?.taxonomy_tag_ids || {};
   const tags =
-    kind === "file"
+    kind === "node"
+      ? {}
+      : kind === "file"
       ? {
           ...(detail?.batch_taxonomy_tags || batch?.taxonomy_tags || {}),
           ...(detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {}),
@@ -1752,6 +2114,8 @@ function EntityDetailPanel({
     batch?.name,
     unit?.key,
     file?.path,
+    nodeInfo?.batchName,
+    nodeInfo?.dirPath,
     session?.id,
     annotation.note,
     annotation.quality,
@@ -1832,13 +2196,15 @@ function EntityDetailPanel({
   const title =
     kind === "batch"
       ? "批次详情"
-      : kind === "unit"
-        ? "数据单元详情"
-        : kind === "file"
-          ? "文件详情"
-          : kind === "upload_session"
-            ? "上传记录"
-            : "详情";
+      : kind === "node"
+        ? "数据节点详情"
+        : kind === "unit"
+          ? "数据单元详情"
+          : kind === "file"
+            ? "文件详情"
+            : kind === "upload_session"
+              ? "上传记录"
+              : "详情";
 
   const saveAnnotation = async () => {
     if (!kind) return;
@@ -1917,6 +2283,42 @@ function EntityDetailPanel({
 
   const saveTaxonomy = async (scheme: string, raw: number | "") => {
     try {
+      if (kind === "node" && nodeInfo) {
+        const nextId = raw === "" ? null : raw;
+        const shared = nodeShare[scheme];
+        const currentId = shared?.mixed || shared?.id === "" ? null : shared?.id ?? null;
+        if (!shared?.mixed && currentId === nextId) return;
+        const schemeName = taxonomySchemeLabel(scheme, schemes);
+        const previous = nodeInfo.units.map((item) => ({
+          name: item.name,
+          taxonomy_tag_ids: {
+            [scheme]: item.taxonomy_tag_ids?.[scheme] ?? null,
+          },
+        }));
+        await execute({
+          label: `更新${schemeName}分类`,
+          do: async () => {
+            await api.storageUpdateNodeTaxonomy({
+              batch: nodeInfo.batchName,
+              units: nodeInfo.units.map((item) => ({
+                name: item.name,
+                taxonomy_tag_ids: { [scheme]: nextId },
+              })),
+            });
+            onMessage(
+              `已批量修改 ${nodeInfo.units.length} 个单元的${schemeName}`
+            );
+            await onReload();
+          },
+          undo: async () => {
+            await api.storageUpdateNodeTaxonomy({
+              batch: nodeInfo.batchName,
+              units: previous,
+            });
+          },
+        });
+        return;
+      }
       const target = metaTarget();
       if (!target) return;
       const nextId = raw === "" ? null : raw;
@@ -1961,6 +2363,17 @@ function EntityDetailPanel({
           <DetailRow label="数据单元数" value={String(batch.unit_count)} />
           <DetailRow label="文件数" value={String(batch.file_count)} />
           <DetailRow label="上传者" value={uploaderLabel(batch.uploaders)} />
+        </dl>
+      )}
+      {kind === "node" && nodeInfo && (
+        <dl className="storage-detail-list">
+          <DetailRow label="数据批次" value={nodeInfo.batchName} />
+          <DetailRow label="节点路径" value={nodeInfo.dirPath || "整个批次"} />
+          <DetailRow label="包含单元" value={String(nodeInfo.units.length)} />
+          <DetailRow
+            label="包含文件"
+            value={String(nodeInfo.units.reduce((sum, item) => sum + item.file_count, 0))}
+          />
         </dl>
       )}
       {kind === "upload_session" && session && (
@@ -2040,7 +2453,43 @@ function EntityDetailPanel({
       {kind && (
         <section className="storage-detail-tags stack">
           <h4>标签</h4>
+          {kind === "node" && nodeInfo && canEdit && (
+            <p className="muted">
+              修改后应用到该节点下所有 {nodeInfo.units.length} 个数据单元
+            </p>
+          )}
           {visibleSchemes.map((scheme) => {
+            if (kind === "node") {
+              const share = nodeShare[scheme.key];
+              const found = share?.id
+                ? nodes.find((item) => item.id === share.id)
+                : null;
+              if (!canEdit) {
+                return (
+                  <DetailRow
+                    key={scheme.key}
+                    label={taxonomySchemeLabel(scheme.key, schemes)}
+                    value={share?.mixed ? "多个取值" : found?.path || "未分类"}
+                  />
+                );
+              }
+              return (
+                <label key={scheme.key}>
+                  {taxonomySchemeLabel(scheme.key, schemes)}
+                  <TaxonomySelect
+                    scheme={scheme.key}
+                    nodes={nodes.filter((item) => item.scheme === scheme.key)}
+                    value={share?.id ?? ""}
+                    canCreate={canCreate}
+                    onNodesReload={onNodesReload}
+                    onChange={(id) => void saveTaxonomy(scheme.key, id)}
+                  />
+                  {share?.mixed ? (
+                    <small className="muted">节点内取值不一致，选择后将统一设置</small>
+                  ) : null}
+                </label>
+              );
+            }
             const inherited = parentTags[scheme.key]?.path;
             if (canEdit) {
               return (
@@ -2111,19 +2560,18 @@ function EntityDetailPanel({
             !canEdit && (
             <>
               <DetailRow label="机器人款式" value={robotStyle || "未选择"} />
-              {robotDescriptionVersions(
-                robotInstances.find((item) => item.name === robotStyle)
-              ).length > 1 || robotVersion ? (
-                <DetailRow
-                  label="机器人版本"
-                  value={robotVersionLabel(
-                    robotDescriptionVersions(
-                      robotInstances.find((item) => item.name === robotStyle)
-                    ),
-                    robotVersion
-                  )}
-                />
-              ) : null}
+              {(() => {
+                const inst = robotInstances.find((item) => item.name === robotStyle);
+                const vers = robotDescriptionVersions(inst);
+                const defFile = String(inst?.meta?.default_description_file || "");
+                const resolved = normalizeRobotVersion(vers, robotVersion, defFile);
+                return vers.length > 1 || resolved ? (
+                  <DetailRow
+                    label="机器人版本"
+                    value={robotVersionLabel(vers, resolved)}
+                  />
+                ) : null;
+              })()}
             </>
           )}
           {(kind === "file" || kind === "upload_session") &&
@@ -2269,7 +2717,7 @@ function EntityDetailPanel({
               value={qualityLabel(String(annotation.quality || ""))}
             />
           )}
-          {canEdit ? (
+          {kind !== "node" && canEdit ? (
             <>
               <label>
                 备注
@@ -2286,12 +2734,12 @@ function EntityDetailPanel({
                 {saving ? "保存中…" : saved ? "已保存" : "保存标签"}
               </button>
             </>
-          ) : (
+          ) : kind !== "node" ? (
             <DetailRow
               label="备注"
               value={String(annotation.note || "").trim() || "暂无备注"}
             />
-          )}
+          ) : null}
         </section>
       )}
       {kind === "file" && loading && <div className="muted">正在读取文件元数据…</div>}
@@ -2331,7 +2779,7 @@ function filesFromDownloadTargets(batches: StorageBatch[], units: StorageUnit[])
 }
 
 function fileRobotStyle(file: StorageFile, unit?: StorageUnit | null) {
-  return String(file.annotation?.robot_style || unit?.annotation?.robot_style || "").trim();
+  return String(file.robot_style || file.annotation?.robot_style || unit?.annotation?.robot_style || "").trim();
 }
 
 type DownloadConfirm = {
@@ -2572,6 +3020,7 @@ function UnitMatrix({
   onFile,
   canUpload,
   onQuickUpload,
+  showEmpty = true,
 }: {
   unit: StorageUnit;
   selectedFile: StorageFile | null;
@@ -2582,19 +3031,57 @@ function UnitMatrix({
     modality: string;
     motionKind?: MotionKind;
   }) => void;
+  showEmpty?: boolean;
 }) {
+  const robotFiles = unit.files.filter((f) => f.ontology === "robot");
+  const robotStyles = [
+    ...new Set(
+      robotFiles.map((f) => String(f.robot_style || f.annotation?.robot_style || "").trim()).filter(Boolean)
+    ),
+  ].sort((a, b) => a.localeCompare(b, "zh"));
+  const [robotStyle, setRobotStyle] = useState(robotStyles[0] || "");
+  const activeStyle = robotStyles.includes(robotStyle) ? robotStyle : robotStyles[0] || "";
+  const styleFilter = (file: StorageFile) => {
+    if (file.ontology !== "robot") return true;
+    if (!robotStyles.length) return true;
+    const style = String(file.robot_style || file.annotation?.robot_style || "").trim();
+    return style === activeStyle;
+  };
+
   return (
     <div className="storage-unit-matrix">
-      {(["human", "robot"] as const).map((ontology) => (
+      {(["human", "robot"] as const).map((ontology) => {
+        const hasFiles = unit.files.some((file) => file.ontology === ontology);
+        if (!showEmpty && !hasFiles) return null;
+        return (
         <section key={ontology} className="storage-ontology-card">
           <h3>{ontology === "human" ? "人体数据" : "机器人数据"}</h3>
+          {ontology === "robot" && robotStyles.length > 1 && (
+            <div className="storage-robot-style-tabs">
+              {robotStyles.map((style) => (
+                <button
+                  key={style}
+                  type="button"
+                  className={`storage-robot-style-tab ${style === activeStyle ? "active" : "secondary"}`}
+                  onClick={() => setRobotStyle(style)}
+                >
+                  {style}
+                </button>
+              ))}
+            </div>
+          )}
+          {ontology === "robot" && robotStyles.length === 1 && (
+            <div className="storage-robot-style-label">款式：{robotStyles[0]}</div>
+          )}
           {matrixRows().map(({ key, modality, motionKind, label }) => {
             const files = unit.files.filter(
               (f) =>
                 f.ontology === ontology &&
                 f.modality === modality &&
-                (!motionKind || resolveMotionKind(f.annotation?.motion_kind) === motionKind)
+                (!motionKind || resolveMotionKind(f.annotation?.motion_kind) === motionKind) &&
+                styleFilter(f)
             );
+            if (!showEmpty && !files.length) return null;
             return (
               <div className="storage-modality-row" key={key}>
                 <div
@@ -2618,7 +3105,6 @@ function UnitMatrix({
                     >
                       {file.channel ? `${file.channel}/` : ""}
                       {file.format}
-                      <span className="storage-file-uploader">{file.name}</span>
                       <span className="storage-file-uploader">
                         {file.uploader?.username || "未知用户"}
                       </span>
@@ -2651,12 +3137,130 @@ function UnitMatrix({
             );
           })}
         </section>
-      ))}
+        );
+      })}
     </div>
   );
 }
 
 type WorkspaceVariant = "browse" | "upload" | "annotate" | "manage";
+
+export const STORAGE_SORT_OPTIONS: [string, string][] = [
+  ["created_desc", "创建时间由近到远"],
+  ["created_asc", "创建时间由远到近"],
+  ["uploaded_desc", "上传时间由近到远"],
+  ["uploaded_asc", "上传时间由远到近"],
+  ["modified_desc", "修改时间由近到远"],
+  ["modified_asc", "修改时间由远到近"],
+  ["name_asc", "字符顺序 A-Z"],
+  ["name_desc", "字符顺序 Z-A"],
+];
+
+function parseSortTime(value?: string | null) {
+  if (!value) return 0;
+  const stamp = Date.parse(value);
+  return Number.isFinite(stamp) ? stamp : 0;
+}
+
+function compareNames(left: string, right: string) {
+  return left.localeCompare(right, "zh", { numeric: true, sensitivity: "base" });
+}
+
+function entitySortTimes(item: {
+  created_at?: string;
+  uploaded_at?: string;
+  modified_at?: string;
+}) {
+  return {
+    created: parseSortTime(item.created_at),
+    uploaded: parseSortTime(item.uploaded_at),
+    modified: parseSortTime(item.modified_at),
+  };
+}
+
+function sortStorageUnits(units: StorageUnit[], sortMode: string) {
+  return [...units].sort((a, b) =>
+    compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes)
+  );
+}
+
+function sortBatchNames(names: string[], units: StorageUnit[], sortMode: string) {
+  const groups = new Map<string, StorageUnit[]>();
+  for (const unit of units) {
+    const list = groups.get(unit.batch) || [];
+    list.push(unit);
+    groups.set(unit.batch, list);
+  }
+  return [...names].sort((left, right) =>
+    compareByStorageSort(
+      {
+        name: left,
+        created_at: groups.get(left)?.reduce(
+          (earliest, unit) =>
+            !earliest || (unit.created_at && unit.created_at < earliest)
+              ? unit.created_at || earliest
+              : earliest,
+          ""
+        ),
+        uploaded_at: groups.get(left)?.reduce(
+          (latest, unit) =>
+            unit.uploaded_at && unit.uploaded_at > latest ? unit.uploaded_at : latest,
+          ""
+        ),
+        modified_at: groups.get(left)?.reduce(
+          (latest, unit) =>
+            unit.modified_at && unit.modified_at > latest ? unit.modified_at : latest,
+          ""
+        ),
+      },
+      {
+        name: right,
+        created_at: groups.get(right)?.reduce(
+          (earliest, unit) =>
+            !earliest || (unit.created_at && unit.created_at < earliest)
+              ? unit.created_at || earliest
+              : earliest,
+          ""
+        ),
+        uploaded_at: groups.get(right)?.reduce(
+          (latest, unit) =>
+            unit.uploaded_at && unit.uploaded_at > latest ? unit.uploaded_at : latest,
+          ""
+        ),
+        modified_at: groups.get(right)?.reduce(
+          (latest, unit) =>
+            unit.modified_at && unit.modified_at > latest ? unit.modified_at : latest,
+          ""
+        ),
+      },
+      sortMode,
+      (item) => item.name,
+      entitySortTimes
+    )
+  );
+}
+
+function compareByStorageSort<T>(
+  left: T,
+  right: T,
+  sortMode: string,
+  nameOf: (item: T) => string,
+  timesOf: (item: T) => { created: number; uploaded: number; modified: number }
+) {
+  const nameCmp = compareNames(nameOf(left), nameOf(right));
+  const a = timesOf(left);
+  const b = timesOf(right);
+  let primary = 0;
+  if (sortMode === "created_desc") primary = b.created - a.created;
+  else if (sortMode === "created_asc") primary = a.created - b.created;
+  else if (sortMode === "uploaded_desc") primary = b.uploaded - a.uploaded;
+  else if (sortMode === "uploaded_asc") primary = a.uploaded - b.uploaded;
+  else if (sortMode === "modified_desc") primary = b.modified - a.modified;
+  else if (sortMode === "modified_asc") primary = a.modified - b.modified;
+  else if (sortMode === "name_desc") return -nameCmp;
+  else return nameCmp;
+  return primary || nameCmp;
+}
 
 export function StorageWorkspace({
   variant = "browse",
@@ -2677,7 +3281,7 @@ export function StorageWorkspace({
     setTagExact(Boolean(exact) && id != null);
   };
   const [query, setQuery] = useState("");
-  const [sortMode, setSortMode] = useState("name_asc");
+  const [sortMode, setSortMode] = useState("created_desc");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [focus, setFocus] = useState<{ kind: DetailKind; key: string } | null>(null);
   const preview = usePreview();
@@ -2798,22 +3402,8 @@ export function StorageWorkspace({
 
   const displayData = useMemo(() => {
     if (!data) return null;
-    const createdTimestamp = (unit: StorageUnit) => {
-      const times = unit.files.map((file) => Date.parse(file.modified_at) || 0);
-      return times.length ? Math.min(...times) : 0;
-    };
-    const modifiedTimestamp = (unit: StorageUnit) => {
-      const times = unit.files.map((file) => Date.parse(file.modified_at) || 0);
-      return times.length ? Math.max(...times) : 0;
-    };
-    const compareUnits = (a: StorageUnit, b: StorageUnit) => {
-      if (sortMode === "name_desc") return b.name.localeCompare(a.name);
-      if (sortMode === "modified_desc") return modifiedTimestamp(b) - modifiedTimestamp(a);
-      if (sortMode === "modified_asc") return modifiedTimestamp(a) - modifiedTimestamp(b);
-      if (sortMode === "created_desc") return createdTimestamp(b) - createdTimestamp(a);
-      if (sortMode === "created_asc") return createdTimestamp(a) - createdTimestamp(b);
-      return a.name.localeCompare(b.name);
-    };
+    const compareUnits = (a: StorageUnit, b: StorageUnit) =>
+      compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes);
     const known = new Set(data.batches.map((batch) => batch.name));
     const placeholderBatches = extraBatches
       .filter((name) => !known.has(name))
@@ -2831,9 +3421,7 @@ export function StorageWorkspace({
     const batches = [...data.batches, ...placeholderBatches]
       .map((batch) => ({ ...batch, units: [...batch.units].sort(compareUnits) }))
       .sort((a, b) =>
-        sortMode === "name_desc"
-          ? b.name.localeCompare(a.name)
-          : a.name.localeCompare(b.name)
+        compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes)
       );
     return { ...data, batches };
   }, [data, extraBatches, sortMode]);
@@ -2855,6 +3443,56 @@ export function StorageWorkspace({
     if (focus?.kind !== "batch") return null;
     return displayData?.batches.find((item) => item.name === focus.key) || null;
   }, [displayData, focus]);
+
+  const focusedNode = useMemo(() => {
+    if (focus?.kind !== "node" || !displayData) return null;
+    const splitAt = focus.key.indexOf("::");
+    const batchName = splitAt >= 0 ? focus.key.slice(0, splitAt) : focus.key;
+    const dirPath = splitAt >= 0 ? focus.key.slice(splitAt + 2) : "";
+    const nodeBatch = displayData.batches.find((item) => item.name === batchName);
+    if (!nodeBatch) return null;
+    return {
+      batchName,
+      dirPath,
+      units: unitsUnderPath(nodeBatch.units, dirPath),
+    };
+  }, [displayData, focus]);
+
+  const lastVisualizedRef = useRef<StorageFile | null>(preview.activeFile);
+  useEffect(() => {
+    if (preview.activeFile) lastVisualizedRef.current = preview.activeFile;
+  }, [preview.activeFile]);
+
+  const previewUnitFile = (unit: StorageUnit, keepFocus: boolean) => {
+    const file = pickPreviewFile(unit.files, lastVisualizedRef.current);
+    if (!file) return;
+    lastVisualizedRef.current = file;
+    preview.add(file);
+    if (!keepFocus) {
+      setSelectedKey(unit.key);
+      setFocus({ kind: "file", key: file.path });
+    }
+  };
+
+  const previewRandomUnit = (units: StorageUnit[], keepFocus: boolean) => {
+    const playable = units.filter((unit) =>
+      unit.files.some((file) => isVisualizableStorageFile(file))
+    );
+    if (!playable.length) return;
+    const unit = playable[Math.floor(Math.random() * playable.length)];
+    previewUnitFile(unit, keepFocus);
+  };
+
+  const unitsForTaxonomyNode = (id: number, exact: boolean) => {
+    const node = nodes.find((item) => item.id === id);
+    if (!node) return [];
+    return classificationUnits.filter((unit) => {
+      const taggedId = unit.taxonomy_tag_ids?.[node.scheme];
+      if (exact) return taggedId === node.id;
+      const tagged = nodes.find((item) => item.id === taggedId);
+      return !!tagged && tagged.path.startsWith(node.path);
+    });
+  };
 
   const ownsSelected = !!(user && selected && unitOwnedBy(selected, user.id));
   const ownsFocusedBatch = !!(
@@ -3167,14 +3805,7 @@ export function StorageWorkspace({
         )}
         <div className="storage-filter-line">
           <span className="muted">排序方式：</span>
-          {[
-            ["created_asc", "创建时间正序"],
-            ["created_desc", "创建时间倒序"],
-            ["modified_asc", "修改时间正序"],
-            ["modified_desc", "修改时间倒序"],
-            ["name_asc", "字符顺序 A-Z"],
-            ["name_desc", "字符顺序 Z-A"],
-          ].map(([value, label]) => (
+          {STORAGE_SORT_OPTIONS.map(([value, label]) => (
             <button
               key={value}
               type="button"
@@ -3256,12 +3887,11 @@ export function StorageWorkspace({
                   value={sortMode}
                   onChange={(e) => setSortMode(e.target.value)}
                 >
-                  <option value="created_asc">创建时间正序</option>
-                  <option value="created_desc">创建时间倒序</option>
-                  <option value="modified_asc">修改时间正序</option>
-                  <option value="modified_desc">修改时间倒序</option>
-                  <option value="name_asc">字符顺序 A-Z</option>
-                  <option value="name_desc">字符顺序 Z-A</option>
+                  {STORAGE_SORT_OPTIONS.map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
                 </select>
               </div>
               <div className="storage-filter-line">
@@ -3287,13 +3917,21 @@ export function StorageWorkspace({
               <TaxonomyTreePanel
                 nodes={currentNodes}
                 units={classificationUnits}
+                sortMode={sortMode}
                 selectedId={tagId}
                 selectedExact={tagExact}
                 selectedKey={selectedKey}
-                onSelect={selectTag}
+                onSelect={(id, exact) => {
+                  selectTag(id, exact);
+                  if (id != null) previewRandomUnit(unitsForTaxonomyNode(id, !!exact), false);
+                }}
                 onUnitSelect={(unit) => {
                   setSelectedKey(unit.key);
-                  setFocus({ kind: "unit", key: unit.key });
+                  setActiveSessionId(null);
+                  previewUnitFile(unit, false);
+                  if (!pickPreviewFile(unit.files, lastVisualizedRef.current)) {
+                    setFocus({ kind: "unit", key: unit.key });
+                  }
                 }}
                 canDownload={canDownloadItems}
                 currentUserId={user?.id}
@@ -3307,12 +3945,16 @@ export function StorageWorkspace({
               <UploaderTreePanel
                 uploaders={data?.uploaders || []}
                 units={data?.units || []}
+                sortMode={sortMode}
                 selectedId={tagId}
                 selectedKey={selectedKey}
                 onSelect={setTagId}
                 onUnitSelect={(unit) => {
                   setSelectedKey(unit.key);
-                  setFocus({ kind: "unit", key: unit.key });
+                  previewUnitFile(unit, false);
+                  if (!unit.files.some((file) => isVisualizableStorageFile(file))) {
+                    setFocus({ kind: "unit", key: unit.key });
+                  }
                 }}
                 canDownload={canDownloadItems}
                 currentUserId={user?.id}
@@ -3335,18 +3977,19 @@ export function StorageWorkspace({
                   );
                 })
                 .slice()
-                .sort((left, right) => {
-                  if (sortMode === "created_asc") {
-                    return left.created_at.localeCompare(right.created_at);
-                  }
-                  if (sortMode === "name_asc") {
-                    return left.batch.localeCompare(right.batch, "zh");
-                  }
-                  if (sortMode === "name_desc") {
-                    return right.batch.localeCompare(left.batch, "zh");
-                  }
-                  return right.created_at.localeCompare(left.created_at);
-                })}
+                .sort((left, right) =>
+                  compareByStorageSort(
+                    left,
+                    right,
+                    sortMode,
+                    (item) => item.batch,
+                    (item) => ({
+                      created: parseSortTime(item.created_at),
+                      uploaded: parseSortTime(item.created_at),
+                      modified: parseSortTime(item.created_at),
+                    })
+                  )
+                )}
               units={data?.units || []}
               selectedSessionId={activeSessionId}
               selectedUnitKey={
@@ -3363,8 +4006,11 @@ export function StorageWorkspace({
               }}
               onSelectUnit={(session, unit) => {
                 setActiveSessionId(session.id);
-                setFocus({ kind: "unit", key: unit.key });
                 setSelectedKey(unit.key);
+                previewUnitFile(unit, false);
+                if (!unit.files.some((file) => isVisualizableStorageFile(file))) {
+                  setFocus({ kind: "unit", key: unit.key });
+                }
               }}
               onDeleteSession={(session) => void handleDeleteUploadSession(session)}
               onDeleteSessionUnit={(session, unit) => {
@@ -3381,15 +4027,24 @@ export function StorageWorkspace({
             <UnitTree
               data={displayData || { updated_at: "", modalities: [], ontologies: [], uploaders: [], batches: [], units: [], files: [] }}
               selectedUnit={focus?.kind === "unit" || focus?.kind === "file" ? selectedKey : null}
-              selectedBatch={focus?.kind === "batch" ? focus.key : selected?.batch || null}
+              selectedNodeKey={focus?.kind === "node" ? focus.key : null}
               onSelectUnit={(unit) => {
                 setActiveSessionId(null);
                 setSelectedKey(unit.key);
-                setFocus({ kind: "unit", key: unit.key });
+                previewUnitFile(unit, false);
+                if (!unit.files.some((file) => isVisualizableStorageFile(file))) {
+                  setFocus({ kind: "unit", key: unit.key });
+                }
               }}
-              onSelectBatch={(batch) => {
+              onSelectNode={(key) => {
                 setActiveSessionId(null);
-                setFocus({ kind: "batch", key: batch.name });
+                setSelectedKey(null);
+                setFocus({ kind: "node", key });
+                const splitAt = key.indexOf("::");
+                const batchName = splitAt >= 0 ? key.slice(0, splitAt) : key;
+                const dirPath = splitAt >= 0 ? key.slice(splitAt + 2) : "";
+                const batch = displayData?.batches.find((item) => item.name === batchName);
+                if (batch) previewRandomUnit(unitsUnderPath(batch.units, dirPath), true);
               }}
               canEdit={canManageItems}
               canDownload={canDownloadItems}
@@ -3414,6 +4069,21 @@ export function StorageWorkspace({
               </div>
               <div className="storage-preview-empty">
                 已选中数据批次。请在右侧查看或设置批次标签，或从左侧选择数据单元。
+              </div>
+            </>
+          )}
+          {focus?.kind === "node" && focusedNode && (
+            <>
+              <div>
+                <h2 style={{ margin: 0 }}>{focusedNode.dirPath || focusedNode.batchName}</h2>
+                <span className="muted">
+                  {focusedNode.batchName}
+                  {focusedNode.dirPath ? ` / ${focusedNode.dirPath}` : ""} · {focusedNode.units.length} 个单元 ·{" "}
+                  {focusedNode.units.reduce((sum, item) => sum + item.file_count, 0)} 个文件
+                </span>
+              </div>
+              <div className="storage-preview-empty">
+                已选中数据节点。请在右侧查看或批量设置其下所有数据单元的标签。
               </div>
             </>
           )}
@@ -3462,10 +4132,10 @@ export function StorageWorkspace({
               </div>
             </>
           )}
-          {focus?.kind !== "batch" && focus?.kind !== "upload_session" && !selected && (
+          {focus?.kind !== "batch" && focus?.kind !== "node" && focus?.kind !== "upload_session" && !selected && (
             <div className="storage-preview-empty">请选择一个数据批次、上传记录或数据单元</div>
           )}
-          {focus?.kind !== "batch" && focus?.kind !== "upload_session" && selected && (
+          {focus?.kind !== "batch" && focus?.kind !== "node" && focus?.kind !== "upload_session" && selected && (
             <>
               <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
                 <div>
@@ -3555,6 +4225,7 @@ export function StorageWorkspace({
                 }}
                 canUpload={canUpload}
                 onQuickUpload={setQuickPreset}
+                showEmpty={variant === "upload" || variant === "manage"}
               />
 
             </>
@@ -3571,13 +4242,14 @@ export function StorageWorkspace({
           batch={
             focusedBatch ||
             displayData?.batches.find(
-              (item) => item.name === (selected?.batch || focusedFile?.batch)
+              (item) => item.name === (selected?.batch || focusedFile?.batch || focusedNode?.batchName)
             ) ||
             null
           }
           unit={selected}
           file={focus?.kind === "file" ? focusedFile : null}
           session={focusedSession}
+          nodeInfo={focusedNode}
           schemes={schemes}
           nodes={nodes}
           canEdit={variant !== "browse" && canAnnotateSelected}

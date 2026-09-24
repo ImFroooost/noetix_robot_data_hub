@@ -342,6 +342,25 @@ function expandSkeletonBox(root: THREE.Object3D, box: THREE.Box3) {
   }
 }
 
+/** 取骨骼最多的那棵骨架。道具、刚体点不会和人体绑在同一棵树上。 */
+function primaryBoneRoot(root: THREE.Object3D): THREE.Object3D | null {
+  let best: THREE.Object3D | null = null;
+  let bestCount = 0;
+  root.traverse((obj) => {
+    if (!(obj as THREE.Bone).isBone) return;
+    if (obj.parent && (obj.parent as THREE.Bone).isBone) return;
+    let count = 0;
+    obj.traverse((child) => {
+      if ((child as THREE.Bone).isBone) count += 1;
+    });
+    if (count > bestCount) {
+      best = obj;
+      bestCount = count;
+    }
+  });
+  return bestCount >= 2 ? best : null;
+}
+
 function styleSkeletonHelper(helper: THREE.SkeletonHelper, look?: { bone: string }) {
   const mat = helper.material as THREE.LineBasicMaterial;
   mat.depthTest = false;
@@ -566,13 +585,14 @@ export function FbxScene({
         let spanZ = 0;
         let midY = 0;
         let midZ = 0;
+        const measureRoot = primaryBoneRoot(obj) ?? obj;
         const n = probeAction && probeMixer ? 24 : 1;
         for (let i = 0; i < n; i++) {
           if (probeAction && probeMixer) {
             probeAction.time = (i / Math.max(n - 1, 1)) * clipDur;
             probeMixer.update(0);
           }
-          expandSkeletonBox(obj, _bvhBox);
+          expandSkeletonBox(measureRoot, _bvhBox);
           if (_bvhBox.isEmpty()) continue;
           const mid = _bvhBox.getCenter(_bvhHips);
           sumX += mid.x;
@@ -761,6 +781,8 @@ export function AnimationFormatPreview({
     setGlProblem("");
     setDetectedUp("y");
     setDetectedUnit("m");
+    setUpAxisMode("auto");
+    setUnitMode("auto");
   }, [url]);
 
   useEffect(() => {

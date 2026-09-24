@@ -1,7 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { NavLink, Outlet, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../auth";
+import { subscribeLoading } from "../loadingState";
 import { ThemeToggle } from "../theme";
 import { IndexRefreshControl } from "./IndexRefreshControl";
 import { RoleHelpDialog, useRoleHelpAutoOpen } from "./RoleHelpDialog";
@@ -15,9 +16,9 @@ const SIDEBAR_KEY = "hub-sidebar-collapsed";
 
 const PAGES: Record<string, { title: string; subtitle: string }> = {
   "/": { title: "浏览", subtitle: "按批次、分类和上传记录查找数据" },
-  "/upload": { title: "上传", subtitle: "导入文件夹或压缩包，并补齐分类" },
-  "/annotate": { title: "标注", subtitle: "为范围内的数据补充标签与评价" },
-  "/manage": { title: "数据管理", subtitle: "整理批次、单元，并处理过期文件" },
+  "/?mode=upload": { title: "上传", subtitle: "导入文件夹或压缩包，并补齐分类" },
+  "/?mode=annotate": { title: "标注", subtitle: "为范围内的数据补充标签与评价" },
+  "/?mode=manage": { title: "数据管理", subtitle: "整理批次、单元，并处理过期文件" },
   "/taxonomies": { title: "分类管理", subtitle: "维护项目、地点等分类标准" },
   "/robots": { title: "3D 模型", subtitle: "管理人体与机器人的描述和网格" },
   "/users": { title: "用户与权限", subtitle: "开账号、配范围，并进入对方视角验收" },
@@ -39,7 +40,19 @@ export function Layout() {
   });
   const { open: helpOpen, setOpen: setHelpOpen } = useRoleHelpAutoOpen(user?.role);
   const [pwOpen, setPwOpen] = useState(false);
-  const page = PAGES[location.pathname] || PAGES["/"];
+  const [loadingActive, setLoadingActive] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState("");
+  const [searchParams] = useSearchParams();
+  const currentMode = searchParams.get("mode") || "browse";
+
+  useEffect(() => {
+    return subscribeLoading((active, label) => {
+      setLoadingActive(active);
+      setLoadingLabel(label);
+    });
+  }, []);
+  const pageKey = location.pathname + (location.search || "");
+  const page = PAGES[pageKey] || PAGES["/"];
 
   const toggleCollapsed = () => {
     setCollapsed((current) => {
@@ -151,21 +164,21 @@ export function Layout() {
             </button>
           </div>
           <nav className="sidebar-nav">
-            <SideLink to="/" end icon={<IconBrowse />} onClick={() => setNavOpen(false)}>
+            <SideLink to="/?mode=browse" icon={<IconBrowse />} onClick={() => setNavOpen(false)} activeMode={currentMode === "browse"}>
               浏览
             </SideLink>
             {hasPerm("upload") && (
-              <SideLink to="/upload" icon={<IconUpload />} onClick={() => setNavOpen(false)}>
+              <SideLink to="/?mode=upload" icon={<IconUpload />} onClick={() => setNavOpen(false)} activeMode={currentMode === "upload"}>
                 上传
               </SideLink>
             )}
             {hasPerm("annotate") && (
-              <SideLink to="/annotate" icon={<IconAnnotate />} onClick={() => setNavOpen(false)}>
+              <SideLink to="/?mode=annotate" icon={<IconAnnotate />} onClick={() => setNavOpen(false)} activeMode={currentMode === "annotate"}>
                 标注
               </SideLink>
             )}
             {hasPerm("manage_data") && (
-              <SideLink to="/manage" icon={<IconManage />} onClick={() => setNavOpen(false)}>
+              <SideLink to="/?mode=manage" icon={<IconManage />} onClick={() => setNavOpen(false)} activeMode={currentMode === "manage"}>
                 数据管理
               </SideLink>
             )}
@@ -205,6 +218,12 @@ export function Layout() {
               <p>{page.subtitle}</p>
             </div>
             <div className="app-top-actions">
+              {loadingActive && (
+                <span className="global-loading-indicator">
+                  <span className="global-loading-spinner" />
+                  {loadingLabel || "处理中…"}
+                </span>
+              )}
               <HistoryButtons />
               <IndexRefreshControl className="btn-primary" />
               <button
@@ -262,25 +281,25 @@ export function Layout() {
 
 function SideLink({
   to,
-  end,
   icon,
   children,
   onClick,
+  activeMode,
 }: {
   to: string;
   end?: boolean;
   icon: ReactNode;
   children: ReactNode;
   onClick: () => void;
+  activeMode?: boolean;
 }) {
   const label = typeof children === "string" ? children : undefined;
   return (
     <NavLink
       to={to}
-      end={end}
       title={label}
       onClick={onClick}
-      className={({ isActive }) => (isActive ? "is-active" : undefined)}
+      className={() => (activeMode ? "is-active" : undefined)}
     >
       {icon}
       <span>{children}</span>

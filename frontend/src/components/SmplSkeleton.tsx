@@ -603,6 +603,10 @@ export function SmplPreview({ file }: { file: StorageFile }) {
     setDuration(0);
   }, [url, modelUrl]);
 
+  useEffect(() => {
+    setUpAxisMode("auto");
+  }, [file.path]);
+
   const upAxisLabel = upAxisModeLabel(upAxisMode, detectedUp);
   const cycleUpAxis = () => {
     setUpAxisMode(cycleUpAxisMode(upAxisMode));

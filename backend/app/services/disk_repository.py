@@ -65,6 +65,92 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _iso_or_empty(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _min_iso(values: list[str]) -> str:
+    items = [item for item in values if item]
+    return min(items) if items else ""
+
+
+def _max_iso(values: list[str]) -> str:
+    items = [item for item in values if item]
+    return max(items) if items else ""
+
+
+def _ensure_created_at(row: dict[str, Any], fallback: str | None = None) -> str:
+    current = _iso_or_empty(row.get("created_at"))
+    if current:
+        return current
+    stamp = fallback or _now()
+    row["created_at"] = stamp
+    return stamp
+
+
+def _file_uploaded_at(rec: dict[str, Any]) -> str:
+    uploader = rec.get("uploader") or {}
+    return _iso_or_empty(rec.get("uploaded_at")) or _iso_or_empty(uploader.get("uploaded_at"))
+
+
+def _file_annotated_at(rec: dict[str, Any], metadata: dict[str, Any]) -> str:
+    row = (metadata.get("files") or {}).get(rec.get("path")) or {}
+    return _iso_or_empty(row.get("updated_at")) or _iso_or_empty(rec.get("annotated_at"))
+
+
+def _attach_sort_timestamps(
+    units: list[dict[str, Any]],
+    batches: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> None:
+    """Fill created/uploaded/modified times used by the browse sort bar.
+
+    created_at: first time the unit/batch appeared in repository.json
+    uploaded_at: latest file upload time inside the unit/batch
+    modified_at: latest file upload or annotation-edit time inside the unit/batch
+    """
+    units_meta = metadata.get("units") or {}
+    batches_meta = metadata.get("batches") or {}
+    for unit in units:
+        files = unit.get("files") or []
+        for rec in files:
+            rec["uploaded_at"] = _file_uploaded_at(rec)
+        key = str(unit.get("key") or unit_key(str(unit.get("batch") or ""), str(unit.get("name") or "")))
+        row = units_meta.get(key) or {}
+        created = (
+            _iso_or_empty(row.get("created_at"))
+            or _iso_or_empty((unit.get("meta") or {}).get("created_at"))
+            or _iso_or_empty(unit.get("created_at"))
+        )
+        uploads = [_file_uploaded_at(rec) for rec in files]
+        annots = [_file_annotated_at(rec, metadata) for rec in files]
+        unit_updated = _iso_or_empty(row.get("updated_at")) or _iso_or_empty(unit.get("updated_at"))
+        uploaded = _max_iso(uploads)
+        modified = _max_iso([uploaded, *annots, unit_updated])
+        if not created:
+            created = _min_iso([*uploads, *(_iso_or_empty(rec.get("modified_at")) for rec in files), unit_updated])
+        unit["created_at"] = created
+        unit["uploaded_at"] = uploaded
+        unit["modified_at"] = modified
+    for batch in batches:
+        row = batches_meta.get(batch.get("name") or "") or {}
+        kids = batch.get("units") or []
+        created = (
+            _iso_or_empty(row.get("created_at"))
+            or _iso_or_empty((batch.get("meta") or {}).get("created_at"))
+            or _iso_or_empty(batch.get("created_at"))
+        )
+        uploaded = _max_iso([_iso_or_empty(unit.get("uploaded_at")) for unit in kids])
+        modified = _max_iso(
+            [*(_iso_or_empty(unit.get("modified_at")) for unit in kids), _iso_or_empty(row.get("updated_at"))]
+        )
+        if not created:
+            created = _min_iso([_iso_or_empty(unit.get("created_at")) for unit in kids])
+        batch["created_at"] = created
+        batch["uploaded_at"] = uploaded
+        batch["modified_at"] = modified
+
+
 def root() -> Path:
     path = Path(settings.hub_repo_root)
     ensure_layout(path)
@@ -194,6 +280,12 @@ def _unit_meta_for_names(
         extra = dict(merged.get("meta") or {})
         extra.update(raw.get("meta") or {})
         merged["meta"] = extra
+        created = _min_iso([_iso_or_empty(merged.get("created_at")), _iso_or_empty(raw.get("created_at"))])
+        if created:
+            merged["created_at"] = created
+        updated = _max_iso([_iso_or_empty(merged.get("updated_at")), _iso_or_empty(raw.get("updated_at"))])
+        if updated:
+            merged["updated_at"] = updated
     return merged
 
 
@@ -201,18 +293,22 @@ def _file_id(rel_path: str) -> str:
     return hashlib.sha1(rel_path.encode("utf-8")).hexdigest()[:20]
 
 
-def _file_record(path: Path, base: Path, parsed: dict[str, str]) -> dict[str, Any]:
+def _file_record(path: Path, base: Path, parsed: dict[str, Any]) -> dict[str, Any]:
     stat = path.stat()
     rel = path.relative_to(base).as_posix()
-    return {
+    record: dict[str, Any] = {
         "id": _file_id(rel),
         "path": rel,
         "name": path.name,
-        "unit_name": normalize_unit_stem(path.stem) or path.stem,
         "size": stat.st_size,
         "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-        **parsed,
     }
+    if "unit_name" in parsed:
+        record["unit_name"] = parsed.pop("unit_name")
+    else:
+        record["unit_name"] = normalize_unit_stem(path.stem) or path.stem
+    record.update(parsed)
+    return record
 
 
 def _media_cache_valid(cached: dict[str, Any] | None, path: Path) -> bool:
@@ -295,9 +391,10 @@ def _attach_file_tags(record: dict[str, Any], metadata: dict[str, Any]) -> dict[
 
 def _unit_tag_index(
     metadata: dict[str, Any],
-) -> tuple[dict[tuple[str, str], dict[str, int]], dict[str, list[tuple[str, dict[str, int]]]]]:
+) -> tuple[dict[tuple[str, str], dict[str, int]], dict[str, list[tuple[str, dict[str, int]]]], dict[str, dict[str, dict[str, int]]]]:
     exact: dict[tuple[str, str], dict[str, int]] = {}
     by_batch: dict[str, list[tuple[str, dict[str, int]]]] = defaultdict(list)
+    normalized: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
     for key, row in (metadata.get("units") or {}).items():
         if "::" not in str(key):
             continue
@@ -305,7 +402,9 @@ def _unit_tag_index(
         tags = _as_tag_ids((row or {}).get("taxonomy_tag_ids"))
         exact[(batch, name)] = tags
         by_batch[batch].append((name, tags))
-    return exact, by_batch
+        norm = normalize_unit_stem(name) or name
+        normalized[batch].setdefault(norm, {}).update(tags)
+    return exact, by_batch, normalized
 
 
 def _lookup_unit_tags(
@@ -313,11 +412,18 @@ def _lookup_unit_tags(
     by_batch: dict[str, list[tuple[str, dict[str, int]]]],
     batch: str,
     unit_name: str,
+    normalized: dict[str, dict[str, dict[str, int]] | None] | None = None,
 ) -> dict[str, int]:
     tags = dict(exact.get((batch, unit_name)) or {})
-    for name, row_tags in by_batch.get(batch, []):
-        if name != unit_name and stems_same_unit(name, unit_name):
-            tags.update(row_tags)
+    if normalized is not None:
+        norm = normalize_unit_stem(unit_name) or unit_name
+        norm_tags = (normalized.get(batch) or {}).get(norm)
+        if norm_tags:
+            tags.update(norm_tags)
+    else:
+        for name, row_tags in by_batch.get(batch, []):
+            if name != unit_name and stems_same_unit(name, unit_name):
+                tags.update(row_tags)
     return tags
 
 
@@ -325,13 +431,13 @@ def _inherit_file_tags(
     units: list[dict[str, Any]],
     metadata: dict[str, Any],
 ) -> None:
-    exact, by_batch = _unit_tag_index(metadata)
+    exact, by_batch, normalized = _unit_tag_index(metadata)
     batch_tags = {
         name: _as_tag_ids((row or {}).get("taxonomy_tag_ids"))
         for name, row in (metadata.get("batches") or {}).items()
     }
     for unit in units:
-        unit_tags = _lookup_unit_tags(exact, by_batch, unit["batch"], unit["name"])
+        unit_tags = _lookup_unit_tags(exact, by_batch, unit["batch"], unit["name"], normalized)
         if unit_tags:
             unit["taxonomy_tag_ids"] = unit_tags
         else:
@@ -439,6 +545,7 @@ def _merge_tag_updates(
         row["annotation"] = {**(row.get("annotation") or {}), **annotation}
     if meta is not None:
         row["meta"] = {**(row.get("meta") or {}), **meta}
+    _ensure_created_at(row)
     row["updated_at"] = _now()
 
 
@@ -494,15 +601,42 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
     parts = path.relative_to(base / "data").parts
     if len(parts) < 5:
         return None
-    ontology, modality = parts[0], parts[1]
-    if ontology not in ONTOLOGIES or modality not in MODALITIES:
+    ontology = parts[0]
+    if ontology not in ONTOLOGIES:
+        return None
+    robot_style = ""
+    if ontology == "robot" and parts[1] not in MODALITIES:
+        robot_style = parts[1]
+        modality = parts[2]
+        idx = 3
+    else:
+        modality = parts[1]
+        idx = 2
+    if modality not in MODALITIES:
         return None
     if modality == "fpv_video":
-        if len(parts) < 6 or parts[2] not in FPV_CHANNELS:
+        if len(parts) < idx + 3 or parts[idx] not in FPV_CHANNELS:
             return None
-        channel, fmt, batch = parts[2], parts[3], parts[4]
+        channel, fmt, batch = parts[idx], parts[idx + 1], parts[idx + 2]
+        rest_start = idx + 3
     else:
-        channel, fmt, batch = "", parts[2], parts[3]
+        if len(parts) < idx + 3:
+            return None
+        channel, fmt, batch = "", parts[idx], parts[idx + 1]
+        rest_start = idx + 2
+    # Everything after batch is sub_path + filename
+    remaining = parts[rest_start:]
+    if len(remaining) < 1:
+        return None
+    sub_path = ""
+    if len(remaining) > 1:
+        sub_path = "/".join(remaining[:-1])
+    filename = remaining[-1]
+    stem = Path(filename).stem
+    if sub_path:
+        unit_name = normalize_unit_stem((sub_path + "/" + stem).replace("/", "_")) or (sub_path + "_" + stem).replace("/", "_")
+    else:
+        unit_name = normalize_unit_stem(stem) or stem
     return _file_record(
         path,
         base,
@@ -512,6 +646,9 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
             "channel": channel,
             "format": fmt,
             "batch": batch,
+            "robot_style": robot_style,
+            "unit_name": unit_name,
+            "sub_path": sub_path,
         },
     )
 
@@ -557,12 +694,6 @@ def _scan_data_live(
     stems_by_batch: dict[str, list[str]] = defaultdict(list)
     for rec in files:
         stems_by_batch[rec["batch"]].append(rec["unit_name"])
-    if include_empty:
-        for key in (metadata.get("units") or {}):
-            if "::" not in key:
-                continue
-            batch, name = key.split("::", 1)
-            stems_by_batch[batch].append(name)
     canon_by_batch = {
         batch: cluster_unit_names(names) for batch, names in stems_by_batch.items()
     }
@@ -616,30 +747,6 @@ def _scan_data_live(
                 "uploaders": list(uploaders.values()),
             }
         )
-    if include_empty:
-        existing_keys = {item["key"] for item in units}
-        for key, raw_meta in sorted((metadata.get("units") or {}).items()):
-            if key in existing_keys or "::" not in key:
-                continue
-            batch, name = key.split("::", 1)
-            canon = canon_by_batch.get(batch, {}).get(name, name)
-            if unit_key(batch, canon) in existing_keys:
-                continue
-            batch_names.add(batch)
-            meta = dict(raw_meta or {})
-            units.append(
-                {
-                    "key": key,
-                    "batch": batch,
-                    "name": name,
-                    "file_count": 0,
-                    "files": [],
-                    "taxonomy_tag_ids": meta.get("taxonomy_tag_ids") or {},
-                    "annotation": meta.get("annotation") or {},
-                    "meta": meta.get("meta") or {},
-                    "uploaders": [],
-                }
-            )
 
     units_by_batch: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in units:
@@ -685,6 +792,7 @@ def _scan_data_live(
             {"id": -1, "username": "历史数据（上传者未知）", "file_count": unknown_count}
         )
     _inherit_file_tags(units, metadata)
+    _attach_sort_timestamps(units, batches, metadata)
     return {
         "updated_at": _now(),
         "modalities": list(MODALITIES),
@@ -873,14 +981,13 @@ def _overlay_metadata(
     file_by_path = {item["path"]: item for item in files if item.get("path")}
 
     units: list[dict[str, Any]] = []
-    seen_keys: set[str] = set()
     for unit in snapshot.get("units") or []:
         unit_files = []
         for rec in unit.get("files") or []:
             live = file_by_path.get(rec.get("path"))
             if live is not None:
                 unit_files.append(live)
-        if not unit_files and not include_empty:
+        if not unit_files:
             continue
         item = dict(unit)
         item["files"] = unit_files
@@ -904,29 +1011,11 @@ def _overlay_metadata(
             item["taxonomy_tag_ids"] = dict(meta.get("taxonomy_tag_ids") or item["taxonomy_tag_ids"])
             item["annotation"] = dict(meta.get("annotation") or item["annotation"])
             item["meta"] = dict(meta.get("meta") or item.get("meta") or {})
+            if meta.get("created_at"):
+                item["created_at"] = meta["created_at"]
+            if meta.get("updated_at"):
+                item["updated_at"] = meta["updated_at"]
         units.append(item)
-        seen_keys.add(str(item.get("key") or unit_key(item.get("batch") or "", item.get("name") or "")))
-
-    if include_empty:
-        for key, raw_meta in (metadata.get("units") or {}).items():
-            if key in seen_keys or "::" not in str(key):
-                continue
-            batch, name = str(key).split("::", 1)
-            meta = dict(raw_meta or {})
-            units.append(
-                {
-                    "key": key,
-                    "batch": batch,
-                    "name": name,
-                    "file_count": 0,
-                    "files": [],
-                    "taxonomy_tag_ids": meta.get("taxonomy_tag_ids") or {},
-                    "annotation": meta.get("annotation") or {},
-                    "meta": meta.get("meta") or {},
-                    "uploaders": [],
-                }
-            )
-            seen_keys.add(key)
 
     _inherit_file_tags(units, metadata)
 
@@ -984,6 +1073,7 @@ def _overlay_metadata(
         uploaders.append(
             {"id": -1, "username": "历史数据（上传者未知）", "file_count": unknown_count}
         )
+    _attach_sort_timestamps(units, batches, metadata)
     return {
         "updated_at": snapshot.get("updated_at") or _now(),
         "index_updated_at": snapshot.get("updated_at") or _now(),
@@ -1036,6 +1126,78 @@ def scan_models(*, live: bool = False) -> dict[str, Any]:
     return _scan_models_live()
 
 
+def _sync_robot_style_from_dirs(data: dict[str, Any]) -> None:
+    """Update file annotation robot_style based on directory structure.
+
+    For robot files stored under ``data/robot/{style}/...``, write the style
+    into the file's annotation metadata so it persists across rescans.
+    """
+    updates: dict[str, str] = {}
+    for rec in data.get("files") or []:
+        if rec.get("ontology") != "robot":
+            continue
+        path_style = str(rec.get("robot_style") or "").strip()
+        if not path_style:
+            continue
+        ann_style = str((rec.get("annotation") or {}).get("robot_style") or "").strip()
+        if ann_style == path_style:
+            continue
+        updates[rec["path"]] = path_style
+    if not updates:
+        return
+
+    def mutate(meta):
+        files = meta.setdefault("files", {})
+        for path, style in updates.items():
+            row = files.setdefault(path, {})
+            ann = dict(row.get("annotation") or {})
+            ann["robot_style"] = style
+            row["annotation"] = ann
+
+    update_metadata(mutate)
+
+
+def prune_units_without_files(units: list[dict[str, Any]] | None = None) -> int:
+    """Drop unit metadata that no longer has any data file.
+
+    Alias records that still match a file-backed unit (for example a
+    ``skeleton`` suffix) are kept, because their tags belong to that unit.
+    """
+    if units is None:
+        units = scan_data(include_empty=False).get("units") or []
+    backed: dict[str, set[str]] = defaultdict(set)
+    for unit in units:
+        if not unit.get("files") and not unit.get("file_count"):
+            continue
+        batch = str(unit.get("batch") or "")
+        name = str(unit.get("name") or "")
+        if not batch or not name:
+            continue
+        backed[batch].add(normalize_unit_stem(name) or name)
+        backed[batch].add(name)
+    current = read_metadata().get("units") or {}
+    pending: list[str] = []
+    for key in current:
+        if "::" not in str(key):
+            pending.append(str(key))
+            continue
+        batch, name = str(key).split("::", 1)
+        stem = normalize_unit_stem(name) or name
+        names = backed.get(batch, set())
+        if stem not in names and name not in names:
+            pending.append(str(key))
+    if not pending:
+        return 0
+
+    def mutate(data):
+        rows = data.setdefault("units", {})
+        for key in pending:
+            rows.pop(key, None)
+
+    update_metadata(mutate)
+    return len(pending)
+
+
 def rebuild_catalog() -> dict[str, Any]:
     def report(phase: str, percent: int, message: str) -> None:
         _set_rebuild_status(
@@ -1049,6 +1211,11 @@ def rebuild_catalog() -> dict[str, Any]:
     report("data", 4, "正在扫描数据文件…")
     try:
         data = _scan_data_live(include_empty=True, on_progress=report)
+        report("metadata", 56, "正在同步机器人款式标签…")
+        _sync_robot_style_from_dirs(data)
+        dropped = prune_units_without_files(data.get("units") or [])
+        if dropped:
+            report("metadata", 58, f"已移除 {dropped} 个没有数据文件的单元…")
         report("models", 60, "正在扫描三维模型…")
         models = _scan_models_live(on_progress=report)
         report("write", 92, "正在写入索引…")
@@ -1132,6 +1299,7 @@ def apply_batch_taxonomy_to_new_units(batch: str, unit_names: list[str]) -> None
         units = data.setdefault("units", {})
         for unit_name in names:
             row = units.setdefault(unit_key(batch, unit_name), {})
+            _ensure_created_at(row)
             current = dict(row.get("taxonomy_tag_ids") or {})
             changed = False
             for scheme, node_id in batch_tags.items():
@@ -1168,6 +1336,7 @@ def apply_upload_taxonomy(
             units = data.setdefault("units", {})
             for unit_name in names:
                 unit_row = units.setdefault(unit_key(batch, unit_name), {})
+                _ensure_created_at(unit_row)
                 _merge_tag_updates(unit_row, taxonomy_tag_ids=taxonomy_tag_ids)
             if targets:
                 _apply_taxonomy_to_file_rows(data, targets, taxonomy_tag_ids)
@@ -1192,6 +1361,7 @@ def update_unit_metadata(
 
     def mutate(data):
         row = data["units"].setdefault(key, {})
+        _ensure_created_at(row)
         _merge_tag_updates(
             row,
             taxonomy_tag_ids=taxonomy_tag_ids,
@@ -1215,6 +1385,48 @@ def update_unit_metadata(
             **read_metadata()["units"][key],
         }
     return found
+
+
+def update_units_taxonomy(
+    batch: str,
+    updates: list[tuple[str, dict[str, int | None]]],
+) -> int:
+    """Apply taxonomy patches to many units in one metadata write."""
+    cleaned: list[tuple[str, dict[str, int | None]]] = []
+    seen: set[str] = set()
+    for name, tags in updates:
+        unit_name = str(name or "").strip()
+        if not unit_name or unit_name in seen or not tags:
+            continue
+        seen.add(unit_name)
+        cleaned.append((unit_name, tags))
+    if not cleaned:
+        return 0
+    snapshot = scan_data()
+    paths_by_name: dict[str, list[str]] = {name: [] for name, _ in cleaned}
+    for unit in snapshot.get("units") or []:
+        if unit.get("batch") != batch:
+            continue
+        unit_name = str(unit.get("name") or "")
+        if unit_name not in paths_by_name:
+            continue
+        for item in unit.get("files") or []:
+            path = str(item.get("path") or "")
+            if path:
+                paths_by_name[unit_name].append(path)
+
+    def mutate(data):
+        units = data.setdefault("units", {})
+        for unit_name, tags in cleaned:
+            row = units.setdefault(unit_key(batch, unit_name), {})
+            _ensure_created_at(row)
+            _merge_tag_updates(row, taxonomy_tag_ids=tags)
+            paths = paths_by_name.get(unit_name) or []
+            if paths:
+                _apply_taxonomy_to_file_rows(data, paths, tags)
+
+    update_metadata(mutate)
+    return len(cleaned)
 
 
 def update_batch_metadata(
@@ -1314,6 +1526,8 @@ def data_destination(
     fmt: str,
     batch: str,
     filename: str,
+    robot_style: str = "",
+    sub_path: str = "",
 ) -> Path:
     if ontology not in ONTOLOGIES:
         raise ValueError("本体须为 human 或 robot")
@@ -1324,10 +1538,20 @@ def data_destination(
     fmt = safe_name(fmt.lower().lstrip("."), label="格式")
     batch = safe_name(batch, label="数据批次名")
     filename = safe_name(Path(filename).name, label="文件名")
-    parts = [root(), "data", ontology, modality]
+    parts = [root(), "data", ontology]
+    if ontology == "robot" and robot_style:
+        parts.append(safe_name(robot_style, label="机器人款式"))
+    parts.append(modality)
     if modality == "fpv_video":
         parts.append(channel)
-    return Path(*parts) / fmt / batch / filename
+    parts.append(fmt)
+    parts.append(batch)
+    if sub_path:
+        for seg in sub_path.replace("\\", "/").split("/"):
+            if seg:
+                parts.append(safe_name(seg, label="子目录"))
+    parts.append(filename)
+    return Path(*parts)
 
 
 def _legacy_session_id(user_id: int, uploaded_at: str, batch: str) -> str:
@@ -1634,6 +1858,8 @@ def save_data_file(
     original_name: str,
     replace: bool = False,
     update_index: bool = True,
+    robot_style: str = "",
+    sub_path: str = "",
 ) -> dict[str, Any]:
     unit_name = safe_name(normalize_unit_stem(unit_name) or unit_name, label="数据单元名")
     suffix = Path(original_name).suffix or f".{fmt.lstrip('.')}"
@@ -1649,6 +1875,8 @@ def save_data_file(
         fmt=fmt,
         batch=batch,
         filename=filename,
+        robot_style=robot_style,
+        sub_path=sub_path,
     )
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and not replace:
@@ -2081,6 +2309,27 @@ def create_model_instance(ontology: str, name: str) -> dict[str, Any]:
         "kinds": [],
         "files": [],
         "meta": read_metadata()["models"][f"{ontology}::{name}"],
+    }
+
+
+def update_model_instance_meta(
+    ontology: str, name: str, patch: dict[str, Any]
+) -> dict[str, Any]:
+    if ontology not in ONTOLOGIES:
+        raise ValueError("模型类型须为 human 或 robot")
+    name = safe_name(name, label="模型实例名")
+    key = f"{ontology}::{name}"
+
+    def mutate(data):
+        row = data["models"].setdefault(key, {"created_at": _now(), "description": ""})
+        row.update(patch)
+
+    update_metadata(mutate)
+    return {
+        "key": key,
+        "ontology": ontology,
+        "name": name,
+        "meta": read_metadata()["models"].get(key, {}),
     }
 
 

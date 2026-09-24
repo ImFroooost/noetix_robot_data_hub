@@ -113,6 +113,26 @@ export function IndexRefreshControl({ className = "btn-primary" }: { className?:
   const percent = Math.max(0, Math.min(100, status?.percent ?? 0));
   const statsText = status && done ? formatStats(status) : "";
 
+  useEffect(() => {
+    if (!open || running) return;
+    const fadeTimer = window.setTimeout(() => setOpen(false), 4000);
+    return () => window.clearTimeout(fadeTimer);
+  }, [open, running, done, failed]);
+
+  useEffect(() => {
+    if (!open || running) return;
+    const onAwayClick = (e: MouseEvent) => {
+      const panel = panelRef.current;
+      if (panel && !panel.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onAwayClick);
+    return () => window.removeEventListener("mousedown", onAwayClick);
+  }, [open, running]);
+
+  const panelRef = useRef<HTMLDivElement>(null);
+
   return (
     <div className="index-refresh">
       <button
@@ -125,6 +145,7 @@ export function IndexRefreshControl({ className = "btn-primary" }: { className?:
       </button>
       {open && (running || done || failed) && (
         <div
+          ref={panelRef}
           className={`index-refresh-panel${failed ? " is-error" : ""}${done && !failed ? " is-done" : ""}`}
           role="status"
         >

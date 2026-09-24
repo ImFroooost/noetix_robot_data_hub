@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -59,6 +59,7 @@ from ..services.disk_repository import (
     update_file_metadata,
     update_files_annotation,
     update_unit_metadata,
+    update_units_taxonomy,
 )
 from ..models.enums import is_super_role
 from ..services.human_zip import (
@@ -94,6 +95,10 @@ class ModelInstanceIn(BaseModel):
     name: str = Field(min_length=1, max_length=256)
 
 
+class ModelInstanceMetaIn(BaseModel):
+    default_description_file: str | None = None
+
+
 class RenameIn(BaseModel):
     name: str = Field(min_length=1, max_length=256)
 
@@ -106,6 +111,16 @@ class UploadSessionIn(BaseModel):
 
 class UploadSessionDeleteIn(BaseModel):
     paths: list[str] | None = None
+
+
+class UnitTaxonomyPatch(BaseModel):
+    name: str = Field(min_length=1, max_length=1024)
+    taxonomy_tag_ids: dict[str, int | None]
+
+
+class NodeTaxonomyIn(BaseModel):
+    batch: str = Field(min_length=1, max_length=256)
+    units: list[UnitTaxonomyPatch] = Field(default_factory=list)
 
 
 class UnitRefIn(BaseModel):
@@ -1141,6 +1156,61 @@ def patch_batch(
     return result
 
 
+@router.post("/nodes/taxonomy")
+def patch_node_taxonomy(
+    body: NodeTaxonomyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not body.units:
+        raise HTTPException(status_code=400, detail="没有要更新的数据单元")
+    if len(body.units) > 20000:
+        raise HTTPException(status_code=400, detail="一次更新的数据单元过多")
+    merged_ids: dict[str, int | None] = {}
+    for item in body.units:
+        merged_ids.update(item.taxonomy_tag_ids)
+    if merged_ids:
+        _validate_taxonomy_ids(db, merged_ids)
+    snapshot = scan_data(
+        include_empty=user_has_any_capability(db, user, Capability.manage_data)
+    )
+    batch = next((item for item in snapshot["batches"] if item["name"] == body.batch), None)
+    units = (batch or {}).get("units") or []
+    allowed_unit = next(
+        (
+            unit
+            for unit in units
+            if _has_capability_on_unit(
+                db, user, unit, Capability.annotate, Capability.edit, Capability.upload
+            )
+        ),
+        None,
+    )
+    _require_tag_edit(
+        db,
+        user,
+        unit=allowed_unit,
+        path=f"/{body.batch}/",
+    )
+    updated = update_units_taxonomy(
+        body.batch,
+        [(item.name, item.taxonomy_tag_ids) for item in body.units],
+    )
+    write_audit(
+        db,
+        user_id=user.id,
+        action="annotate",
+        entity_type="storage_node",
+        detail={
+            "batch": body.batch,
+            "unit_count": updated,
+            "schemes": sorted(merged_ids),
+        },
+    )
+    db.commit()
+    return {"updated": updated}
+
+
 @router.patch("/units/{batch}/{unit_name}")
 def patch_unit(
     batch: str,
@@ -1198,6 +1268,7 @@ async def upload_data(
 ):
     if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
         raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
+    parsed_annotation = _parse_annotation_form(annotation)
     current = _find_unit(scan_data(), batch, unit_name)
     if current:
         _require_unit(db, user, Capability.upload, current)
@@ -1233,6 +1304,7 @@ async def upload_data(
             original_name=file.filename or f"{unit_name}.{resolved_fmt}",
             replace=replace,
             update_index=False,
+            robot_style=str(parsed_annotation.get("robot_style") or ""),
         )
         uploader = {
             "id": user.id,
@@ -1241,7 +1313,6 @@ async def upload_data(
         set_file_uploaders(
             [result["path"]], user_id=user.id, username=user.username
         )
-        parsed_annotation = _parse_annotation_form(annotation)
         update_files_annotation([result["path"]], parsed_annotation)
         create_batch(batch)
         parsed_tags = _parse_taxonomy_form(taxonomy_tag_ids)
@@ -1283,18 +1354,28 @@ async def upload_data(
 
 @router.post("/data/upload-folder")
 async def upload_data_folder(
-    ontology: str = Form(...),
-    modality: str = Form(...),
-    channel: str = Form(""),
-    format: str = Form(...),
-    batch: str = Form(...),
-    actions: str = Form("[]"),
-    annotation: str = Form(""),
-    taxonomy_tag_ids: str = Form(""),
-    files: list[UploadFile] = File(...),
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    import logging as _logging
+    _log = _logging.getLogger("upload_debug")
+    try:
+        form = await request.form(max_files=100000, max_fields=100000, max_part_size=100*1024*1024)
+    except Exception as e:
+        _log.error("Form parse error: %s: %s", type(e).__name__, e)
+        raise HTTPException(status_code=400, detail=f"解析表单失败：{type(e).__name__}: {e}")
+    ontology = form.get("ontology", "")
+    modality = form.get("modality", "")
+    channel = form.get("channel", "")
+    format = form.get("format", "")
+    batch = form.get("batch", "")
+    actions = form.get("actions", "[]")
+    annotation = form.get("annotation", "")
+    taxonomy_tag_ids = form.get("taxonomy_tag_ids", "")
+    raw_files = form.getlist("files")
+    files = raw_files if isinstance(raw_files, list) else [raw_files]
+    sub_paths_raw = form.get("sub_paths", "[]")
     """Upload one folder as a batch while rebuilding the catalog only once."""
     if not files:
         raise HTTPException(status_code=400, detail="文件夹中没有可上传文件")
@@ -1306,11 +1387,21 @@ async def upload_data_folder(
         raise HTTPException(status_code=400, detail="文件处理策略与文件数量不一致")
     if any(action not in {"upload", "replace", "skip"} for action in raw_actions):
         raise HTTPException(status_code=400, detail="文件处理策略须为 upload、replace 或 skip")
+    try:
+        raw_sub_paths = json.loads(sub_paths_raw)
+    except json.JSONDecodeError:
+        raw_sub_paths = []
+    if not isinstance(raw_sub_paths, list):
+        raw_sub_paths = []
+    while len(raw_sub_paths) < len(files):
+        raw_sub_paths.append("")
 
     ontology = ontology.strip().lower()
     modality = modality.strip().lower()
     channel = channel.strip().lower()
     fallback_fmt = format.strip().lower().lstrip(".")
+    parsed_annotation = _parse_annotation_form(annotation)
+    robot_style = str(parsed_annotation.get("robot_style") or "")
     snapshot = scan_data()
     current_units = {
         (item["batch"], item["name"]): item for item in snapshot.get("units", [])
@@ -1320,11 +1411,13 @@ async def upload_data_folder(
     saved_paths: list[str] = []
     formats: list[str] = []
 
-    for file, action in zip(files, raw_actions):
+    for file, action, sub_path in zip(files, raw_actions, raw_sub_paths):
         original_name = Path(file.filename or "").name
-        raw_unit_name = normalize_unit_stem(Path(original_name).stem) or Path(
-            original_name
-        ).stem
+        file_stem = Path(original_name).stem
+        if sub_path:
+            raw_unit_name = normalize_unit_stem((sub_path + "/" + file_stem).replace("/", "_")) or (sub_path + "_" + file_stem).replace("/", "_")
+        else:
+            raw_unit_name = normalize_unit_stem(file_stem) or file_stem
         row: dict[str, Any] = {
             "name": original_name,
             "unit_name": raw_unit_name,
@@ -1379,6 +1472,8 @@ async def upload_data_folder(
                 original_name=original_name or f"{raw_unit_name}.{file_fmt}",
                 replace=action == "replace",
                 update_index=False,
+                robot_style=robot_style,
+                sub_path=sub_path,
             )
             result["uploader"] = {
                 "id": user.id,
@@ -1482,8 +1577,10 @@ async def upload_data_zip(
     parsed_annotation = _parse_annotation_form(annotation)
     ensure_capability(db, user, Capability.upload, f"/{batch}/")
 
+    _tmp_root = Path("/hub_repo/index/tmp")
+    _tmp_root.mkdir(parents=True, exist_ok=True)
     staging = Path(
-        tempfile.mkdtemp(prefix="storage_zip_", dir=Path("/tmp"))
+        tempfile.mkdtemp(prefix="storage_zip_", dir=_tmp_root)
     )
     zip_path = staging / "upload.zip"
     work_dir = staging / "extracted"
@@ -1540,11 +1637,25 @@ async def upload_data_zip(
             else:
                 ensure_capability(db, user, Capability.upload, f"/{batch}/{raw_unit_name}/")
 
+            new_robot_style = str(parsed_annotation.get("robot_style") or "").strip()
+
             for fmt, path in sorted(group.files.items()):
                 original_name = path.name
+                file_sub_path = ""
+                try:
+                    rel_to_work = path.relative_to(work_dir)
+                    if len(rel_to_work.parts) > 1:
+                        file_sub_path = "/".join(rel_to_work.parts[:-1])
+                except Exception:
+                    pass
+                file_stem = Path(original_name).stem
+                if file_sub_path:
+                    effective_unit = normalize_unit_stem((file_sub_path + "/" + file_stem).replace("/", "_")) or (file_sub_path + "_" + file_stem).replace("/", "_")
+                else:
+                    effective_unit = raw_unit_name
                 row: dict[str, Any] = {
                     "name": original_name,
-                    "unit_name": raw_unit_name,
+                    "unit_name": effective_unit,
                     "status": "upload",
                 }
                 existing = None
@@ -1560,6 +1671,11 @@ async def upload_data_zip(
                             and (
                                 item["name"] == original_name
                                 or Path(item["name"]).stem == raw_unit_name
+                            )
+                            and (
+                                ontology != "robot"
+                                or not new_robot_style
+                                or str(item.get("robot_style") or "").strip() == new_robot_style
                             )
                         ),
                         None,
@@ -1584,10 +1700,12 @@ async def upload_data_zip(
                             channel=channel,
                             fmt=str(fmt).lstrip("."),
                             batch=batch,
-                            unit_name=raw_unit_name,
+                            unit_name=row["unit_name"],
                             original_name=original_name,
                             replace=bool(existing and replace),
                             update_index=False,
+                            robot_style=str(parsed_annotation.get("robot_style") or ""),
+                            sub_path=file_sub_path,
                         )
                     result["uploader"] = {"id": user.id, "username": user.username}
                     row.update(
@@ -1898,11 +2016,16 @@ def remove_file(
 @router.get("/models")
 def models(_: User = Depends(get_current_user)):
     result = scan_models()
-    # Include metadata-only instances that have no file yet.
+    # Overlay latest metadata for all instances and add metadata-only ones.
     from ..services.disk_repository import read_metadata
 
+    meta_by_key = read_metadata().get("models") or {}
+    for instance in result["instances"]:
+        key = instance.get("key") or ""
+        if key in meta_by_key:
+            instance["meta"] = dict(meta_by_key[key])
     existing = {item["key"] for item in result["instances"]}
-    for key, meta in (read_metadata().get("models") or {}).items():
+    for key, meta in meta_by_key.items():
         if key in existing or "::" not in key:
             continue
         ontology, name = key.split("::", 1)
@@ -1969,6 +2092,32 @@ async def upload_model(
         action="upload",
         entity_type="model_file",
         detail=result,
+    )
+    db.commit()
+    return result
+
+
+@router.patch("/models/instances/{ontology}/{name}")
+def patch_model_instance(
+    ontology: str,
+    name: str,
+    body: ModelInstanceMetaIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    ensure_capability(db, user, Capability.edit, "/")
+    from ..services.disk_repository import update_model_instance_meta
+
+    try:
+        result = update_model_instance_meta(ontology, name, body.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="update",
+        entity_type="model_instance",
+        detail={"ontology": ontology, "name": name, **body.model_dump(exclude_none=True)},
     )
     db.commit()
     return result

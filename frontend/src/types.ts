@@ -171,13 +171,16 @@ export interface StorageFile {
   path: string;
   name: string;
   unit_name: string;
+  sub_path?: string;
   size: number;
   modified_at: string;
+  uploaded_at?: string;
   ontology: "human" | "robot";
   modality: string;
   channel: string;
   format: string;
   batch: string;
+  robot_style?: string;
   uploader: StorageUploader | null;
   fps?: number | null;
   frame_count?: number | null;
@@ -304,6 +307,9 @@ export interface StorageUnit {
   annotation: StorageAnnotation;
   meta: Record<string, unknown>;
   uploaders: StorageUploader[];
+  created_at?: string;
+  uploaded_at?: string;
+  modified_at?: string;
 }
 
 export interface StorageBatch {
@@ -313,6 +319,9 @@ export interface StorageBatch {
   units: StorageUnit[];
   meta: Record<string, unknown>;
   uploaders: StorageUploader[];
+  created_at?: string;
+  uploaded_at?: string;
+  modified_at?: string;
   taxonomy_tag_ids?: Record<string, number>;
   taxonomy_tags?: Record<string, TaxonomyTagBrief>;
   annotation?: StorageAnnotation;

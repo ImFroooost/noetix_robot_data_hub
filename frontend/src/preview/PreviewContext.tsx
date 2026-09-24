@@ -19,6 +19,7 @@ type PreviewContextValue = {
   activeIndex: number;
   activeFile: StorageFile | null;
   filledCount: number;
+  contrastMode: boolean;
   add: (file: StorageFile) => void;
   removeAt: (index: number) => void;
   removeByPaths: (paths: string[]) => void;
@@ -27,6 +28,8 @@ type PreviewContextValue = {
   setActive: (index: number) => void;
   addSlot: () => void;
   clear: () => void;
+  setContrastMode: (on: boolean) => void;
+  reorder: (from: number, to: number) => void;
 };
 
 const PreviewContext = createContext<PreviewContextValue | null>(null);
@@ -43,6 +46,7 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
     Array.from({ length: MIN_SLOTS }, () => null)
   );
   const [activeIndex, setActiveIndex] = useState(0);
+  const [contrastMode, setContrastModeState] = useState(false);
   const slotsRef = useRef(slots);
   const activeRef = useRef(activeIndex);
   slotsRef.current = slots;
@@ -53,12 +57,31 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
     setActiveIndex(nextActive);
   }, []);
 
+  const setContrastMode = useCallback((on: boolean) => {
+    setContrastModeState(on);
+  }, []);
+
   const add = useCallback((file: StorageFile) => {
     const prevSlots = slotsRef.current;
     const prevActive = activeRef.current;
     const existing = prevSlots.findIndex((item) => item?.id === file.id);
     if (existing >= 0) {
       setActiveIndex(existing);
+      return;
+    }
+    if (!contrastMode) {
+      const nextSlots = Array.from({ length: MIN_SLOTS }, () => null);
+      nextSlots[0] = file;
+      slotsRef.current = nextSlots;
+      activeRef.current = 0;
+      setSlots(nextSlots);
+      setActiveIndex(0);
+      void history?.execute({
+        label: `预览 ${file.name}`,
+        refresh: false,
+        do: () => restore(nextSlots, 0),
+        undo: () => restore(prevSlots, prevActive),
+      });
       return;
     }
     const emptyActive = prevSlots[prevActive] == null ? prevActive : -1;
@@ -162,12 +185,23 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
     });
   }, [history, restore]);
 
+  const reorder = useCallback((from: number, to: number) => {
+    const prevSlots = slotsRef.current;
+    if (from === to || from < 0 || to < 0 || from >= prevSlots.length || to >= prevSlots.length) return;
+    const nextSlots = [...prevSlots];
+    const [moved] = nextSlots.splice(from, 1);
+    nextSlots.splice(to, 0, moved);
+    slotsRef.current = nextSlots;
+    setSlots(nextSlots);
+  }, []);
+
   const value = useMemo<PreviewContextValue>(
     () => ({
       slots,
       activeIndex,
       activeFile: slots[activeIndex] || null,
       filledCount: slots.filter(Boolean).length,
+      contrastMode,
       add,
       removeAt,
       removeByPaths,
@@ -176,8 +210,10 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
       setActive: setActiveIndex,
       addSlot,
       clear,
+      setContrastMode,
+      reorder,
     }),
-    [slots, activeIndex, add, removeAt, removeByPaths, replaceByPath, syncFromOverview, addSlot, clear]
+    [slots, activeIndex, contrastMode, add, removeAt, removeByPaths, replaceByPath, syncFromOverview, addSlot, clear, setContrastMode, reorder]
   );
 
   return <PreviewContext.Provider value={value}>{children}</PreviewContext.Provider>;
