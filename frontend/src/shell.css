@@ -10,8 +10,7 @@
 .app-body {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  display: flex;
   overflow: hidden;
 }
 
@@ -264,6 +263,7 @@
 }
 
 .app-main {
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -363,6 +363,8 @@
 .app-content {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
   overflow: auto;
 }
 
@@ -537,7 +539,11 @@ button.btn-primary:hover:not(:disabled) {
 @media (max-width: 960px) {
   .app-body,
   .app-body.is-collapsed {
-    grid-template-columns: 1fr;
+    display: flex;
+  }
+
+  .app-body > .split-handle {
+    display: none;
   }
 
   .app-sidebar,

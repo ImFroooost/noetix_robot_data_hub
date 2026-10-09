@@ -3,15 +3,21 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { fetchStorageOverview } from "../storageOverviewCache";
 import { useAuth } from "../auth";
+import { humanModelFiles } from "../components/HumanModelFields";
+import { robotDescriptionVersions } from "../components/RobotStyleFields";
 import type {
+  ModelInstance,
   PermissionItem,
   Role,
+  StorageUploader,
   TaxonomyNode,
   TaxonomySchemeDef,
   User,
+  UserPresence,
 } from "../types";
 import {
   CAPABILITY_COLUMNS,
+  MOTION_KIND_OPTIONS,
   ROLE_CAPABILITIES,
   ROLE_LABEL,
   ROLE_OPTIONS,
@@ -29,17 +35,98 @@ const CAPABILITY_LABEL: Record<string, string> = {
   manage_data: "管理数据",
 };
 
+const FILTER_DIMENSIONS: { key: string; label: string }[] = [
+  { key: "uploader", label: "上传用户" },
+  { key: "subject", label: "数据主体" },
+  { key: "format", label: "数据格式" },
+  { key: "modality", label: "数据模态" },
+];
+
+const MODALITY_SCOPES: { value: string; label: string }[] = [
+  { value: "tpv_video", label: "第三视角视频" },
+  { value: "fpv_video", label: "第一视角视频" },
+  ...MOTION_KIND_OPTIONS.map(([kind, label]) => ({ value: `motion:${kind}`, label })),
+  { value: "text", label: "文本" },
+  { value: "audio", label: "音频" },
+  { value: "log", label: "日志" },
+];
+
+type ScopeOption = { value: string; label: string };
+
+function withCurrentScope(options: ScopeOption[], current: string): ScopeOption[] {
+  if (!current || options.some((item) => item.value === current)) return options;
+  return [...options, { value: current, label: current }];
+}
+
+function subjectScopes(instances: ModelInstance[]): ScopeOption[] {
+  const options: ScopeOption[] = [{ value: "/", label: "/（全部）" }];
+  for (const ontology of ["human", "robot"] as const) {
+    const title = ontology === "human" ? "人体" : "机器人";
+    options.push({ value: ontology, label: title });
+    for (const item of instances.filter((row) => row.ontology === ontology)) {
+      options.push({ value: `${ontology}|${item.name}`, label: `${title} / ${item.name}` });
+      const versions =
+        ontology === "robot" ? robotDescriptionVersions(item) : humanModelFiles(item);
+      for (const file of versions) {
+        options.push({
+          value: `${ontology}|${item.name}|${file.relative_path}`,
+          label: `${title} / ${item.name} / ${file.name}`,
+        });
+      }
+    }
+  }
+  return options;
+}
+
+function seenAgo(iso: string | null | undefined) {
+  if (!iso) return "";
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return "";
+  const sec = Math.max(0, (Date.now() - at) / 1000);
+  if (sec < 60) return "刚刚";
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+  return `${Math.floor(sec / 86400)} 天前`;
+}
+
+function presenceActivity(item: UserPresence | undefined) {
+  if (!item?.seen_at) return "—";
+  const doing = [item.page, item.detail].filter(Boolean).join(" · ");
+  if (item.online || item.away) return doing || "—";
+  const when = seenAgo(item.seen_at);
+  if (!doing) return when ? `上次 ${when}` : "—";
+  return when ? `上次 ${when} · ${doing}` : doing;
+}
+
+function PresenceStatus({ item }: { item: UserPresence | undefined }) {
+  const online = !!item?.online;
+  const away = !!item?.away;
+  const label = online ? "在线" : away ? "离开" : "离线";
+  return (
+    <span className="presence-status">
+      <span className={`presence-dot${online ? " is-online" : away ? " is-away" : ""}`} />
+      {label}
+    </span>
+  );
+}
+
 function PermissionEditor({
   user,
   folderPaths,
   schemes,
   taxNodes,
+  uploaders,
+  formats,
+  instances,
   onSaved,
 }: {
   user: User;
   folderPaths: string[];
   schemes: TaxonomySchemeDef[];
   taxNodes: TaxonomyNode[];
+  uploaders: StorageUploader[];
+  formats: string[];
+  instances: ModelInstance[];
   onSaved: () => void;
 }) {
   const [items, setItems] = useState<PermissionItem[]>([]);
@@ -62,11 +149,41 @@ function PermissionEditor({
       .finally(() => setLoading(false));
   }, [user.id]);
 
-  const pathOptions = (scheme: string): string[] => {
-    if (!scheme) {
-      return ["/", ...folderPaths];
+  const scopeOptions = (scheme: string, current: string): ScopeOption[] => {
+    if (scheme === "uploader") {
+      return withCurrentScope(
+        [
+          { value: "/", label: "/（全部）" },
+          ...uploaders.map((item) => ({ value: String(item.id), label: item.username })),
+        ],
+        current
+      );
     }
-    return ["/", ...taxNodes.filter((n) => n.scheme === scheme).map((n) => n.path)];
+    if (scheme === "subject") {
+      return withCurrentScope(subjectScopes(instances), current);
+    }
+    if (scheme === "format") {
+      return withCurrentScope(
+        [
+          { value: "/", label: "/（全部）" },
+          ...formats.map((format) => ({ value: format, label: format })),
+        ],
+        current
+      );
+    }
+    if (scheme === "modality") {
+      return withCurrentScope(
+        [{ value: "/", label: "/（全部）" }, ...MODALITY_SCOPES],
+        current
+      );
+    }
+    const paths = scheme
+      ? ["/", ...taxNodes.filter((node) => node.scheme === scheme).map((node) => node.path)]
+      : ["/", ...folderPaths];
+    return withCurrentScope(
+      paths.map((path) => ({ value: path, label: path === "/" ? "/（全部）" : path })),
+      current
+    );
   };
 
   const update = (idx: number, patch: Partial<PermissionItem>) => {
@@ -112,8 +229,8 @@ function PermissionEditor({
         <thead>
           <tr>
             <th>能力</th>
-            <th>适用分类标准</th>
-            <th>范围（文件夹 / 分类节点）</th>
+            <th>筛选维度</th>
+            <th>范围</th>
             <th></th>
           </tr>
         </thead>
@@ -142,7 +259,14 @@ function PermissionEditor({
                   }
                 >
                   <option value="">文件夹目录</option>
-                  {schemes.map((s) => (
+                  {FILTER_DIMENSIONS.map((dimension) => (
+                    <option key={dimension.key} value={dimension.key}>
+                      {dimension.label}
+                    </option>
+                  ))}
+                  {schemes
+                    .filter((scheme) => !FILTER_DIMENSIONS.some((dimension) => dimension.key === scheme.key))
+                    .map((s) => (
                     <option key={s.key} value={s.key}>
                       {taxonomySchemeLabel(s.key, schemes)}
                     </option>
@@ -154,9 +278,9 @@ function PermissionEditor({
                   value={it.path_prefix}
                   onChange={(e) => update(idx, { path_prefix: e.target.value })}
                 >
-                  {pathOptions(it.scheme || "").map((p) => (
-                    <option key={p} value={p}>
-                      {p === "/" ? "/（全部）" : p}
+                  {scopeOptions(it.scheme || "", it.path_prefix).map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
                     </option>
                   ))}
                 </select>
@@ -210,10 +334,34 @@ export function UsersPage() {
   const [folderPaths, setFolderPaths] = useState<string[]>([]);
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [taxNodes, setTaxNodes] = useState<TaxonomyNode[]>([]);
+  const [uploaders, setUploaders] = useState<StorageUploader[]>([]);
+  const [formats, setFormats] = useState<string[]>([]);
+  const [instances, setInstances] = useState<ModelInstance[]>([]);
   const nav = useNavigate();
   const [expanded, setExpanded] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [viewBusy, setViewBusy] = useState<number | null>(null);
+  const [presence, setPresence] = useState<Record<number, UserPresence>>({});
+
+  useEffect(() => {
+    if (!canManageUsers) return;
+    let stop = false;
+    const tick = () => {
+      api
+        .listPresence()
+        .then((rows) => {
+          if (stop) return;
+          setPresence(Object.fromEntries(rows.map((row) => [row.user_id, row])));
+        })
+        .catch(() => undefined);
+    };
+    tick();
+    const timer = window.setInterval(tick, 8000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [canManageUsers]);
 
   const reload = () => api.listUsers().then(setUsers);
   useHistoryReload(() => {
@@ -223,8 +371,8 @@ export function UsersPage() {
   useEffect(() => {
     if (!canManageUsers) return;
     reload().catch((e) => setError(e.message));
-    Promise.all([api.listFolders(), fetchStorageOverview()])
-      .then(([folders, storage]) => {
+    Promise.all([api.listFolders(), fetchStorageOverview(), api.storageModels()])
+      .then(([folders, storage, models]) => {
         const paths = [
           ...folders.map((folder) => folder.path),
           ...storage.batches.flatMap((batch) => [
@@ -233,6 +381,13 @@ export function UsersPage() {
           ]),
         ];
         setFolderPaths([...new Set(paths)].sort((a, b) => a.localeCompare(b)));
+        setUploaders(storage.uploaders || []);
+        setFormats(
+          [...new Set(storage.files.map((file) => (file.format || "").toLowerCase()).filter(Boolean))].sort(
+            (a, b) => a.localeCompare(b)
+          )
+        );
+        setInstances(models.instances || []);
       })
       .catch(() => undefined);
     api.listTaxonomySchemes().then(setSchemes).catch(() => undefined);
@@ -273,8 +428,9 @@ export function UsersPage() {
     <div className="page stack">
       <div className="card stack">
         <p className="muted" style={{ margin: 0 }}>
-          普通角色的能力为「受限」：只对已分配的文件夹或分类节点生效。超级角色的对应能力为全量。
+          普通角色的能力为「受限」：只对已分配的文件夹、筛选维度或分类节点生效。超级角色的对应能力为全量。
           「管理数据」包含同范围的浏览、下载、标注、上传。只有超级管理者可以管理用户。点「进入视角」可按该用户的权限浏览界面。
+          在线表示对方正在使用页面；切到别的窗口会显示为离开。离线时保留最近一次在做的事。
         </p>
         <div style={{ overflowX: "auto" }}>
           <table className="table" style={{ fontSize: "0.85rem" }}>
@@ -310,6 +466,8 @@ export function UsersPage() {
               <th>ID</th>
               <th>用户名</th>
               <th>角色</th>
+              <th>在线</th>
+              <th>正在做</th>
               <th>状态</th>
               <th>操作</th>
             </tr>
@@ -348,6 +506,10 @@ export function UsersPage() {
                       )}
                     </select>
                   </td>
+                  <td>
+                    <PresenceStatus item={presence[u.id]} />
+                  </td>
+                  <td className="presence-activity">{presenceActivity(presence[u.id])}</td>
                   <td>{u.is_active ? "启用" : "禁用"}</td>
                   <td>
                     <span className="row" style={{ gap: 6, flexWrap: "wrap" }}>
@@ -418,12 +580,15 @@ export function UsersPage() {
                 </tr>
                 {expanded === u.id && !isSuperRole(u.role) && (
                   <tr key={`${u.id}-perm`}>
-                    <td colSpan={5}>
+                    <td colSpan={7}>
                       <PermissionEditor
                         user={u}
                         folderPaths={folderPaths}
                         schemes={schemes}
                         taxNodes={taxNodes}
+                        uploaders={uploaders}
+                        formats={formats}
+                        instances={instances}
                         onSaved={() => void reload()}
                       />
                     </td>

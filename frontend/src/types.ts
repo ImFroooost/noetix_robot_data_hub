@@ -25,7 +25,7 @@ export type ReviewValue = "" | "pass" | "needs_fix" | "discard";
 
 export interface PermissionItem {
   capability: string;
-  // ""=文件夹树；否则为分类标准 key，path_prefix 为该分类树节点路径
+  // ""=文件夹树；uploader/subject/format/modality=筛选维度；其余为分类标准 key
   scheme?: string;
   path_prefix: string;
   recursive: boolean;
@@ -41,6 +41,15 @@ export interface User {
   capabilities?: Record<string, string[]>;
   permissions?: PermissionItem[];
   impersonated_by?: { id: number; username: string } | null;
+}
+
+export interface UserPresence {
+  user_id: number;
+  online: boolean;
+  away: boolean;
+  page: string;
+  detail: string;
+  seen_at: string | null;
 }
 
 export interface Folder {

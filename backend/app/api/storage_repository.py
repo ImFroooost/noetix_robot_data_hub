@@ -68,10 +68,12 @@ from ..services.human_zip import (
     human_format_from_filename,
 )
 from ..services.permissions import (
+    FACET_SCHEMES,
     capability_query_values,
     ensure_capability,
     has_role_capability,
     path_matches,
+    unit_matches_facet,
     user_has_any_capability,
     user_has_capability,
 )
@@ -260,6 +262,10 @@ def _unit_allowed_scoped(
         scheme = permission.scheme or ""
         if not scheme:
             if path_matches(_unit_path(unit), permission.path_prefix, permission.recursive):
+                return True
+            continue
+        if scheme in FACET_SCHEMES:
+            if unit_matches_facet(unit, scheme, permission.path_prefix):
                 return True
             continue
         raw_id = (unit.get("taxonomy_tag_ids") or {}).get(scheme)

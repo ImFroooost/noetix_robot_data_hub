@@ -9,6 +9,8 @@ import { RoleHelpDialog, useRoleHelpAutoOpen } from "./RoleHelpDialog";
 import { PreviewProvider } from "../preview/PreviewContext";
 import { HistoryButtons, UndoProvider } from "../undo/UndoContext";
 import { ChangePasswordDialog } from "./ChangePasswordDialog";
+import { clampPane, SplitHandle, useStoredNumber } from "./SplitHandle";
+import { presenceDetail, subscribePresenceDetail } from "../presence";
 import { ROLE_LABEL } from "../types";
 import type { User } from "../types";
 
@@ -31,6 +33,7 @@ export function Layout() {
   const [targets, setTargets] = useState<User[]>([]);
   const [busy, setBusy] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useStoredNumber("hub-sidebar-width", 248);
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem(SIDEBAR_KEY) === "1";
@@ -54,6 +57,49 @@ export function Layout() {
   }, []);
   const pageKey = location.pathname + (location.search || "");
   const page = PAGES[pageKey] || PAGES["/"];
+  const activityPage =
+    page.title === "浏览"
+      ? "浏览数据"
+      : page.title === "上传"
+        ? "上传数据"
+        : page.title === "标注"
+          ? "标注数据"
+          : page.title === "数据管理"
+            ? "管理数据"
+            : page.title === "分类管理"
+              ? "管理分类"
+              : page.title === "3D 模型"
+                ? "查看模型"
+                : page.title === "用户与权限"
+                  ? "管理用户"
+                  : page.title;
+
+  useEffect(() => {
+    let debounce = 0;
+    const send = () => {
+      void api
+        .reportPresence({
+          page: activityPage,
+          detail: presenceDetail(),
+          idle: document.hidden,
+        })
+        .catch(() => undefined);
+    };
+    send();
+    const interval = window.setInterval(send, 15000);
+    const kick = () => {
+      window.clearTimeout(debounce);
+      debounce = window.setTimeout(send, 600);
+    };
+    const unsub = subscribePresenceDetail(kick);
+    document.addEventListener("visibilitychange", send);
+    return () => {
+      window.clearInterval(interval);
+      window.clearTimeout(debounce);
+      unsub();
+      document.removeEventListener("visibilitychange", send);
+    };
+  }, [activityPage]);
 
   const toggleCollapsed = () => {
     setCollapsed((current) => {
@@ -144,7 +190,10 @@ export function Layout() {
             onClick={() => setNavOpen(false)}
           />
         )}
-        <aside className={`app-sidebar${navOpen ? " is-open" : ""}${collapsed ? " is-collapsed" : ""}`}>
+        <aside
+          className={`app-sidebar${navOpen ? " is-open" : ""}${collapsed ? " is-collapsed" : ""}`}
+          style={collapsed ? undefined : { width: sidebarWidth }}
+        >
           <div className="sidebar-brand">
             <span className="sidebar-mark" aria-hidden="true">
               N
@@ -201,6 +250,12 @@ export function Layout() {
             <ThemeToggle />
           </div>
         </aside>
+        {!collapsed && (
+          <SplitHandle
+            axis="x"
+            onDelta={(delta) => setSidebarWidth((current) => clampPane(current + delta, 180, 420))}
+          />
+        )}
 
         <div className="app-main">
           <header className="app-top">

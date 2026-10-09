@@ -1,4 +1,4 @@
-import { Children, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Children, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { api, downloadAuth, downloadAuthPost } from "../api";
 import { useAuth } from "../auth";
 import { usePreview } from "../preview/PreviewContext";
@@ -19,7 +19,9 @@ import {
   robotVersionLabel,
   normalizeRobotVersion,
 } from "./RobotStyleFields";
+import { clampPane, SplitHandle, useStoredNumber } from "./SplitHandle";
 import { TaxonomySelect } from "./TaxonomyTree";
+import { setPresenceDetail } from "../presence";
 import { fetchStorageOverview, INDEX_UPDATED_EVENT } from "../storageOverviewCache";
 import { useUndo } from "../undo/UndoContext";
 import { patchStorageMeta, type StorageMetaTarget } from "../undo/storageMeta";
@@ -168,6 +170,25 @@ function TreeAllButton({
       {children}
     </button>
   );
+}
+
+function applyCheckedKeys(
+  current: Record<string, boolean>,
+  keys: string[],
+  on: boolean
+): Record<string, boolean> {
+  const next = { ...current };
+  for (const key of keys) {
+    if (on) next[key] = true;
+    else delete next[key];
+  }
+  return next;
+}
+
+function checkedKeyCount(keys: string[], checked: Record<string, boolean>) {
+  let count = 0;
+  for (const key of keys) if (checked[key]) count += 1;
+  return count;
 }
 
 function TreeSelectAll({
@@ -343,6 +364,7 @@ function TreeGroup({
   nested = false,
   depth = 0,
   checked,
+  indeterminate,
   onCheck,
   actions,
 }: {
@@ -358,6 +380,7 @@ function TreeGroup({
   nested?: boolean;
   depth?: number;
   checked?: boolean;
+  indeterminate?: boolean;
   onCheck?: (checked: boolean) => void;
   actions?: ReactNode;
 }) {
@@ -381,6 +404,9 @@ function TreeGroup({
             type="checkbox"
             className="storage-tree-check"
             checked={!!checked}
+            ref={(el) => {
+              if (el) el.indeterminate = !!indeterminate && !checked;
+            }}
             onChange={(e) => onCheck(e.target.checked)}
             onClick={(e) => e.stopPropagation()}
             aria-label={`选择 ${title}`}
@@ -520,6 +546,12 @@ function dirUnitCount(node: DirTreeNode): number {
   return total;
 }
 
+function unitsInDir(node: DirTreeNode): StorageUnit[] {
+  const units = [...node.units];
+  for (const child of node.children.values()) units.push(...unitsInDir(child));
+  return units;
+}
+
 function unitsUnderPath(units: StorageUnit[], dirPath: string): StorageUnit[] {
   if (!dirPath) return units;
   return units.filter((unit) => {
@@ -652,6 +684,23 @@ function renderDirTree(
               }))
             }
             onSelect={() => onSelectNode(nodeKey)}
+            checked={(() => {
+              const keys = unitsInDir(child).map((unit) => unit.key);
+              return keys.length > 0 && checkedKeyCount(keys, checkedUnits) === keys.length;
+            })()}
+            indeterminate={(() => {
+              const keys = unitsInDir(child).map((unit) => unit.key);
+              const count = checkedKeyCount(keys, checkedUnits);
+              return count > 0 && count < keys.length;
+            })()}
+            onCheck={
+              canManage
+                ? (value) => {
+                    const keys = unitsInDir(child).map((unit) => unit.key);
+                    setCheckedUnits((current) => applyCheckedKeys(current, keys, value));
+                  }
+                : undefined
+            }
           >
             {open
               ? renderDirTree(
@@ -750,6 +799,7 @@ function UnitTree({
   onRenameUnit,
   onDelete,
   onDownload,
+  onSelectionChange,
 }: {
   data: StorageOverview;
   selectedUnit: string | null;
@@ -763,10 +813,10 @@ function UnitTree({
   onRenameUnit: (unit: StorageUnit) => void;
   onDelete: (batches: StorageBatch[], units: StorageUnit[]) => void;
   onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void;
+  onSelectionChange?: (units: StorageUnit[]) => void;
 }) {
   const { user } = useAuth();
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [checkedBatches, setCheckedBatches] = useState<Record<string, boolean>>({});
   const scopedEmpty =
     !isSuperRole(user?.role) &&
     !(user?.permissions || []).some(
@@ -774,16 +824,24 @@ function UnitTree({
     );
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const batchKeys = data.batches.map((batch) => batch.name);
-  const selectedBatches = data.batches.filter((batch) => checkedBatches[batch.name]);
-  const selectedUnits = data.batches.flatMap((batch) => batch.units).filter((unit) => checkedUnits[unit.key]);
-  const selectedCount = selectedBatches.length + selectedUnits.length;
+  const displayedUnits = data.batches.flatMap((batch) => batch.units);
+  const displayedKeys = displayedUnits.map((unit) => unit.key);
+  const selectedUnits = displayedUnits.filter((unit) => checkedUnits[unit.key]);
+  const selectedCount = selectedUnits.length;
+  useEffect(() => {
+    const visible = new Set(displayedKeys);
+    setCheckedUnits((current) => {
+      const stale = Object.keys(current).some((key) => !visible.has(key));
+      if (!stale) return current;
+      const next: Record<string, boolean> = {};
+      for (const key of Object.keys(current)) if (visible.has(key)) next[key] = true;
+      return next;
+    });
+  }, [displayedKeys.join("\0")]);
+  useReportSelection(selectedUnits, onSelectionChange);
   const canDownloadAny =
     !!canDownload || data.batches.some((batch) => batchOwnedBy(batch, currentUserId));
   const canManage = !!(canEdit || canDownloadAny);
-
-  const toggleBatch = (name: string, value: boolean) => {
-    setCheckedBatches((current) => ({ ...current, [name]: value }));
-  };
 
   return (
     <div className="storage-tree storage-structure-tree">
@@ -796,18 +854,11 @@ function UnitTree({
           canManage ? (
             <div className="storage-tree-manage">
               <TreeSelectAll
-                total={data.batches.length}
-                selected={selectedBatches.length}
-                onChange={(checked) => {
-                  if (checked) {
-                    setCheckedBatches(
-                      Object.fromEntries(data.batches.map((batch) => [batch.name, true]))
-                    );
-                    return;
-                  }
-                  setCheckedBatches({});
-                  setCheckedUnits({});
-                }}
+                total={displayedUnits.length}
+                selected={selectedCount}
+                onChange={(checked) =>
+                  setCheckedUnits((current) => applyCheckedKeys(current, displayedKeys, checked))
+                }
               />
               <span className="muted">已选 {selectedCount} 项</span>
               {canDownloadAny && (
@@ -815,7 +866,7 @@ function UnitTree({
                   type="button"
                   className="secondary"
                   disabled={!selectedCount}
-                  onClick={() => onDownload(selectedBatches, selectedUnits)}
+                  onClick={() => onDownload([], selectedUnits)}
                 >
                   下载
                 </button>
@@ -824,10 +875,9 @@ function UnitTree({
                 <button
                   type="button"
                   className="secondary"
-                  disabled={selectedCount !== 1}
+                  disabled={selectedUnits.length !== 1}
                   onClick={() => {
-                    if (selectedBatches.length === 1) onRenameBatch(selectedBatches[0]);
-                    else if (selectedUnits.length === 1) onRenameUnit(selectedUnits[0]);
+                    if (selectedUnits.length === 1) onRenameUnit(selectedUnits[0]);
                   }}
                 >
                   重命名
@@ -838,7 +888,7 @@ function UnitTree({
                   type="button"
                   className="danger"
                   disabled={!selectedCount}
-                  onClick={() => onDelete(selectedBatches, selectedUnits)}
+                  onClick={() => onDelete([], selectedUnits)}
                 >
                   删除
                 </button>
@@ -847,10 +897,7 @@ function UnitTree({
                 type="button"
                 className="secondary"
                 disabled={!selectedCount}
-                onClick={() => {
-                  setCheckedBatches({});
-                  setCheckedUnits({});
-                }}
+                onClick={() => setCheckedUnits({})}
               >
                 取消选择
               </button>
@@ -880,8 +927,32 @@ function UnitTree({
               }))
             }
             onSelect={() => onSelectNode(`${batch.name}::`)}
-            checked={!!checkedBatches[batch.name]}
-            onCheck={canManage ? (value) => toggleBatch(batch.name, value) : undefined}
+            checked={
+              batch.units.length > 0 &&
+              checkedKeyCount(
+                batch.units.map((unit) => unit.key),
+                checkedUnits
+              ) === batch.units.length
+            }
+            indeterminate={(() => {
+              const count = checkedKeyCount(
+                batch.units.map((unit) => unit.key),
+                checkedUnits
+              );
+              return count > 0 && count < batch.units.length;
+            })()}
+            onCheck={
+              canManage
+                ? (value) =>
+                    setCheckedUnits((current) =>
+                      applyCheckedKeys(
+                        current,
+                        batch.units.map((unit) => unit.key),
+                        value
+                      )
+                    )
+                : undefined
+            }
             actions={
               <TreeActions
                 canDownload={!!canDownload || batchOwnedBy(batch, currentUserId)}
@@ -946,6 +1017,7 @@ function UploaderTreePanel({
   currentUserId,
   onDownload,
   sortMode = "created_desc",
+  onSelectionChange,
 }: {
   uploaders: StorageUploader[];
   units: StorageUnit[];
@@ -957,9 +1029,9 @@ function UploaderTreePanel({
   currentUserId?: number;
   onDownload?: (units: StorageUnit[]) => void;
   sortMode?: string;
+  onSelectionChange?: (units: StorageUnit[]) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [checkedUploaders, setCheckedUploaders] = useState<Record<string, boolean>>({});
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const uploaderKeys = uploaders.map((item) => String(item.id));
   const unitsOf = (uploader: StorageUploader) =>
@@ -968,9 +1040,20 @@ function UploaderTreePanel({
         uploader.id === -1 ? !file.uploader : file.uploader?.id === uploader.id
       )
     );
-  const selectedUploaders = uploaders.filter((item) => checkedUploaders[String(item.id)]);
-  const selectedUnits = units.filter((unit) => checkedUnits[unit.key]);
-  const selectedCount = selectedUploaders.length + selectedUnits.length;
+  const displayedUnits = uniqueUnits(uploaders.flatMap((item) => unitsOf(item)));
+  const displayedKeys = displayedUnits.map((unit) => unit.key);
+  const selectedUnits = displayedUnits.filter((unit) => checkedUnits[unit.key]);
+  const selectedCount = selectedUnits.length;
+  useEffect(() => {
+    const visible = new Set(displayedKeys);
+    setCheckedUnits((current) => {
+      if (!Object.keys(current).some((key) => !visible.has(key))) return current;
+      const next: Record<string, boolean> = {};
+      for (const key of Object.keys(current)) if (visible.has(key)) next[key] = true;
+      return next;
+    });
+  }, [displayedKeys.join("\0")]);
+  useReportSelection(selectedUnits, onSelectionChange);
   const canDownloadAny =
     !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
@@ -984,31 +1067,14 @@ function UploaderTreePanel({
         extra={
           <DownloadToolbar
             count={selectedCount}
-            total={uploaders.length}
-            selectedForAll={selectedUploaders.length}
+            total={displayedUnits.length}
+            selectedForAll={selectedCount}
             canDownload={canDownloadAny}
-            onSelectAll={(checked) => {
-              if (checked) {
-                setCheckedUploaders(
-                  Object.fromEntries(uploaders.map((item) => [String(item.id), true]))
-                );
-                return;
-              }
-              setCheckedUploaders({});
-              setCheckedUnits({});
-            }}
-            onDownload={() =>
-              onDownload?.(
-                uniqueUnits([
-                  ...selectedUploaders.flatMap((item) => unitsOf(item)),
-                  ...selectedUnits,
-                ])
-              )
+            onSelectAll={(checked) =>
+              setCheckedUnits((current) => applyCheckedKeys(current, displayedKeys, checked))
             }
-            onClear={() => {
-              setCheckedUploaders({});
-              setCheckedUnits({});
-            }}
+            onDownload={() => onDownload?.(selectedUnits)}
+            onClear={() => setCheckedUnits({})}
           />
         }
       >
@@ -1040,8 +1106,32 @@ function UploaderTreePanel({
               }))
             }
             onSelect={() => onSelect(uploader.id)}
-            checked={!!checkedUploaders[key]}
-            onCheck={canDownloadAny ? (value) => setCheckedUploaders((current) => ({ ...current, [key]: value })) : undefined}
+            checked={
+              uploaderUnits.length > 0 &&
+              checkedKeyCount(
+                uploaderUnits.map((unit) => unit.key),
+                checkedUnits
+              ) === uploaderUnits.length
+            }
+            indeterminate={(() => {
+              const count = checkedKeyCount(
+                uploaderUnits.map((unit) => unit.key),
+                checkedUnits
+              );
+              return count > 0 && count < uploaderUnits.length;
+            })()}
+            onCheck={
+              canDownloadAny
+                ? (value) =>
+                    setCheckedUnits((current) =>
+                      applyCheckedKeys(
+                        current,
+                        uploaderUnits.map((unit) => unit.key),
+                        value
+                      )
+                    )
+                : undefined
+            }
             actions={
               <TreeActions
                 canDownload={
@@ -1121,6 +1211,7 @@ function UploadSessionTree({
   onDeleteSession,
   onDeleteSessionUnit,
   onDownload,
+  onSelectionChange,
 }: {
   sessions: StorageUploadSession[];
   units: StorageUnit[];
@@ -1134,9 +1225,9 @@ function UploadSessionTree({
   onDeleteSession?: (session: StorageUploadSession) => void;
   onDeleteSessionUnit?: (session: StorageUploadSession, unit: StorageUnit) => void;
   onDownload?: (units: StorageUnit[]) => void;
+  onSelectionChange?: (units: StorageUnit[]) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [checkedSessions, setCheckedSessions] = useState<Record<string, boolean>>({});
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const unitsByKey = new Map(units.map((unit) => [unit.key, unit]));
   const unitsByName = new Map<string, StorageUnit[]>();
@@ -1154,11 +1245,23 @@ function UploadSessionTree({
       )
       .filter((item): item is StorageUnit => !!item);
   const unitCheckKey = (sessionId: string, unitKey: string) => `${sessionId}:${unitKey}`;
-  const selectedSessions = sessions.filter((item) => checkedSessions[item.id]);
+  const displayedKeys = sessions.flatMap((session) =>
+    unitsOf(session).map((unit) => unitCheckKey(session.id, unit.key))
+  );
   const selectedUnits = sessions.flatMap((session) =>
     unitsOf(session).filter((unit) => checkedUnits[unitCheckKey(session.id, unit.key)])
   );
-  const selectedCount = selectedSessions.length + selectedUnits.length;
+  const selectedCount = selectedUnits.length;
+  useEffect(() => {
+    const visible = new Set(displayedKeys);
+    setCheckedUnits((current) => {
+      if (!Object.keys(current).some((key) => !visible.has(key))) return current;
+      const next: Record<string, boolean> = {};
+      for (const key of Object.keys(current)) if (visible.has(key)) next[key] = true;
+      return next;
+    });
+  }, [displayedKeys.join("\0")]);
+  useReportSelection(selectedUnits, onSelectionChange);
   const canDownloadAny =
     !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
@@ -1174,31 +1277,14 @@ function UploadSessionTree({
         extra={
           <DownloadToolbar
             count={selectedCount}
-            total={sessions.length}
-            selectedForAll={selectedSessions.length}
+            total={displayedKeys.length}
+            selectedForAll={selectedCount}
             canDownload={canDownloadAny}
-            onSelectAll={(checked) => {
-              if (checked) {
-                setCheckedSessions(
-                  Object.fromEntries(sessions.map((item) => [item.id, true]))
-                );
-                return;
-              }
-              setCheckedSessions({});
-              setCheckedUnits({});
-            }}
-            onDownload={() =>
-              onDownload?.(
-                uniqueUnits([
-                  ...selectedSessions.flatMap((item) => unitsOf(item)),
-                  ...selectedUnits,
-                ])
-              )
+            onSelectAll={(checked) =>
+              setCheckedUnits((current) => applyCheckedKeys(current, displayedKeys, checked))
             }
-            onClear={() => {
-              setCheckedSessions({});
-              setCheckedUnits({});
-            }}
+            onDownload={() => onDownload?.(uniqueUnits(selectedUnits))}
+            onClear={() => setCheckedUnits({})}
           />
         }
       >
@@ -1228,14 +1314,30 @@ function UploadSessionTree({
               }))
             }
             onSelect={() => onSelectSession(session)}
-            checked={!!checkedSessions[session.id]}
+            checked={
+              sessionUnits.length > 0 &&
+              checkedKeyCount(
+                sessionUnits.map((unit) => unitCheckKey(session.id, unit.key)),
+                checkedUnits
+              ) === sessionUnits.length
+            }
+            indeterminate={(() => {
+              const count = checkedKeyCount(
+                sessionUnits.map((unit) => unitCheckKey(session.id, unit.key)),
+                checkedUnits
+              );
+              return count > 0 && count < sessionUnits.length;
+            })()}
             onCheck={
               canDownloadAny
                 ? (value) =>
-                    setCheckedSessions((current) => ({
-                      ...current,
-                      [session.id]: value,
-                    }))
+                    setCheckedUnits((current) =>
+                      applyCheckedKeys(
+                        current,
+                        sessionUnits.map((unit) => unitCheckKey(session.id, unit.key)),
+                        value
+                      )
+                    )
                 : undefined
             }
             actions={
@@ -1320,6 +1422,7 @@ function TaxonomyTreePanel({
   currentUserId,
   onDownload,
   sortMode = "created_desc",
+  onSelectionChange,
 }: {
   nodes: TaxonomyNode[];
   units: StorageUnit[];
@@ -1332,6 +1435,7 @@ function TaxonomyTreePanel({
   currentUserId?: number;
   onDownload?: (units: StorageUnit[]) => void;
   sortMode?: string;
+  onSelectionChange?: (units: StorageUnit[]) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<number, boolean>>(() =>
     Object.fromEntries(nodes.map((node) => [node.id, false]))
@@ -1341,8 +1445,6 @@ function TaxonomyTreePanel({
   );
   const [groupByBatch, setGroupByBatch] = useState(true);
   const [batchExpanded, setBatchExpanded] = useState<Record<string, boolean>>({});
-  const [checkedNodes, setCheckedNodes] = useState<Record<number, boolean>>({});
-  const [checkedUnspecified, setCheckedUnspecified] = useState<Record<number, boolean>>({});
   const [checkedUnits, setCheckedUnits] = useState<Record<string, boolean>>({});
   const children = new Map<number | null, TaxonomyNode[]>();
   nodes.forEach((node) => {
@@ -1366,11 +1468,19 @@ function TaxonomyTreePanel({
     });
   const unspecifiedUnitsOf = (node: TaxonomyNode) =>
     units.filter((unit) => unit.taxonomy_tag_ids?.[scheme] === node.id);
-  const selectedNodes = nodes.filter((node) => checkedNodes[node.id]);
-  const selectedUnspecified = nodes.filter((node) => checkedUnspecified[node.id]);
+  const displayedKeys = units.map((unit) => unit.key);
   const selectedUnits = units.filter((unit) => checkedUnits[unit.key]);
-  const selectedCount =
-    selectedNodes.length + selectedUnspecified.length + selectedUnits.length;
+  const selectedCount = selectedUnits.length;
+  useEffect(() => {
+    const visible = new Set(displayedKeys);
+    setCheckedUnits((current) => {
+      if (!Object.keys(current).some((key) => !visible.has(key))) return current;
+      const next: Record<string, boolean> = {};
+      for (const key of Object.keys(current)) if (visible.has(key)) next[key] = true;
+      return next;
+    });
+  }, [displayedKeys.join("\0")]);
+  useReportSelection(selectedUnits, onSelectionChange);
   const canDownloadAny =
     !!canDownload || units.some((unit) => unitOwnedBy(unit, currentUserId));
 
@@ -1394,11 +1504,30 @@ function TaxonomyTreePanel({
           setUnspecifiedOpen((current) => ({ ...current, [node.id]: !open }))
         }
         onSelect={() => onSelect(node.id, true)}
-        checked={!!checkedUnspecified[node.id]}
+        checked={
+          bucket.length > 0 &&
+          checkedKeyCount(
+            bucket.map((unit) => unit.key),
+            checkedUnits
+          ) === bucket.length
+        }
+        indeterminate={(() => {
+          const count = checkedKeyCount(
+            bucket.map((unit) => unit.key),
+            checkedUnits
+          );
+          return count > 0 && count < bucket.length;
+        })()}
         onCheck={
           canDownloadAny
             ? (value) =>
-                setCheckedUnspecified((current) => ({ ...current, [node.id]: value }))
+                setCheckedUnits((current) =>
+                  applyCheckedKeys(
+                    current,
+                    bucket.map((unit) => unit.key),
+                    value
+                  )
+                )
             : undefined
         }
         actions={
@@ -1425,11 +1554,39 @@ function TaxonomyTreePanel({
                   nested
                   depth={depth + 1}
                   open={bOpen}
+                  selected={false}
                   title={batchName}
                   meta={<span>{batchUnits.length} 个单元</span>}
                   toggleLabel={bOpen ? "收起批次" : "展开批次"}
+                  onSelect={() => onSelect(node.id, true)}
                   onToggle={() =>
                     setBatchExpanded((current) => ({ ...current, [bKey]: !bOpen }))
+                  }
+                  checked={
+                    batchUnits.length > 0 &&
+                    checkedKeyCount(
+                      batchUnits.map((unit) => unit.key),
+                      checkedUnits
+                    ) === batchUnits.length
+                  }
+                  indeterminate={(() => {
+                    const count = checkedKeyCount(
+                      batchUnits.map((unit) => unit.key),
+                      checkedUnits
+                    );
+                    return count > 0 && count < batchUnits.length;
+                  })()}
+                  onCheck={
+                    canDownloadAny
+                      ? (value) =>
+                          setCheckedUnits((current) =>
+                            applyCheckedKeys(
+                              current,
+                              batchUnits.map((unit) => unit.key),
+                              value
+                            )
+                          )
+                      : undefined
                   }
                 >
                   {batchUnits.map((unit) => (
@@ -1514,11 +1671,30 @@ function TaxonomyTreePanel({
             setExpanded((current) => ({ ...current, [node.id]: !dirOpen }))
           }
           onSelect={() => onSelect(node.id, false)}
-          checked={!!checkedNodes[node.id]}
+          checked={
+            nodeUnits.length > 0 &&
+            checkedKeyCount(
+              nodeUnits.map((unit) => unit.key),
+              checkedUnits
+            ) === nodeUnits.length
+          }
+          indeterminate={(() => {
+            const count = checkedKeyCount(
+              nodeUnits.map((unit) => unit.key),
+              checkedUnits
+            );
+            return count > 0 && count < nodeUnits.length;
+          })()}
           onCheck={
             canDownloadAny
               ? (value) =>
-                  setCheckedNodes((current) => ({ ...current, [node.id]: value }))
+                  setCheckedUnits((current) =>
+                    applyCheckedKeys(
+                      current,
+                      nodeUnits.map((unit) => unit.key),
+                      value
+                    )
+                  )
               : undefined
           }
           actions={
@@ -1562,32 +1738,14 @@ function TaxonomyTreePanel({
         extra={
           <DownloadToolbar
             count={selectedCount}
-            total={nodes.length}
-            selectedForAll={selectedNodes.length}
+            total={displayedKeys.length}
+            selectedForAll={selectedCount}
             canDownload={canDownloadAny}
-            onSelectAll={(checked) => {
-              if (checked) {
-                setCheckedNodes(Object.fromEntries(nodes.map((node) => [node.id, true])));
-                return;
-              }
-              setCheckedNodes({});
-              setCheckedUnspecified({});
-              setCheckedUnits({});
-            }}
-            onDownload={() =>
-              onDownload?.(
-                uniqueUnits([
-                  ...selectedNodes.flatMap((node) => unitsUnder(node)),
-                  ...selectedUnspecified.flatMap((node) => unspecifiedUnitsOf(node)),
-                  ...selectedUnits,
-                ])
-              )
+            onSelectAll={(checked) =>
+              setCheckedUnits((current) => applyCheckedKeys(current, displayedKeys, checked))
             }
-            onClear={() => {
-              setCheckedNodes({});
-              setCheckedUnspecified({});
-              setCheckedUnits({});
-            }}
+            onDownload={() => onDownload?.(selectedUnits)}
+            onClear={() => setCheckedUnits({})}
           />
         }
       >
@@ -1926,7 +2084,44 @@ function DetailRow({
   );
 }
 
-type DetailKind = "batch" | "unit" | "file" | "upload_session" | "node";
+type DetailKind = "batch" | "unit" | "file" | "upload_session" | "node" | "selection";
+
+function unitSchemeTagId(
+  unit: StorageUnit,
+  scheme: string,
+  batch: StorageBatch | undefined
+): number | null {
+  const own = unit.taxonomy_tag_ids?.[scheme];
+  if (own) return own;
+  const inherited = batch?.taxonomy_tag_ids?.[scheme];
+  if (inherited) return inherited;
+  for (const file of unit.files || []) {
+    const tagged = file.taxonomy_tag_ids?.[scheme];
+    if (tagged) return tagged;
+  }
+  return null;
+}
+
+function useReportSelection(
+  units: StorageUnit[],
+  onSelectionChange?: (units: StorageUnit[]) => void
+) {
+  const selectionKey = [...new Set(units.map((unit) => unit.key))].join("\0");
+  useEffect(() => {
+    if (!onSelectionChange) return;
+    const seen = new Set<string>();
+    onSelectionChange(
+      units.filter((unit) => {
+        if (seen.has(unit.key)) return false;
+        seen.add(unit.key);
+        return true;
+      })
+    );
+  }, [selectionKey]);
+  useEffect(() => {
+    return () => onSelectionChange?.([]);
+  }, [onSelectionChange]);
+}
 
 type StorageNodeFocus = {
   batchName: string;
@@ -1953,6 +2148,8 @@ function EntityDetailPanel({
   onNodesReload,
   onError,
   onMessage,
+  selectedUnits = [],
+  selectionBatches = [],
 }: {
   kind: DetailKind | null;
   batch: StorageBatch | null;
@@ -1968,6 +2165,8 @@ function EntityDetailPanel({
   onNodesReload: () => Promise<void>;
   onError: (message: string) => void;
   onMessage: (message: string) => void;
+  selectedUnits?: StorageUnit[];
+  selectionBatches?: StorageBatch[];
 }) {
   const [detail, setDetail] = useState<StorageFileDetail | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1985,6 +2184,11 @@ function EntityDetailPanel({
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
+  const [selectionDrafts, setSelectionDrafts] = useState<Record<string, number | "">>({});
+  const selectionKey = selectedUnits.map((item) => item.key).join("\0");
+  useEffect(() => {
+    setSelectionDrafts({});
+  }, [selectionKey]);
   const [saved, setSaved] = useState(false);
   const { execute } = useUndo();
 
@@ -2204,7 +2408,9 @@ function EntityDetailPanel({
             ? "文件详情"
             : kind === "upload_session"
               ? "上传记录"
-              : "详情";
+              : kind === "selection"
+                ? "所选数据单元详情"
+                : "详情";
 
   const saveAnnotation = async () => {
     if (!kind) return;
@@ -2319,6 +2525,64 @@ function EntityDetailPanel({
         });
         return;
       }
+      if (kind === "selection") {
+        const nextId = raw === "" ? null : raw;
+        if (nextId == null) return;
+        const schemeName = taxonomySchemeLabel(scheme, schemes);
+        const batchOf = (item: StorageUnit) =>
+          selectionBatches.find((entry) => entry.name === item.batch);
+        const missing = selectedUnits.filter(
+          (item) => !unitSchemeTagId(item, scheme, batchOf(item))
+        );
+        const skipped = selectedUnits.length - missing.length;
+        if (!missing.length) {
+          onMessage("所选单元都已经有该标签，未做修改");
+          return;
+        }
+        const byBatch = new Map<string, StorageUnit[]>();
+        for (const item of missing) {
+          const list = byBatch.get(item.batch) || [];
+          list.push(item);
+          byBatch.set(item.batch, list);
+        }
+        const writeSelection = async (nodeId: number | null) => {
+          const limit = 20000;
+          for (const [batchName, items] of byBatch) {
+            for (let offset = 0; offset < items.length; offset += limit) {
+              const slice = items.slice(offset, offset + limit);
+              await api.storageUpdateNodeTaxonomy({
+                batch: batchName,
+                units: slice.map((item) => ({
+                  name: item.name,
+                  taxonomy_tag_ids: { [scheme]: nodeId },
+                })),
+              });
+            }
+          }
+        };
+        setSaving(true);
+        try {
+          await execute({
+            label: `补标注${schemeName}`,
+            do: async () => {
+              await writeSelection(nextId);
+              onMessage(
+                skipped
+                  ? `已为 ${missing.length} 个单元补上${schemeName}，${skipped} 个已有标签的单元未修改`
+                  : `已为 ${missing.length} 个单元补上${schemeName}`
+              );
+              await onReload();
+              setSelectionDrafts((current) => ({ ...current, [scheme]: "" }));
+            },
+            undo: async () => {
+              await writeSelection(null);
+            },
+          });
+        } finally {
+          setSaving(false);
+        }
+        return;
+      }
       const target = metaTarget();
       if (!target) return;
       const nextId = raw === "" ? null : raw;
@@ -2397,6 +2661,19 @@ function EntityDetailPanel({
           <DetailRow label="上传者" value={session.username || "—"} />
         </dl>
       )}
+      {kind === "selection" && (
+        <dl className="storage-detail-list">
+          <DetailRow label="数据单元" value={`${selectedUnits.length} 个`} />
+          <DetailRow
+            label="数据批次"
+            value={String(new Set(selectedUnits.map((item) => item.batch)).size)}
+          />
+          <DetailRow
+            label="文件数"
+            value={String(selectedUnits.reduce((sum, item) => sum + item.file_count, 0))}
+          />
+        </dl>
+      )}
       {kind === "unit" && unit && (
         <dl className="storage-detail-list">
           <DetailRow label="数据单元" value={unit.name} />
@@ -2458,7 +2735,64 @@ function EntityDetailPanel({
               修改后应用到该节点下所有 {nodeInfo.units.length} 个数据单元
             </p>
           )}
+          {kind === "selection" && canEdit && (
+            <p className="muted">
+              只给还没有该标签的单元补上，已经有标签的不会修改
+            </p>
+          )}
           {visibleSchemes.map((scheme) => {
+            if (kind === "selection") {
+              const batchOf = (item: StorageUnit) =>
+                selectionBatches.find((entry) => entry.name === item.batch);
+              const filled = selectedUnits.filter((item) =>
+                unitSchemeTagId(item, scheme.key, batchOf(item))
+              ).length;
+              const empty = selectedUnits.length - filled;
+              if (!canEdit) {
+                return (
+                  <DetailRow
+                    key={scheme.key}
+                    label={taxonomySchemeLabel(scheme.key, schemes)}
+                    value={
+                      empty
+                        ? `${filled} 个已标注，${empty} 个未标注`
+                        : `${filled} 个已标注`
+                    }
+                  />
+                );
+              }
+              const draft = selectionDrafts[scheme.key] ?? "";
+              return (
+                <div key={scheme.key} className="storage-selection-scheme">
+                  <label>
+                    {taxonomySchemeLabel(scheme.key, schemes)}
+                    <TaxonomySelect
+                      scheme={scheme.key}
+                      nodes={nodes.filter((item) => item.scheme === scheme.key)}
+                      value={draft}
+                      disabled={saving}
+                      canCreate={canCreate}
+                      onNodesReload={onNodesReload}
+                      onChange={(id) =>
+                        setSelectionDrafts((current) => ({ ...current, [scheme.key]: id }))
+                      }
+                    />
+                  </label>
+                  <span className="muted">
+                    {empty
+                      ? `已有标签 ${filled} 个，确认后只标注其余 ${empty} 个`
+                      : `所选 ${filled} 个单元都已有该标签`}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={saving || draft === "" || empty === 0}
+                    onClick={() => void saveTaxonomy(scheme.key, draft)}
+                  >
+                    {saving ? "保存中…" : "补上标签"}
+                  </button>
+                </div>
+              );
+            }
             if (kind === "node") {
               const share = nodeShare[scheme.key];
               const found = share?.id
@@ -2717,7 +3051,7 @@ function EntityDetailPanel({
               value={qualityLabel(String(annotation.quality || ""))}
             />
           )}
-          {kind !== "node" && canEdit ? (
+          {kind !== "node" && kind !== "selection" && canEdit ? (
             <>
               <label>
                 备注
@@ -2734,7 +3068,7 @@ function EntityDetailPanel({
                 {saving ? "保存中…" : saved ? "已保存" : "保存标签"}
               </button>
             </>
-          ) : kind !== "node" ? (
+          ) : kind !== "node" && kind !== "selection" ? (
             <DetailRow
               label="备注"
               value={String(annotation.note || "").trim() || "暂无备注"}
@@ -3533,11 +3867,24 @@ export function StorageWorkspace({
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [nodes, setNodes] = useState<TaxonomyNode[]>([]);
   const [mode, setMode] = useState("folder");
+  const [pickedKeys, setPickedKeys] = useState<string[]>([]);
+  const reportPickedUnits = useCallback((units: StorageUnit[]) => {
+    setPickedKeys((current) => {
+      const next = units.map((unit) => unit.key);
+      if (current.length === next.length && current.every((key, index) => key === next[index])) {
+        return current;
+      }
+      return next;
+    });
+  }, []);
   const [openFilterScheme, setOpenFilterScheme] = useState<string | null>(null);
   const [filterNodeIds, setFilterNodeIds] = useState<Record<string, number[]>>({});
   const [extraChecks, setExtraChecks] = useState<Record<string, string[]>>({});
   const [modelInstances, setModelInstances] = useState<ModelInstance[]>([]);
   const [browseMenu, setBrowseMenu] = useState<"standard" | "sort" | null>(null);
+  const [leftPaneWidth, setLeftPaneWidth] = useStoredNumber("hub-pane-left", 320);
+  const [rightPaneWidth, setRightPaneWidth] = useStoredNumber("hub-pane-right", 320);
+  const [previewHeight, setPreviewHeight] = useStoredNumber("hub-pane-preview", 520);
   useEffect(() => {
     if (!browseMenu && !openFilterScheme) return;
     const onPointerDown = (event: MouseEvent) => {
@@ -3752,6 +4099,19 @@ export function StorageWorkspace({
     }) };
   }, [data, extraBatches, sortMode, filterNodeIds, nodes, extraChecks]);
 
+  const pickedUnits = useMemo(() => {
+    if (!pickedKeys.length) return [];
+    const byKey = new Map<string, StorageUnit>();
+    for (const unit of data?.units || []) byKey.set(unit.key, unit);
+    for (const batch of displayData?.batches || []) {
+      for (const unit of batch.units) byKey.set(unit.key, unit);
+    }
+    return pickedKeys.flatMap((key) => {
+      const unit = byKey.get(key);
+      return unit ? [unit] : [];
+    });
+  }, [pickedKeys, displayData, data]);
+
   const currentNodes = nodes.filter((node) => node.scheme === mode);
 
   const reloadTaxonomies = async () => {
@@ -3831,6 +4191,11 @@ export function StorageWorkspace({
     ownsSelected ||
     ownsFocusedBatch ||
     !!(user && focusedSession && focusedSession.user_id === user.id);
+  const canAnnotatePicked =
+    canAnnotate ||
+    (!!user &&
+      pickedUnits.length > 0 &&
+      pickedUnits.every((unit) => unitOwnedBy(unit, user.id)));
 
   const focusedFile = useMemo(() => {
     if (focus?.kind !== "file") return selectedFile;
@@ -3843,6 +4208,64 @@ export function StorageWorkspace({
       selectedFile
     );
   }, [focus, selected, data, selectedFile, preview.slots]);
+
+  useEffect(() => {
+    const bits: string[] = [];
+    const tree =
+      mode === "folder"
+        ? "存储结构"
+        : mode === "uploader"
+          ? "按上传用户"
+          : mode === "upload_order"
+            ? "按上传记录"
+            : `${taxonomySchemeLabel(mode, schemes)}分类`;
+    bits.push(tree);
+    const keyword = query.trim();
+    if (keyword) bits.push(`搜索「${keyword.slice(0, 20)}」`);
+    const filters: string[] = [];
+    for (const [scheme, ids] of Object.entries(filterNodeIds)) {
+      if (!ids.length) continue;
+      const summary = filterSummary(ids, nodes);
+      if (summary) filters.push(summary);
+    }
+    for (const [key, ids] of Object.entries(extraChecks)) {
+      if (!ids.length) continue;
+      if (key === "uploader") {
+        const names = ids
+          .map((id) => data?.uploaders.find((item) => String(item.id) === id)?.username)
+          .filter((name): name is string => !!name);
+        if (names.length === 1) filters.push(names[0]);
+        else if (names.length) filters.push(`${names[0]} +${names.length - 1}`);
+      } else if (key === "modality") {
+        const raw = ids[0];
+        const name = raw.startsWith("motion:")
+          ? motionKindLabel(raw.slice("motion:".length))
+          : MODALITY_LABEL[raw] || raw;
+        filters.push(ids.length > 1 ? `${name} +${ids.length - 1}` : name);
+      } else {
+        filters.push(ids.length > 1 ? `${ids[0]} +${ids.length - 1}` : ids[0]);
+      }
+    }
+    if (filters.length) bits.push(`筛选 ${filters.slice(0, 3).join("、")}`);
+    if (pickedUnits.length) bits.push(`勾选 ${pickedUnits.length} 个单元`);
+    else if (selected) bits.push(`查看「${selected.name.slice(0, 28)}」`);
+    else if (focusedBatch) bits.push(`查看批次 ${focusedBatch.name}`);
+    else if (focusedFile) bits.push(`查看文件 ${focusedFile.name}`);
+    setPresenceDetail(bits.join(" · "));
+    return () => setPresenceDetail("");
+  }, [
+    mode,
+    schemes,
+    query,
+    filterNodeIds,
+    nodes,
+    extraChecks,
+    data,
+    pickedUnits,
+    selected,
+    focusedBatch,
+    focusedFile,
+  ]);
 
   const promptName = (label: string, current: string) => {
     const next = window.prompt(label, current);
@@ -4227,7 +4650,14 @@ export function StorageWorkspace({
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
 
-      <div className="storage-workspace">
+      <div
+        className="storage-workspace is-split"
+        style={{
+          ["--pane-left" as string]: `${leftPaneWidth}px`,
+          ["--pane-right" as string]: `${rightPaneWidth}px`,
+          ["--pane-preview" as string]: `${previewHeight}px`,
+        }}
+      >
         <aside className="card storage-left-pane">
           {variant !== "upload" && (
             <div className="browse-pickers">
@@ -4352,6 +4782,7 @@ export function StorageWorkspace({
                 canDownload={canDownloadItems}
                 currentUserId={user?.id}
                 onDownload={(units) => handleDownloadItems([], units)}
+                onSelectionChange={reportPickedUnits}
               />
             </>
           )}
@@ -4375,6 +4806,7 @@ export function StorageWorkspace({
                 canDownload={canDownloadItems}
                 currentUserId={user?.id}
                 onDownload={(units) => handleDownloadItems([], units)}
+                onSelectionChange={reportPickedUnits}
               />
             </>
           )}
@@ -4437,6 +4869,7 @@ export function StorageWorkspace({
                   `确认删除这次上传到「${unit.name}」的 ${paths.length} 个文件？\n不会删除该单元里其它上传留下的文件。`
                 );
               }}
+              onSelectionChange={reportPickedUnits}
             />
           )}
           {mode === "folder" && (
@@ -4469,11 +4902,17 @@ export function StorageWorkspace({
               onRenameUnit={(unit) => void handleRenameUnit(unit)}
               onDelete={(batches, units) => void handleDeleteItems(batches, units)}
               onDownload={(batches, units) => void handleDownloadItems(batches, units)}
+              onSelectionChange={reportPickedUnits}
             />
           )}
         </aside>
+        <SplitHandle
+          axis="x"
+          onDelta={(delta) => setLeftPaneWidth((current) => clampPane(current + delta, 220, 640))}
+        />
 
-        <main className="card storage-right-pane stack">
+        <main className="card storage-right-pane pane-stack">
+          <div className="pane-stack-body">
           {focus?.kind === "batch" && focusedBatch && (
             <>
               <div>
@@ -4646,15 +5085,27 @@ export function StorageWorkspace({
 
             </>
           )}
-          <FilePreviewDock
-            onActivate={(file) => {
-              setSelectedKey(`${file.batch}::${file.unit_name}`);
-              setFocus({ kind: "file", key: file.path });
-            }}
+          </div>
+          <SplitHandle
+            axis="y"
+            onDelta={(delta) => setPreviewHeight((current) => clampPane(current - delta, 220, 900))}
           />
+          <div className="pane-preview">
+            <FilePreviewDock
+              onActivate={(file) => {
+                setSelectedKey(`${file.batch}::${file.unit_name}`);
+                setFocus({ kind: "file", key: file.path });
+              }}
+            />
+          </div>
         </main>
+        <SplitHandle
+          axis="x"
+          onDelta={(delta) => setRightPaneWidth((current) => clampPane(current - delta, 240, 560))}
+        />
+        <div className="pane-slot">
         <EntityDetailPanel
-          kind={focus?.kind || null}
+          kind={pickedUnits.length ? "selection" : focus?.kind || null}
           batch={
             focusedBatch ||
             displayData?.batches.find(
@@ -4668,7 +5119,7 @@ export function StorageWorkspace({
           nodeInfo={focusedNode}
           schemes={schemes}
           nodes={nodes}
-          canEdit={variant !== "browse" && canAnnotateSelected}
+          canEdit={variant !== "browse" && (pickedUnits.length ? canAnnotatePicked : canAnnotateSelected)}
           canCreate={variant !== "browse" && canCreateTaxonomy}
           onReload={async () => {
             await load(true);
@@ -4676,7 +5127,10 @@ export function StorageWorkspace({
           onNodesReload={reloadTaxonomies}
           onError={setError}
           onMessage={setMessage}
+          selectedUnits={pickedUnits}
+          selectionBatches={displayData?.batches?.length ? displayData.batches : data?.batches || []}
         />
+        </div>
       </div>
 
       {downloadPick && (

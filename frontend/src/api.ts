@@ -31,25 +31,29 @@ function chineseHttpError(status: number, detail: string): string {
   return detail || `请求失败（${status}）`;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers || {});
+type RequestOpts = RequestInit & { quiet?: boolean };
+
+async function request<T>(path: string, init: RequestOpts = {}): Promise<T> {
+  const quiet = !!init.quiet;
+  const { quiet: _quiet, ...rest } = init;
+  const headers = new Headers(rest.headers || {});
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
+  if (rest.body && !(rest.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  startLoading();
+  if (!quiet) startLoading();
   let res: Response;
   try {
-    res = await fetch(path, { ...init, headers });
+    res = await fetch(path, { ...rest, headers });
   } catch {
-    stopLoading();
+    if (!quiet) stopLoading();
     throw new Error(
       "无法连接服务器（Failed to fetch）。请确认用 http://服务器IP/ 打开网页，且 docker compose 服务正常；若上传大 zip，请在系统浏览器中重试。"
     );
   }
   if (res.status === 401) {
-    stopLoading();
+    if (!quiet) stopLoading();
     const actor = getActorToken();
     setToken(null);
     if (actor && actor !== token && !path.includes("/auth/login")) {
@@ -71,21 +75,21 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       /* ignore */
     }
-    stopLoading();
+    if (!quiet) stopLoading();
     const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
     throw new Error(chineseHttpError(res.status, msg));
   }
   if (res.status === 204) {
-    stopLoading();
+    if (!quiet) stopLoading();
     return undefined as T;
   }
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) {
     const data = await res.json();
-    stopLoading();
+    if (!quiet) stopLoading();
     return data;
   }
-  stopLoading();
+  if (!quiet) stopLoading();
   return res as unknown as T;
 }
 
@@ -186,6 +190,14 @@ export const api = {
   modelAssetDownloadUrl: (id: number) => `/api/model-assets/${id}/download`,
 
   listUsers: () => request<import("./types").User[]>("/api/users"),
+  reportPresence: (body: { page: string; detail: string; idle: boolean }) =>
+    request<{ ok: boolean }>("/api/presence", {
+      method: "POST",
+      body: JSON.stringify(body),
+      quiet: true,
+    }),
+  listPresence: () =>
+    request<import("./types").UserPresence[]>("/api/presence", { quiet: true }),
   changePassword: (oldPassword: string, newPassword: string) =>
     request<{ ok: boolean }>("/api/auth/change-password", {
       method: "POST",

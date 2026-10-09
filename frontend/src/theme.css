@@ -166,6 +166,13 @@ body {
   max-height: 68vh;
 }
 
+.pane-preview .storage-preview-section:not(.is-fullscreen) .animation-format-canvas.viewer-panel {
+  aspect-ratio: auto;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
+}
+
 .table tr:hover td,
 .table tr:hover td {
   background: var(--hover-wash);

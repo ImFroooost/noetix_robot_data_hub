@@ -13,7 +13,7 @@ class ORMModel(BaseModel):
 # -------- Auth / Users --------
 class PermissionItem(BaseModel):
     capability: Capability
-    # ""=文件夹树；否则为分类标准 key，path_prefix 为该分类树下的节点路径
+    # ""=文件夹树；uploader/subject/format/modality=筛选维度；其余为分类标准 key
     scheme: str = ""
     path_prefix: str = "/"
     recursive: bool = True

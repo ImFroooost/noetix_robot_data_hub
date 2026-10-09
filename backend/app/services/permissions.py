@@ -31,6 +31,10 @@ MANAGE_DATA_IMPLIES = (
     Capability.upload,
 )
 
+# 与浏览页「筛选维度」里分类标准之外的四项对应。path_prefix 存筛选项 id，不是文件夹路径。
+FACET_SCHEMES = frozenset({"uploader", "subject", "format", "modality"})
+_MOTION_KINDS = frozenset({"skeleton", "object", "merged"})
+
 
 def normalize_path(path: str | None) -> str:
     if not path or path.strip() in ("", "/"):
@@ -51,6 +55,14 @@ def join_folder_path(parent_path: str | None, name: str) -> str:
     if parent == "/":
         return f"/{name}/"
     return f"{parent}{name}/"
+
+
+def permission_prefix(scheme: str, path_prefix: str | None) -> str:
+    """Folder and taxonomy scopes are directory paths. Filter scopes keep their raw id."""
+    if scheme in FACET_SCHEMES:
+        raw = (path_prefix or "/").strip()
+        return "/" if raw in ("", "/") else raw
+    return normalize_path(path_prefix)
 
 
 def path_matches(folder_path: str, prefix: str, recursive: bool = True) -> bool:
@@ -136,6 +148,67 @@ def user_has_capability(db: Session, user: User, capability: Capability, folder_
     return False
 
 
+def _file_modality_key(file: dict) -> str:
+    modality = str(file.get("modality") or "")
+    if modality != "motion":
+        return modality
+    kind = str((file.get("annotation") or {}).get("motion_kind") or "skeleton")
+    if kind not in _MOTION_KINDS:
+        kind = "skeleton"
+    return f"motion:{kind}"
+
+
+def _file_matches_subject(file: dict, selected: str) -> bool:
+    ontology = str(file.get("ontology") or "")
+    annotation = file.get("annotation") or {}
+    if ontology == "robot":
+        instance = str(file.get("robot_style") or annotation.get("robot_style") or "")
+        version = str(annotation.get("robot_version") or "")
+    else:
+        instance = str(annotation.get("human_model") or "")
+        version = str(annotation.get("human_model_file") or "")
+    parts = selected.split("|")
+    onto = parts[0] if parts else ""
+    inst = parts[1] if len(parts) > 1 else ""
+    ver = parts[2] if len(parts) > 2 else ""
+    if onto != ontology:
+        return False
+    if not inst:
+        return True
+    if inst != instance:
+        return False
+    if not ver:
+        return True
+    return ver == version or version.endswith(ver) or ver.endswith(version)
+
+
+def unit_matches_facet(unit: dict, scheme: str, path_prefix: str) -> bool:
+    """Same match as the browse filter chips: uploader, subject, format, modality."""
+    if scheme not in FACET_SCHEMES:
+        return False
+    if path_prefix in ("", "/"):
+        return True
+    files = unit.get("files") or []
+    if scheme == "uploader":
+        ids: set[str] = set()
+        for item in unit.get("uploaders") or []:
+            if item and item.get("id") is not None:
+                ids.add(str(item["id"]))
+        for file in files:
+            uploader = file.get("uploader") or {}
+            if uploader.get("id") is not None:
+                ids.add(str(uploader["id"]))
+        return path_prefix in ids
+    if scheme == "format":
+        wanted = path_prefix.lower()
+        return any(str(file.get("format") or "").lower() == wanted for file in files)
+    if scheme == "modality":
+        return any(_file_modality_key(file) == path_prefix for file in files)
+    if scheme == "subject":
+        return any(_file_matches_subject(file, path_prefix) for file in files)
+    return False
+
+
 def _clip_tag_paths(db: Session, clip: MotionClip) -> dict[str, str]:
     """scheme key -> taxonomy node path for the clip's tags."""
     from ..models import ClipTaxonomyTag, TaxonomyNode
@@ -183,6 +256,8 @@ def user_has_clip_capability(
         if not p.scheme:
             if path_matches(folder_path, p.path_prefix, p.recursive):
                 return True
+            continue
+        if p.scheme in FACET_SCHEMES:
             continue
         if tag_paths is None:
             tag_paths = _clip_tag_paths(db, clip)
@@ -280,6 +355,8 @@ def apply_browse_filter(query, db: Session, user: User):
         if path_matches("/未分类/", pref, True):
             clauses.append(MotionClip.folder_id.is_(None))
     for p in scheme_perms:
+        if p.scheme in FACET_SCHEMES:
+            continue
         pref = normalize_path(p.path_prefix)
         tagged = (
             db.query(ClipTaxonomyTag.clip_id)
@@ -345,7 +422,7 @@ def permission_summary(db: Session, user: User) -> dict:
     allowed = role_capabilities(user.role)
     for r in rows:
         scheme = getattr(r, "scheme", "") or ""
-        pref = normalize_path(r.path_prefix)
+        pref = permission_prefix(scheme, r.path_prefix)
         raw = r.capability.value
         aliased = alias_capability(r.capability)
         if aliased not in allowed:
@@ -388,7 +465,7 @@ def set_user_permissions(
         if cap not in allowed or cap == Capability.manage_users:
             continue
         scheme = (item.get("scheme") or "").strip()
-        prefix = normalize_path(item.get("path_prefix") or "/")
+        prefix = permission_prefix(scheme, item.get("path_prefix"))
         recursive = bool(item.get("recursive", True))
         key = (cap.value, scheme, prefix)
         if key in seen:

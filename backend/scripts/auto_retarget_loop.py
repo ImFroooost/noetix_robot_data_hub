@@ -2,7 +2,8 @@
 
 For each data unit that has human motion and is missing one or more robot styles,
 pick a source file (skeleton before merged, then fbx, bvh, smpl) and run
-holosoma_retargeting's batch_retarget_to_csv.process_one. Outputs are headerless
+holosoma_retargeting's data_utils/batch_retarget_to_csv.py in a fresh process
+(same flags as the official batch command). Outputs are headerless
 30 Hz CSVs under data/robot/<style>/motion/csv/<batch>/...
 
 Run on the host with the holosoma virtualenv:
@@ -15,7 +16,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
@@ -38,7 +42,6 @@ sys.path.insert(0, str(PKG / "holosoma_retargeting" / "data_utils"))
 from app.services.retarget_select import (  # noqa: E402
     choose_human_source,
     human_height_m,
-    missing_robot_styles,
     motion_kind,
     output_stem,
 )
@@ -48,6 +51,18 @@ STYLES = [
     "unitree_g1",
     "noetix_e2",
 ]
+# Interpreter that can run data_utils/batch_retarget_to_csv.py. A fresh process
+# each job so a long-lived worker cannot keep an old copy of the solver.
+RETARGET_PYTHON = Path(
+    os.environ.get(
+        "HOLOSOMA_PYTHON",
+        "/home/noetix/.holosoma_deps/miniconda3/envs/hsretargeting/bin/python",
+    )
+)
+INNER = PKG / "holosoma_retargeting"
+RETARGET_METHOD = "batch_retarget_to_csv"
+# CSVs written by the in-process loop on this day used a stale solver and are redone.
+REDO_AFTER = datetime(2026, 9, 24).timestamp()
 # Each retarget uses about one core and 1–2 GB. Leave room for other jobs on this machine.
 WORKERS = max(1, int(os.environ.get("AUTO_RETARGET_WORKERS", "4")))
 # These taxonomy names, and every node under them, run only after other batches.
@@ -302,7 +317,7 @@ def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> lis
             continue
         source = dict(source)
         source["abs"] = str(source.get("abs") or "")
-        for style in missing_robot_styles(files, STYLES):
+        for style in STYLES:
             key = f"{batch}::{unit}::{style}::{source['path']}"
             until = float(failures.get(key) or 0)
             if until > now:
@@ -313,7 +328,7 @@ def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> lis
             if sub:
                 dest = dest / sub
             dest = dest / f"{stem}.csv"
-            if dest.is_file() and dest.stat().st_size > 0:
+            if not needs_official_retarget(dest, files, style):
                 continue
             jobs.append(
                 {
@@ -355,75 +370,89 @@ def remember_files(rows: list[tuple[str, dict]]) -> None:
     tmp.replace(meta_path)
 
 
-def _shared_height(source: Path, skeletons: list, annotation_height: float | None) -> float | None:
-    """Match batch_retarget_to_csv: multi-skeleton FBX shares one estimated height.
+def needs_official_retarget(dest: Path, files: list[dict], style: str) -> bool:
+    """True when this style still needs data_utils/batch_retarget_to_csv.py.
 
-    A height stored on the data unit overrides that estimate.
+    Files written on 2026-09-24 by the long-lived in-process solver are redone.
+    A later run stamps retarget_method and is kept, including a genuinely still clip.
     """
-    if annotation_height is not None:
-        return annotation_height
-    if len(skeletons) <= 1 or source.suffix.lower() != ".fbx":
-        return None
-    try:
-        import numpy as np
-        from prep_fbx_for_rt import estimate_skeleton_heights
-
-        heights = estimate_skeleton_heights(source)
-    except Exception:
-        return None
-    if not heights:
-        return None
-    return float(np.mean(list(heights.values())))
-
-
-_JOINTS: dict[str, list[str]] = {}
-
-
-def _joint_names(style: str) -> list[str]:
-    cached = _JOINTS.get(style)
-    if cached is not None:
-        return cached
-    from retarget_to_csv import mjcf_joint_names
-
-    names = mjcf_joint_names(style)
-    _JOINTS[style] = names
-    return names
+    if not dest.is_file() or dest.stat().st_size <= 0:
+        return True
+    rel = dest.relative_to(HUB).as_posix()
+    for item in files:
+        if item.get("robot_style") != style:
+            continue
+        if item.get("path") != rel:
+            continue
+        if (item.get("annotation") or {}).get("retarget_method") == RETARGET_METHOD:
+            return False
+    return dest.stat().st_mtime >= REDO_AFTER
 
 
 def retarget(job: dict) -> list[Path]:
-    from batch_retarget_to_csv import process_one
-    from retarget_to_csv import list_input_skeletons
+    """Run data_utils/batch_retarget_to_csv.py the same way as the official command.
+
+    One source file is linked into a temporary input dir. ``--jobs`` matches the
+    documented batch command; with a single file the script still uses one worker.
+    The loop's own pool supplies the parallelism across files.
+    """
+    from retarget_to_csv import list_input_skeletons, output_csv_for_skeleton
 
     source = Path(job["source"]["abs"])
     skeletons = list_input_skeletons(source) or [None]
-    joint_names = _joint_names(job["style"])
     dest = Path(job["dest"])
     dest.parent.mkdir(parents=True, exist_ok=True)
-    height = _shared_height(source, skeletons, job["height"])
-    multi = len(skeletons) > 1
-    written: list[Path] = []
-    # Canonical CSV is written last. Until it exists the unit still looks unfinished,
-    # so a crash mid-way is retried and already-written skeleton files are skipped.
-    for index, skeleton in enumerate(skeletons):
-        last = index == len(skeletons) - 1
-        if last or not skeleton:
-            target = dest
-        else:
-            target = dest.with_name(f"{output_stem(source.name, skeleton)}.csv")
-        if target.is_file() and target.stat().st_size > 0:
-            written.append(target)
-            continue
-        process_one(
-            source,
-            target,
+    env = os.environ.copy()
+    env["TMPDIR"] = "/tmp"
+    with tempfile.TemporaryDirectory(prefix="hub_retarget_", dir="/tmp") as raw:
+        tmp = Path(raw)
+        in_dir = tmp / "in"
+        out_dir = tmp / "out"
+        in_dir.mkdir()
+        (in_dir / source.name).symlink_to(source)
+        log_path = tmp / "run.log"
+        cmd = [
+            str(RETARGET_PYTHON),
+            "-u",
+            str(INNER / "data_utils" / "batch_retarget_to_csv.py"),
+            "--robot",
             job["style"],
-            joint_names,
-            skeleton=skeleton,
-            preserve_world=multi,
-            human_height=height,
-            quiet=True,
-        )
-        written.append(target)
+            "--input-dir",
+            str(in_dir),
+            "--output-dir",
+            str(out_dir),
+            "--jobs",
+            "6",
+            "--skip-existing",
+        ]
+        with log_path.open("w", encoding="utf-8") as handle:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(INNER),
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if proc.returncode != 0:
+            tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
+            raise RuntimeError(f"batch_retarget_to_csv.py failed (exit {proc.returncode}):\n{tail}")
+        base = out_dir / Path(source.name).with_suffix(".csv")
+        written: list[Path] = []
+        for index, skeleton in enumerate(skeletons):
+            produced = output_csv_for_skeleton(base, skeleton)
+            if not produced.is_file():
+                raise FileNotFoundError(produced)
+            last = index == len(skeletons) - 1
+            if last or not skeleton:
+                target = dest
+            else:
+                target = dest.with_name(f"{output_stem(source.name, skeleton)}.csv")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged = target.with_suffix(target.suffix + ".tmp")
+            shutil.copyfile(produced, staged)
+            staged.replace(target)
+            written.append(target)
     return written
 
 
@@ -476,6 +505,7 @@ def _record_wave(jobs: list[dict], results: list[tuple[str, list[str] | None, st
                         "robot_style": job["style"],
                         "motion_kind": job["kind"],
                         "fps": 30,
+                        "retarget_method": RETARGET_METHOD,
                         "note": note,
                     },
                 )
@@ -496,48 +526,49 @@ def main() -> None:
 
     subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)
     log(f"自动重定向已启动，并行 {WORKERS} 路；小批次优先，开源数据和其他数据集最后")
-    pool = ProcessPoolExecutor(max_workers=WORKERS)
     since_catalog = 0
-    try:
-        while True:
-            try:
-                log("正在扫描待重定向的数据")
-                records = iter_motion_files()
-                attach_annotations(records)
-                grouped = group_units(records)
-                jobs = sort_jobs(collect_jobs(grouped, load_state()), grouped)
-                if not jobs:
-                    if since_catalog:
-                        rebuild_catalog()
-                        since_catalog = 0
-                    log("没有待重定向的数据单元，60 秒后再检查")
-                    time.sleep(60)
-                    continue
-                log(f"本轮 {len(jobs)} 条，先做 {jobs[0]['batch']}，{WORKERS} 路并行")
-                for offset in range(0, len(jobs), WORKERS):
-                    wait_until_host_free()
-                    wave = jobs[offset : offset + WORKERS]
-                    for job in wave:
-                        log(
-                            f"重定向 {job['batch']} / {job['unit']} -> {job['style']} "
-                            f"来源 {job['source']['name']}"
-                        )
+    while True:
+        try:
+            log("正在扫描待重定向的数据")
+            records = iter_motion_files()
+            attach_annotations(records)
+            grouped = group_units(records)
+            jobs = sort_jobs(collect_jobs(grouped, load_state()), grouped)
+            if not jobs:
+                if since_catalog:
+                    rebuild_catalog()
+                    since_catalog = 0
+                log("没有待重定向的数据单元，60 秒后再检查")
+                time.sleep(60)
+                continue
+            log(f"本轮 {len(jobs)} 条，先做 {jobs[0]['batch']}，{WORKERS} 路并行")
+            for offset in range(0, len(jobs), WORKERS):
+                # Workers from the previous wave have already exited, so this
+                # check sees memory that is actually free.
+                wait_until_host_free()
+                wave = jobs[offset : offset + WORKERS]
+                for job in wave:
+                    log(
+                        f"重定向 {job['batch']} / {job['unit']} -> {job['style']} "
+                        f"来源 {job['source']['name']}"
+                    )
+                # One process per job. It exits when the job finishes, which
+                # returns the solver heap instead of leaving it in a pool worker.
+                with ProcessPoolExecutor(max_workers=len(wave), max_tasks_per_child=1) as pool:
                     results = list(pool.map(_worker, wave))
-                    since_catalog += _record_wave(wave, results)
-                    if since_catalog >= 40:
-                        rebuild_catalog()
-                        since_catalog = 0
-            except KeyboardInterrupt:
-                log("已停止")
-                return
-            except Exception as exc:
-                state = load_state()
-                state.setdefault("failures", {})["loop"] = time.time() + 30 * 60
-                save_state(state)
-                log(f"失败 loop: {exc}\n{traceback.format_exc().splitlines()[-1]}")
-                time.sleep(5)
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+                since_catalog += _record_wave(wave, results)
+                if since_catalog >= 40:
+                    rebuild_catalog()
+                    since_catalog = 0
+        except KeyboardInterrupt:
+            log("已停止")
+            return
+        except Exception as exc:
+            state = load_state()
+            state.setdefault("failures", {})["loop"] = time.time() + 30 * 60
+            save_state(state)
+            log(f"失败 loop: {exc}\n{traceback.format_exc().splitlines()[-1]}")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
