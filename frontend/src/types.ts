@@ -175,6 +175,110 @@ export interface ModelAsset {
   created_at: string;
 }
 
+export type TaxonomyIdMap = Record<string, number | number[]>;
+export type TaxonomyBriefMap = Record<string, TaxonomyTagBrief | TaxonomyTagBrief[]>;
+
+export function tagIdList(value: unknown): number[] {
+  if (value == null || value === "") return [];
+  const raw = Array.isArray(value) ? value : [value];
+  const out: number[] = [];
+  for (const item of raw) {
+    const id = typeof item === "number" ? item : Number(item);
+    if (Number.isInteger(id) && id > 0 && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+type TreeRef<T extends string | number> = { id: T; parent_id: T | null };
+
+/** 已选子节点时，父节点不再单独算作一条。 */
+export function specificSelection<T extends string | number>(
+  ids: readonly T[],
+  nodes: readonly TreeRef<T>[]
+): T[] {
+  if (ids.length <= 1) return [...ids];
+  const chosen = new Set(ids);
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const covered = new Set<T>();
+  for (const id of ids) {
+    let parent = byId.get(id)?.parent_id ?? null;
+    while (parent != null) {
+      if (chosen.has(parent)) covered.add(parent);
+      parent = byId.get(parent)?.parent_id ?? null;
+    }
+  }
+  return ids.filter((id) => !covered.has(id));
+}
+
+/** 父节点被子节点覆盖时不再单独算作一个标签。 */
+export function specificTagIds(ids: number[], nodes: readonly TreeRef<number>[]): number[] {
+  return specificSelection(tagIdList(ids), nodes);
+}
+
+export function childrenByParent<T extends TreeRef<string | number>>(
+  nodes: readonly T[]
+): Map<T["parent_id"], T[]> {
+  const children = new Map<T["parent_id"], T[]>();
+  nodes.forEach((node) => {
+    const list = children.get(node.parent_id) || [];
+    list.push(node);
+    children.set(node.parent_id, list);
+  });
+  return children;
+}
+
+export function selectionCovers<T extends string | number>(
+  id: T,
+  picked: ReadonlySet<T>,
+  children: ReadonlyMap<T | null, readonly { id: T }[]>
+): boolean {
+  if (picked.has(id)) return true;
+  return (children.get(id) || []).some((node) => selectionCovers(node.id, picked, children));
+}
+
+export function selectionAfterCheck<T extends string | number>(
+  id: T,
+  nodes: readonly TreeRef<T>[],
+  picked: readonly T[],
+  parentId?: T | null
+): T[] {
+  const specific = specificSelection(picked, nodes);
+  const selected = new Set(specific);
+  const children = childrenByParent(nodes);
+  const drop = new Set<T>();
+  const walkDown = (nodeId: T) => {
+    drop.add(nodeId);
+    for (const child of children.get(nodeId) || []) walkDown(child.id);
+  };
+  if (selectionCovers(id, selected, children)) {
+    walkDown(id);
+    return specific.filter((item) => !drop.has(item));
+  }
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  let parent = parentId !== undefined ? parentId : (byId.get(id)?.parent_id ?? null);
+  while (parent != null) {
+    drop.add(parent);
+    parent = byId.get(parent)?.parent_id ?? null;
+  }
+  walkDown(id);
+  drop.delete(id);
+  return [...specific.filter((item) => !drop.has(item)), id];
+}
+
+export function tagBriefList(
+  value: TaxonomyTagBrief | TaxonomyTagBrief[] | null | undefined
+): TaxonomyTagBrief[] {
+  if (!value) return [];
+  return Array.isArray(value) ? value.filter((item) => !!item) : [value];
+}
+
+export function sameTagIds(left: number[], right: number[]) {
+  if (left.length !== right.length) return false;
+  const a = [...left].sort((x, y) => x - y);
+  const b = [...right].sort((x, y) => x - y);
+  return a.every((id, index) => id === b[index]);
+}
+
 export interface StorageFile {
   id: string;
   path: string;
@@ -199,8 +303,8 @@ export interface StorageFile {
   joint_count?: number | null;
   sample_rate?: number | null;
   column_count?: number | null;
-  taxonomy_tag_ids?: Record<string, number>;
-  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  taxonomy_tag_ids?: TaxonomyIdMap;
+  taxonomy_tags?: TaxonomyBriefMap;
   annotation?: StorageAnnotation;
 }
 
@@ -290,11 +394,11 @@ export function parseCsvFps(value: unknown): number {
 }
 
 export interface StorageFileDetail extends StorageFile {
-  unit_taxonomy_tag_ids?: Record<string, number>;
-  unit_taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  unit_taxonomy_tag_ids?: TaxonomyIdMap;
+  unit_taxonomy_tags?: TaxonomyBriefMap;
   unit_annotation?: StorageAnnotation;
-  batch_taxonomy_tag_ids?: Record<string, number>;
-  batch_taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  batch_taxonomy_tag_ids?: TaxonomyIdMap;
+  batch_taxonomy_tags?: TaxonomyBriefMap;
   batch_annotation?: StorageAnnotation;
 }
 
@@ -311,8 +415,8 @@ export interface StorageUnit {
   name: string;
   file_count: number;
   files: StorageFile[];
-  taxonomy_tag_ids: Record<string, number>;
-  taxonomy_tags: Record<string, TaxonomyTagBrief>;
+  taxonomy_tag_ids: TaxonomyIdMap;
+  taxonomy_tags: TaxonomyBriefMap;
   annotation: StorageAnnotation;
   meta: Record<string, unknown>;
   uploaders: StorageUploader[];
@@ -331,8 +435,8 @@ export interface StorageBatch {
   created_at?: string;
   uploaded_at?: string;
   modified_at?: string;
-  taxonomy_tag_ids?: Record<string, number>;
-  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  taxonomy_tag_ids?: TaxonomyIdMap;
+  taxonomy_tags?: TaxonomyBriefMap;
   annotation?: StorageAnnotation;
 }
 
@@ -349,8 +453,8 @@ export interface StorageUploadSession {
   channel: string;
   format: string;
   annotation: StorageAnnotation;
-  taxonomy_tag_ids?: Record<string, number>;
-  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  taxonomy_tag_ids?: TaxonomyIdMap;
+  taxonomy_tags?: TaxonomyBriefMap;
   paths: string[];
   unit_names: string[];
   file_count: number;
@@ -448,7 +552,7 @@ export interface Clip {
   atomic_tag?: TaxonomyTagBrief | null;
   intent_tag?: TaxonomyTagBrief | null;
   style_tag?: TaxonomyTagBrief | null;
-  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  taxonomy_tags?: TaxonomyBriefMap;
   category: string;
   subcategory: string;
   summary: string;
@@ -486,7 +590,7 @@ export interface ClipListItem {
   id: number;
   folder_id?: number | null;
   folder_path?: string;
-  taxonomy_tags?: Record<string, TaxonomyTagBrief>;
+  taxonomy_tags?: TaxonomyBriefMap;
   category: string;
   subcategory: string;
   summary: string;
@@ -712,13 +816,14 @@ export const TAXONOMY_SCHEME_LABEL: Record<string, string> = {
 };
 
 export function compactTaxonomyTagIds(
-  ids: Record<string, number | "">
-): Record<string, number> {
-  return Object.fromEntries(
-    Object.entries(ids).filter(
-      (entry): entry is [string, number] => typeof entry[1] === "number"
-    )
-  );
+  ids: Record<string, number | number[] | "">
+): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
+  for (const [key, value] of Object.entries(ids)) {
+    const list = tagIdList(value);
+    if (list.length) out[key] = list;
+  }
+  return out;
 }
 
 export function taxonomySchemeLabel(

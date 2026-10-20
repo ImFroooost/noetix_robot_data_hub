@@ -1,8 +1,10 @@
 """Filesystem-first repository for hub_repo/data, hub_repo/3d_model and index.
 
 The physical files are the source of truth.  ``index/repository.json`` stores
-only metadata (annotations, taxonomy tags and empty batches/instances), while
-``index/catalog.json`` is a rebuildable snapshot of the current filesystem.
+only metadata (annotations, taxonomy tags and empty batches/instances).
+``index/catalog.json`` is a full snapshot rebuilt on demand or once a day when
+the machine is idle.  ``index/catalog_delta.json`` records uploads, deletions
+and renames so browse reads stay current without scanning the whole tree.
 """
 
 from __future__ import annotations
@@ -45,6 +47,8 @@ _INDEX_LOCK = threading.RLock()
 _CATALOG_MAX_AGE_SEC = 10 * 60
 _catalog_raw: dict[str, Any] | None = None
 _catalog_mtime: float | None = None
+_catalog_view: dict[str, Any] | None = None
+_catalog_view_key: tuple[float | None, float | None] | None = None
 _overlay_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
 _rebuild_lock = threading.Lock()
 _rebuild_running = False
@@ -196,6 +200,24 @@ def safe_name(value: str, *, label: str = "名称") -> str:
     return cleaned
 
 
+def preserved_segment(value: str, *, label: str = "名称") -> str:
+    """Keep an uploaded file or folder name unchanged.
+
+    Only reject empty segments and path separators. Spaces, punctuation and
+    the original spelling stay, so the stored tree matches the upload.
+    """
+    text = str(value or "")
+    if (
+        not text
+        or text in {".", ".."}
+        or "\x00" in text
+        or "/" in text
+        or "\\" in text
+    ):
+        raise ValueError(f"{label}无效")
+    return text
+
+
 def safe_relative_path(value: str) -> Path:
     p = Path(value)
     if p.is_absolute() or ".." in p.parts:
@@ -221,17 +243,38 @@ def _invalidate_overlay_cache() -> None:
 
 
 def _invalidate_catalog_cache() -> None:
-    global _catalog_raw, _catalog_mtime
+    global _catalog_raw, _catalog_mtime, _catalog_view, _catalog_view_key
     _catalog_raw = None
     _catalog_mtime = None
+    _catalog_view = None
+    _catalog_view_key = None
     _invalidate_overlay_cache()
 
 
+def _invalidate_catalog_view() -> None:
+    global _catalog_view, _catalog_view_key
+    _catalog_view = None
+    _catalog_view_key = None
+    _invalidate_overlay_cache()
+
+
+_metadata_cache: dict[str, Any] | None = None
+_metadata_mtime: float | None = None
+
+
 def read_metadata() -> dict[str, Any]:
+    global _metadata_cache, _metadata_mtime
     ensure_layout()
+    path = metadata_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
     with _INDEX_LOCK:
+        if _metadata_cache is not None and _metadata_mtime == mtime:
+            return _metadata_cache
         try:
-            data = json.loads(metadata_path().read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = {}
         data.setdefault("version", 1)
@@ -242,6 +285,8 @@ def read_metadata() -> dict[str, Any]:
         data.setdefault("upload_sessions", [])
         data.setdefault("file_media", {})
         data.setdefault("files", {})
+        _metadata_cache = data
+        _metadata_mtime = mtime
         return data
 
 
@@ -251,6 +296,10 @@ def update_metadata(mutator) -> dict[str, Any]:
         mutator(data)
         data["version"] = int(data.get("version") or 1) + 1
         _write_json(metadata_path(), data)
+        global _metadata_cache, _metadata_mtime, _browse_force_sync
+        _metadata_cache = None
+        _metadata_mtime = None
+        _browse_force_sync = True
         _invalidate_overlay_cache()
         return data
 
@@ -336,29 +385,60 @@ def _tag_fields(row: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _as_tag_ids(raw: Any) -> dict[str, int]:
-    out: dict[str, int] = {}
+def tag_id_list(value: Any) -> list[int]:
+    if value in (None, ""):
+        return []
+    items = value if isinstance(value, list) else [value]
+    out: list[int] = []
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("id")
+        if item in (None, ""):
+            continue
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in out:
+            out.append(number)
+    return out
+
+
+def _as_tag_ids(raw: Any) -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {}
     if not isinstance(raw, dict):
         return out
     for scheme, node_id in raw.items():
-        if node_id in (None, ""):
-            continue
-        try:
-            out[str(scheme)] = int(node_id)
-        except (TypeError, ValueError):
-            continue
+        ids = tag_id_list(node_id)
+        if ids:
+            out[str(scheme)] = ids
     return out
+
+
+def apply_tag_updates(current: Any, updates: dict[str, Any]) -> dict[str, list[int]]:
+    merged = _as_tag_ids(current)
+    for scheme, node_ids in updates.items():
+        key = str(scheme)
+        if node_ids is None:
+            merged.pop(key, None)
+            continue
+        ids = tag_id_list(node_ids)
+        if ids:
+            merged[key] = ids
+        else:
+            merged.pop(key, None)
+    return merged
 
 
 def parent_taxonomy_ids(
     batch: str, unit_name: str, metadata: dict[str, Any] | None = None
-) -> tuple[dict[str, int], dict[str, int]]:
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
     """Return (batch_tag_ids, unit_tag_ids), matching clustered unit aliases."""
     data = metadata if metadata is not None else read_metadata()
     batch_tags = _as_tag_ids(
         ((data.get("batches") or {}).get(batch) or {}).get("taxonomy_tag_ids")
     )
-    unit_tags: dict[str, int] = {}
+    unit_tags: dict[str, list[int]] = {}
     prefix = f"{batch}::"
     for key, row in (data.get("units") or {}).items():
         if not str(key).startswith(prefix):
@@ -534,13 +614,9 @@ def _merge_tag_updates(
     meta: dict[str, Any] | None = None,
 ) -> None:
     if taxonomy_tag_ids is not None:
-        current = dict(row.get("taxonomy_tag_ids") or {})
-        for scheme, node_id in taxonomy_tag_ids.items():
-            if node_id is None:
-                current.pop(scheme, None)
-            else:
-                current[scheme] = int(node_id)
-        row["taxonomy_tag_ids"] = current
+        row["taxonomy_tag_ids"] = apply_tag_updates(
+            row.get("taxonomy_tag_ids"), taxonomy_tag_ids
+        )
     if annotation is not None:
         row["annotation"] = {**(row.get("annotation") or {}), **annotation}
     if meta is not None:
@@ -653,43 +729,24 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
     )
 
 
-def _scan_data_live(
-    *, include_empty: bool = False, on_progress: ProgressFn | None = None
+def _assemble_data_index(
+    files: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    *,
+    include_empty: bool,
+    copy: bool = False,
 ) -> dict[str, Any]:
-    """Scan files and group by batch plus filename stem into data units.
-
-    Role suffixes such as ``skeleton``, ``rigid body`` and ``marker`` are
-    stripped, so ``XXXX_skeleton_0`` and ``XXXX_marker003`` share unit ``XXXX``.
-    """
-    base = root()
-    metadata = read_metadata()
-    files: list[dict[str, Any]] = []
-    data_root = base / "data"
-    if on_progress:
-        on_progress("data", 5, "正在枚举数据文件…")
-    seen = 0
-    if data_root.is_dir():
-        for path in sorted(data_root.rglob("*")):
-            if not path.is_file() or path.name.startswith("."):
-                continue
-            seen += 1
-            rec = _parse_data_file(path, base)
-            if rec:
-                rec["uploader"] = (metadata.get("file_uploaders") or {}).get(
-                    rec["path"]
-                )
-                _attach_cached_media(rec, metadata, path)
-                _attach_own_file_tags(rec, metadata)
-                apply_csv_fps(rec)
-                files.append(rec)
-            if on_progress and seen % 40 == 0:
-                on_progress(
-                    "data",
-                    min(55, 8 + seen // 150),
-                    f"正在扫描数据文件（已处理 {seen}）…",
-                )
-    if on_progress:
-        on_progress("data", 58, f"正在整理数据索引（{len(files)} 个文件）…")
+    """Group parsed file rows into the catalog snapshot shape."""
+    if copy:
+        copied: list[dict[str, Any]] = []
+        for rec in files:
+            item = dict(rec)
+            if isinstance(item.get("taxonomy_tag_ids"), dict):
+                item["taxonomy_tag_ids"] = dict(item["taxonomy_tag_ids"])
+            if isinstance(item.get("annotation"), dict):
+                item["annotation"] = dict(item["annotation"])
+            copied.append(item)
+        files = copied
 
     stems_by_batch: dict[str, list[str]] = defaultdict(list)
     for rec in files:
@@ -736,7 +793,7 @@ def _scan_data_live(
                     unit_files,
                     key=lambda f: (
                         f["ontology"],
-                        MODALITIES.index(f["modality"]),
+                        MODALITIES.index(f["modality"]) if f["modality"] in MODALITIES else 0,
                         f["channel"],
                         f["format"],
                     ),
@@ -744,6 +801,7 @@ def _scan_data_live(
                 "taxonomy_tag_ids": meta.get("taxonomy_tag_ids") or {},
                 "annotation": meta.get("annotation") or {},
                 "meta": meta.get("meta") or {},
+                "alias_names": alias_names,
                 "uploaders": list(uploaders.values()),
             }
         )
@@ -802,6 +860,46 @@ def _scan_data_live(
         "units": units,
         "files": files,
     }
+
+
+def _scan_data_live(
+    *, include_empty: bool = False, on_progress: ProgressFn | None = None
+) -> dict[str, Any]:
+    """Scan files and group by batch plus filename stem into data units.
+
+    Role suffixes such as ``skeleton``, ``rigid body`` and ``marker`` are
+    stripped, so ``XXXX_skeleton_0`` and ``XXXX_marker003`` share unit ``XXXX``.
+    """
+    base = root()
+    metadata = read_metadata()
+    files: list[dict[str, Any]] = []
+    data_root = base / "data"
+    if on_progress:
+        on_progress("data", 5, "正在枚举数据文件…")
+    seen = 0
+    if data_root.is_dir():
+        for path in sorted(data_root.rglob("*")):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            seen += 1
+            rec = _parse_data_file(path, base)
+            if rec:
+                rec["uploader"] = (metadata.get("file_uploaders") or {}).get(
+                    rec["path"]
+                )
+                _attach_cached_media(rec, metadata, path)
+                _attach_own_file_tags(rec, metadata)
+                apply_csv_fps(rec)
+                files.append(rec)
+            if on_progress and seen % 40 == 0:
+                on_progress(
+                    "data",
+                    min(55, 8 + seen // 150),
+                    f"正在扫描数据文件（已处理 {seen}）…",
+                )
+    if on_progress:
+        on_progress("data", 58, f"正在整理数据索引（{len(files)} 个文件）…")
+    return _assemble_data_index(files, metadata, include_empty=include_empty)
 
 
 def _scan_models_live(*, on_progress: ProgressFn | None = None) -> dict[str, Any]:
@@ -863,7 +961,246 @@ def _scan_models_live(*, on_progress: ProgressFn | None = None) -> dict[str, Any
     return {"updated_at": _now(), "instances": list(instances.values())}
 
 
-def _read_data_catalog() -> dict[str, Any] | None:
+_DELTA_LIST_KEYS = (
+    "removed_data_paths",
+    "upsert_data_files",
+    "removed_model_paths",
+    "upsert_model_files",
+    "removed_model_instances",
+)
+
+
+def catalog_delta_path(base: Path | None = None) -> Path:
+    return Path(base or root()) / "index" / "catalog_delta.json"
+
+
+def _empty_delta() -> dict[str, Any]:
+    return {key: [] for key in _DELTA_LIST_KEYS}
+
+
+def _delta_mtime() -> float | None:
+    try:
+        return catalog_delta_path().stat().st_mtime
+    except OSError:
+        return None
+
+
+def _read_catalog_delta() -> dict[str, Any]:
+    delta = _empty_delta()
+    try:
+        raw = json.loads(catalog_delta_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return delta
+    if not isinstance(raw, dict):
+        return delta
+    for key in _DELTA_LIST_KEYS:
+        value = raw.get(key)
+        if isinstance(value, list):
+            delta[key] = value
+    return delta
+
+
+def _delta_is_empty(delta: dict[str, Any]) -> bool:
+    return not any(delta.get(key) for key in _DELTA_LIST_KEYS)
+
+
+def _write_catalog_delta_unlocked(delta: dict[str, Any]) -> None:
+    path = catalog_delta_path()
+    if _delta_is_empty(delta):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    payload = {"version": 1, "updated_at": _now(), **{key: delta.get(key) or [] for key in _DELTA_LIST_KEYS}}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def _clear_catalog_delta_unlocked() -> None:
+    try:
+        catalog_delta_path().unlink()
+    except OSError:
+        pass
+
+
+def _merge_catalog_delta(
+    *,
+    removed_data_paths: list[str] | None = None,
+    upsert_data_files: list[dict[str, Any]] | None = None,
+    removed_model_paths: list[str] | None = None,
+    upsert_model_files: list[dict[str, Any]] | None = None,
+    removed_model_instances: list[str] | None = None,
+) -> None:
+    """Persist an incremental index change without rewriting catalog.json."""
+    global _browse_force_sync
+    with _INDEX_LOCK:
+        delta = _read_catalog_delta()
+        removed_data = {str(path) for path in delta["removed_data_paths"] if path}
+        upsert_data = {
+            str(item["path"]): item
+            for item in delta["upsert_data_files"]
+            if isinstance(item, dict) and item.get("path")
+        }
+        removed_models = {str(path) for path in delta["removed_model_paths"] if path}
+        upsert_models = {
+            str(item["path"]): item
+            for item in delta["upsert_model_files"]
+            if isinstance(item, dict) and item.get("path")
+        }
+        removed_instances = {str(key) for key in delta["removed_model_instances"] if key}
+
+        for path in removed_data_paths or []:
+            removed_data.add(str(path))
+            upsert_data.pop(str(path), None)
+        for rec in upsert_data_files or []:
+            path = str(rec.get("path") or "")
+            if not path:
+                continue
+            upsert_data[path] = rec
+            removed_data.discard(path)
+        for path in removed_model_paths or []:
+            removed_models.add(str(path))
+            upsert_models.pop(str(path), None)
+        fresh_removed_instances = {str(key) for key in (removed_model_instances or []) if key}
+        for key in fresh_removed_instances:
+            removed_instances.add(key)
+            upsert_models = {
+                path: rec
+                for path, rec in upsert_models.items()
+                if f"{rec.get('ontology')}::{rec.get('instance')}" != key
+            }
+        for rec in upsert_model_files or []:
+            path = str(rec.get("path") or "")
+            if not path:
+                continue
+            upsert_models[path] = rec
+            removed_models.discard(path)
+            key = f"{rec.get('ontology')}::{rec.get('instance')}"
+            if key not in fresh_removed_instances:
+                removed_instances.discard(key)
+        _write_catalog_delta_unlocked(
+            {
+                "removed_data_paths": sorted(removed_data),
+                "upsert_data_files": list(upsert_data.values()),
+                "removed_model_paths": sorted(removed_models),
+                "upsert_model_files": list(upsert_models.values()),
+                "removed_model_instances": sorted(removed_instances),
+            }
+        )
+        _invalidate_catalog_view()
+        _browse_force_sync = True
+
+
+def _apply_model_delta(models: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
+    removed_instances = {str(key) for key in delta.get("removed_model_instances") or [] if key}
+    removed_paths = {str(path) for path in delta.get("removed_model_paths") or [] if path}
+    upserts = [
+        item
+        for item in (delta.get("upsert_model_files") or [])
+        if isinstance(item, dict) and item.get("path")
+    ]
+    upsert_paths = {str(item["path"]) for item in upserts}
+    by_key: dict[str, dict[str, Any]] = {}
+    instances: list[dict[str, Any]] = []
+    for source in models.get("instances") or []:
+        key = str(source.get("key") or "")
+        if key in removed_instances:
+            continue
+        files = [
+            dict(item)
+            for item in (source.get("files") or [])
+            if str(item.get("path") or "") not in removed_paths
+            and str(item.get("path") or "") not in upsert_paths
+        ]
+        if not files:
+            continue
+        kinds: list[str] = []
+        for item in files:
+            kind = str(item.get("kind") or "")
+            if kind and kind not in kinds:
+                kinds.append(kind)
+        row = dict(source)
+        row["files"] = files
+        row["kinds"] = kinds
+        instances.append(row)
+        by_key[key] = row
+    for rec in upserts:
+        key = f"{rec.get('ontology')}::{rec.get('instance')}"
+        row = by_key.get(key)
+        if row is None:
+            row = {
+                "key": key,
+                "ontology": rec.get("ontology"),
+                "name": rec.get("instance"),
+                "kinds": [],
+                "files": [],
+                "meta": {},
+            }
+            by_key[key] = row
+            instances.append(row)
+        row["files"].append(
+            {
+                "id": rec.get("id"),
+                "path": rec.get("path"),
+                "name": rec.get("name"),
+                "kind": rec.get("kind"),
+                "relative_path": rec.get("relative_path"),
+                "size": rec.get("size"),
+            }
+        )
+        kind = str(rec.get("kind") or "")
+        if kind and kind not in row["kinds"]:
+            row["kinds"].append(kind)
+    for row in instances:
+        row["files"].sort(
+            key=lambda item: (str(item.get("kind") or ""), str(item.get("relative_path") or ""))
+        )
+    return {
+        "updated_at": models.get("updated_at") or _now(),
+        "instances": [row for row in instances if row.get("files")],
+    }
+
+
+def _materialize_catalog(base: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
+    data = base.get("data") or {}
+    removed = {str(path) for path in delta.get("removed_data_paths") or [] if path}
+    upserts = {
+        str(item["path"]): item
+        for item in (delta.get("upsert_data_files") or [])
+        if isinstance(item, dict) and item.get("path")
+    }
+    files = [
+        rec
+        for rec in (data.get("files") or [])
+        if str(rec.get("path") or "") not in removed and str(rec.get("path") or "") not in upserts
+    ]
+    files.extend(upserts.values())
+    assembled = _assemble_data_index(
+        files,
+        read_metadata(),
+        include_empty=True,
+        copy=True,
+    )
+    models = base.get("models") if isinstance(base.get("models"), dict) else {"instances": []}
+    if any(
+        delta.get(key)
+        for key in ("removed_model_paths", "upsert_model_files", "removed_model_instances")
+    ):
+        models = _apply_model_delta(models, delta)
+    return {
+        "version": base.get("version") or 2,
+        "updated_at": base.get("updated_at"),
+        "data": assembled,
+        "models": models,
+    }
+
+
+def _read_base_catalog() -> dict[str, Any] | None:
     global _catalog_raw, _catalog_mtime
     path = catalog_path()
     if not path.is_file():
@@ -882,7 +1219,192 @@ def _read_data_catalog() -> dict[str, Any] | None:
         return None
     _catalog_raw = raw
     _catalog_mtime = mtime
+    _invalidate_catalog_view()
     return raw
+
+
+def _read_data_catalog() -> dict[str, Any] | None:
+    global _catalog_view, _catalog_view_key
+    base = _read_base_catalog()
+    if base is None:
+        return None
+    key = (_catalog_mtime, _delta_mtime())
+    if _catalog_view is not None and _catalog_view_key == key:
+        return _catalog_view
+    delta = _read_catalog_delta()
+    if _delta_is_empty(delta):
+        _catalog_view = base
+        _catalog_view_key = key
+        return base
+    view = _materialize_catalog(base, delta)
+    _catalog_view = view
+    _catalog_view_key = key
+    return view
+
+
+def _iter_indexed_data_files() -> list[dict[str, Any]]:
+    base = _read_base_catalog()
+    files = list(((base or {}).get("data") or {}).get("files") or [])
+    delta = _read_catalog_delta()
+    if _delta_is_empty(delta):
+        return files
+    removed = {str(path) for path in delta.get("removed_data_paths") or [] if path}
+    upserts = {
+        str(item["path"]): item
+        for item in delta.get("upsert_data_files") or []
+        if isinstance(item, dict) and item.get("path")
+    }
+    kept = [
+        rec
+        for rec in files
+        if str(rec.get("path") or "") not in removed and str(rec.get("path") or "") not in upserts
+    ]
+    kept.extend(upserts.values())
+    return kept
+
+
+def _metadata_keys_for_unit(batch: str, name: str) -> list[str]:
+    prefix = f"{batch}::"
+    found: list[str] = []
+    for key in read_metadata().get("units") or {}:
+        text = str(key)
+        if "::" not in text or not text.startswith(prefix):
+            continue
+        alias = text.split("::", 1)[1]
+        if alias == name or stems_same_unit(alias, name):
+            found.append(text)
+    return found
+
+
+def _unit_keys_emptied_by(paths: list[str]) -> list[str]:
+    removing = {
+        str(path)
+        for path in paths
+        if path and not str(path).startswith("3d_model/")
+    }
+    if not removing:
+        return []
+    grouped: dict[str, int] = defaultdict(int)
+    touched: set[str] = set()
+    for rec in _iter_indexed_data_files():
+        path = str(rec.get("path") or "")
+        batch = str(rec.get("batch") or "")
+        name = str(rec.get("unit_name") or "")
+        if not batch or not name:
+            continue
+        key = unit_key(batch, name)
+        if path in removing:
+            touched.add(key)
+            continue
+        grouped[key] += 1
+    doomed: list[str] = []
+    for key in touched:
+        if grouped.get(key, 0):
+            continue
+        batch, name = key.split("::", 1)
+        doomed.extend(_metadata_keys_for_unit(batch, name))
+    return list(dict.fromkeys(doomed))
+
+
+def _index_one_data_file(path: Path, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    rec = _parse_data_file(path, root())
+    if not rec:
+        return None
+    rec["uploader"] = (metadata.get("file_uploaders") or {}).get(rec["path"])
+    _attach_cached_media(rec, metadata, path)
+    _attach_own_file_tags(rec, metadata)
+    return apply_csv_fps(rec)
+
+
+def _model_file_record(path: Path) -> dict[str, Any] | None:
+    base = root()
+    try:
+        parts = path.relative_to(base / "3d_model").parts
+    except ValueError:
+        return None
+    if len(parts) < 4:
+        return None
+    ontology, kind, instance = parts[0], parts[1], parts[2]
+    instance_dir = base / "3d_model" / ontology / kind / instance
+    rel = path.relative_to(base).as_posix()
+    return {
+        "id": _file_id(rel),
+        "path": rel,
+        "name": path.name,
+        "kind": kind,
+        "relative_path": path.relative_to(instance_dir).as_posix(),
+        "size": path.stat().st_size,
+        "ontology": ontology,
+        "instance": instance,
+    }
+
+
+def refresh_catalog_paths(paths: list[str]) -> None:
+    """Index only the given paths. Missing files are removed from the catalog."""
+    metadata = read_metadata()
+    data_removed: list[str] = []
+    data_upsert: list[dict[str, Any]] = []
+    model_removed: list[str] = []
+    model_upsert: list[dict[str, Any]] = []
+    for raw in paths:
+        rel = str(raw or "").strip().lstrip("/")
+        if not rel:
+            continue
+        try:
+            path = resolve_repo_file(rel)
+        except ValueError:
+            continue
+        if rel.startswith("3d_model/"):
+            if path.is_file():
+                rec = _model_file_record(path)
+                if rec:
+                    model_upsert.append(rec)
+                else:
+                    model_removed.append(rel)
+            else:
+                model_removed.append(rel)
+            continue
+        if path.is_file():
+            rec = _index_one_data_file(path, metadata)
+            if rec:
+                data_upsert.append(rec)
+            else:
+                data_removed.append(rel)
+        else:
+            data_removed.append(rel)
+    if not any((data_removed, data_upsert, model_removed, model_upsert)):
+        return
+    _merge_catalog_delta(
+        removed_data_paths=data_removed,
+        upsert_data_files=data_upsert,
+        removed_model_paths=model_removed,
+        upsert_model_files=model_upsert,
+    )
+
+
+def reindex_model_instance(ontology: str, name: str) -> None:
+    """Replace one model instance in the index from its current files."""
+    base = root() / "3d_model" / ontology
+    upserts: list[dict[str, Any]] = []
+    if base.is_dir():
+        for kind_dir in sorted(path for path in base.iterdir() if path.is_dir()):
+            instance_dir = kind_dir / name
+            if not instance_dir.is_dir():
+                continue
+            for file_path in sorted(instance_dir.rglob("*")):
+                if not file_path.is_file() or file_path.name.startswith("."):
+                    continue
+                rec = _model_file_record(file_path)
+                if rec:
+                    upserts.append(rec)
+    _merge_catalog_delta(
+        removed_model_instances=[f"{ontology}::{name}"],
+        upsert_model_files=upserts,
+    )
+
+
+def catalog_full_rebuild_age_sec() -> float | None:
+    return _catalog_age_sec()
 
 
 def _catalog_age_sec() -> float | None:
@@ -1086,24 +1608,73 @@ def _overlay_metadata(
     }
 
 
-def load_data_index(*, include_empty: bool = False) -> dict[str, Any]:
+_browse_ready: dict[bool, dict[str, Any]] = {}
+_browse_key: dict[bool, tuple[float | None, ...]] = {}
+_browse_refreshing: set[bool] = set()
+_browse_refresh_lock = threading.Lock()
+# Set when this process writes metadata. Retarget updates on the host must not
+# force the next page open to re-read the whole index.
+_browse_force_sync = False
+
+
+def _index_stamp() -> tuple[float | None, ...]:
+    def mtime(path: Path) -> float | None:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return None
+
+    return mtime(catalog_path()), mtime(metadata_path()), mtime(catalog_delta_path())
+
+
+def _build_data_index(*, include_empty: bool) -> dict[str, Any]:
     catalog = _read_data_catalog()
     metadata = read_metadata()
     if catalog is None:
-        snapshot = rebuild_catalog()
-        catalog = snapshot
-    cache_key = (
-        _catalog_mtime,
-        metadata.get("version"),
-        include_empty,
-    )
-    cached = _overlay_cache.get(cache_key)
-    if cached is not None:
-        schedule_catalog_rebuild()
-        return cached
-    data = _overlay_metadata(catalog["data"], metadata, include_empty=include_empty)
-    _overlay_cache[cache_key] = data
-    schedule_catalog_rebuild()
+        catalog = rebuild_catalog()
+        metadata = read_metadata()
+    return _overlay_metadata(catalog["data"], metadata, include_empty=include_empty)
+
+
+def _refresh_data_index(include_empty: bool, stamp: tuple[float | None, ...]) -> None:
+    try:
+        data = _build_data_index(include_empty=include_empty)
+    except Exception:
+        return
+    finally:
+        with _browse_refresh_lock:
+            _browse_refreshing.discard(include_empty)
+    _browse_ready[include_empty] = data
+    _browse_key[include_empty] = stamp
+
+
+def load_data_index(*, include_empty: bool = False) -> dict[str, Any]:
+    """Serve the browse snapshot already in memory.
+
+    The on-disk index is large and changes less often than the page is opened.
+    A newer index is swapped in on a background thread; the page does not wait
+    to re-read it. A write made by this process refreshes before the next read,
+    so a tag just saved is visible.
+    """
+    global _browse_force_sync
+    stamp = _index_stamp()
+    ready = _browse_ready.get(include_empty)
+    if ready is not None and not _browse_force_sync:
+        if _browse_key.get(include_empty) != stamp:
+            with _browse_refresh_lock:
+                if include_empty not in _browse_refreshing:
+                    _browse_refreshing.add(include_empty)
+                    threading.Thread(
+                        target=_refresh_data_index,
+                        args=(include_empty, stamp),
+                        name="browse-index-refresh",
+                        daemon=True,
+                    ).start()
+        return ready
+    data = _build_data_index(include_empty=include_empty)
+    _browse_ready[include_empty] = data
+    _browse_key[include_empty] = _index_stamp()
+    _browse_force_sync = False
     return data
 
 
@@ -1121,7 +1692,6 @@ def scan_models(*, live: bool = False) -> dict[str, Any]:
         catalog = _read_data_catalog()
         models = (catalog or {}).get("models")
         if isinstance(models, dict) and models.get("instances") is not None:
-            schedule_catalog_rebuild()
             return models
     return _scan_models_live()
 
@@ -1209,6 +1779,7 @@ def rebuild_catalog() -> dict[str, Any]:
         )
 
     report("data", 4, "正在扫描数据文件…")
+    delta_stamp = _delta_mtime()
     try:
         data = _scan_data_live(include_empty=True, on_progress=report)
         report("metadata", 56, "正在同步机器人款式标签…")
@@ -1227,6 +1798,8 @@ def rebuild_catalog() -> dict[str, Any]:
         }
         with _INDEX_LOCK:
             _write_json(catalog_path(), snapshot, compact=True)
+            if _delta_mtime() == delta_stamp:
+                _clear_catalog_delta_unlocked()
             _invalidate_catalog_cache()
         stats = {
             "file_count": len(data.get("files") or []),
@@ -1282,6 +1855,46 @@ def _batch_unit_names(
     return list(names)
 
 
+def materialize_batch_tags_onto_units() -> int:
+    """Give each unit its own copy of batch tags it does not already store.
+
+    Batch tags stay as the template used to fill new units. They are not a
+    live fallback when a unit is opened.
+    """
+    snapshot = scan_data(include_empty=True)
+    pending: list[tuple[str, str, dict[str, list[int]]]] = []
+    for batch in snapshot.get("batches") or []:
+        batch_tags = _as_tag_ids(batch.get("taxonomy_tag_ids"))
+        if not batch_tags:
+            continue
+        batch_name = str(batch.get("name") or "")
+        for unit in batch.get("units") or []:
+            own = _as_tag_ids(unit.get("taxonomy_tag_ids"))
+            missing = {
+                scheme: ids for scheme, ids in batch_tags.items() if scheme not in own
+            }
+            unit_name = str(unit.get("name") or "")
+            if batch_name and unit_name and missing:
+                pending.append((batch_name, unit_name, missing))
+    if not pending:
+        return 0
+
+    def mutate(data):
+        units = data.setdefault("units", {})
+        for batch_name, unit_name, missing in pending:
+            row = units.setdefault(unit_key(batch_name, unit_name), {})
+            _ensure_created_at(row)
+            current = _as_tag_ids(row.get("taxonomy_tag_ids"))
+            for scheme, ids in missing.items():
+                if scheme not in current:
+                    current[scheme] = list(ids)
+            row["taxonomy_tag_ids"] = current
+            row["updated_at"] = _now()
+
+    update_metadata(mutate)
+    return len(pending)
+
+
 def apply_batch_taxonomy_to_new_units(batch: str, unit_names: list[str]) -> None:
     """Copy batch taxonomy onto units that do not yet have those schemes."""
     batch = safe_name(batch, label="数据批次名")
@@ -1300,12 +1913,12 @@ def apply_batch_taxonomy_to_new_units(batch: str, unit_names: list[str]) -> None
         for unit_name in names:
             row = units.setdefault(unit_key(batch, unit_name), {})
             _ensure_created_at(row)
-            current = dict(row.get("taxonomy_tag_ids") or {})
+            current = _as_tag_ids(row.get("taxonomy_tag_ids"))
             changed = False
-            for scheme, node_id in batch_tags.items():
+            for scheme, node_id in _as_tag_ids(batch_tags).items():
                 if scheme in current:
                     continue
-                current[scheme] = int(node_id)
+                current[scheme] = node_id
                 changed = True
             if changed:
                 row["taxonomy_tag_ids"] = current
@@ -1537,7 +2150,7 @@ def data_destination(
         raise ValueError("fpv_video 须选择 rgb 或 depth")
     fmt = safe_name(fmt.lower().lstrip("."), label="格式")
     batch = safe_name(batch, label="数据批次名")
-    filename = safe_name(Path(filename).name, label="文件名")
+    filename = preserved_segment(Path(filename).name, label="文件名")
     parts = [root(), "data", ontology]
     if ontology == "robot" and robot_style:
         parts.append(safe_name(robot_style, label="机器人款式"))
@@ -1548,8 +2161,9 @@ def data_destination(
     parts.append(batch)
     if sub_path:
         for seg in sub_path.replace("\\", "/").split("/"):
-            if seg:
-                parts.append(safe_name(seg, label="子目录"))
+            if not seg or seg == ".":
+                continue
+            parts.append(preserved_segment(seg, label="子目录"))
     parts.append(filename)
     return Path(*parts)
 
@@ -1620,11 +2234,7 @@ def record_upload_session(
         "channel": channel,
         "format": fmt,
         "annotation": dict(annotation or {}),
-        "taxonomy_tag_ids": {
-            key: int(value)
-            for key, value in (taxonomy_tag_ids or {}).items()
-            if value not in (None, "")
-        },
+        "taxonomy_tag_ids": _as_tag_ids(taxonomy_tag_ids),
         "paths": [str(path) for path in paths if path],
         "unit_names": [name for name in (unit_names or []) if name],
         "uploaded": uploaded or len(paths),
@@ -1741,13 +2351,9 @@ def update_upload_session(
             row["annotation"] = current
             row["updated_at"] = _now()
         if taxonomy_tag_ids is not None:
-            current_tags = dict(row.get("taxonomy_tag_ids") or {})
-            for scheme, node_id in taxonomy_tag_ids.items():
-                if node_id is None:
-                    current_tags.pop(scheme, None)
-                else:
-                    current_tags[scheme] = int(node_id)
-            row["taxonomy_tag_ids"] = current_tags
+            row["taxonomy_tag_ids"] = apply_tag_updates(
+                row.get("taxonomy_tag_ids"), taxonomy_tag_ids
+            )
             row["updated_at"] = _now()
 
     update_metadata(mutate)
@@ -1795,6 +2401,7 @@ def delete_upload_session_files(
     ]
     if not targets:
         raise FileNotFoundError(session_id)
+    doomed_units = _unit_keys_emptied_by(targets)
     removed: list[str] = []
     for rel_path in targets:
         try:
@@ -1818,10 +2425,29 @@ def delete_upload_session_files(
             next_rows.append(row)
         data["upload_sessions"] = next_rows
         _drop_path_keys(data, removed)
+        units = data.setdefault("units", {})
+        for key in doomed_units:
+            units.pop(key, None)
 
     update_metadata(mutate)
-    rebuild_catalog()
+    refresh_catalog_paths(removed)
     return {"ok": True, "removed": removed, "session_id": session_id}
+
+
+def rename_user_snapshots(user_id: int, username: str) -> None:
+    """Keep browse and upload history labels on the account's current name."""
+    target = int(user_id)
+    name = str(username)
+
+    def mutate(data):
+        for row in (data.get("file_uploaders") or {}).values():
+            if isinstance(row, dict) and int(row.get("id") or 0) == target:
+                row["username"] = name
+        for row in data.get("upload_sessions") or []:
+            if isinstance(row, dict) and int(row.get("user_id") or 0) == target:
+                row["username"] = name
+
+    update_metadata(mutate)
 
 
 def set_file_uploaders(
@@ -1860,14 +2486,22 @@ def save_data_file(
     update_index: bool = True,
     robot_style: str = "",
     sub_path: str = "",
+    preserve_tree: bool = False,
 ) -> dict[str, Any]:
-    unit_name = safe_name(normalize_unit_stem(unit_name) or unit_name, label="数据单元名")
-    suffix = Path(original_name).suffix or f".{fmt.lstrip('.')}"
-    original_stem = Path(original_name).stem
-    if original_stem and (normalize_unit_stem(original_stem) or original_stem) == unit_name:
-        filename = f"{safe_name(original_stem, label='文件名')}{suffix}"
+    if preserve_tree:
+        # Folder and zip uploads keep every directory and the original filename.
+        filename = Path(original_name).name
+        if not filename:
+            suffix = f".{fmt.lstrip('.')}" if fmt else ""
+            filename = f"{unit_name}{suffix}"
     else:
-        filename = f"{unit_name}{suffix}"
+        unit_name = safe_name(normalize_unit_stem(unit_name) or unit_name, label="数据单元名")
+        suffix = Path(original_name).suffix or f".{fmt.lstrip('.')}"
+        original_stem = Path(original_name).stem
+        if original_stem and (normalize_unit_stem(original_stem) or original_stem) == unit_name:
+            filename = f"{safe_name(original_stem, label='文件名')}{suffix}"
+        else:
+            filename = f"{unit_name}{suffix}"
     dest = data_destination(
         ontology=ontology,
         modality=modality,
@@ -1886,7 +2520,7 @@ def save_data_file(
     if update_index:
         create_batch(batch)
         apply_batch_taxonomy_to_new_units(batch, [unit_name])
-        rebuild_catalog()
+        refresh_catalog_paths([dest.relative_to(root()).as_posix()])
     parsed = _parse_data_file(dest, root())
     assert parsed is not None
     return parsed
@@ -1904,15 +2538,20 @@ def delete_repo_file(rel_path: str, *, update_index: bool = True) -> None:
     path = resolve_repo_file(rel_path)
     if not path.is_file():
         raise FileNotFoundError(rel_path)
+    doomed = _unit_keys_emptied_by([rel_path]) if update_index else []
     path.unlink()
 
     def mutate(data):
         _drop_path_keys(data, [rel_path])
+        if doomed:
+            units = data.setdefault("units", {})
+            for key in doomed:
+                units.pop(key, None)
 
     update_metadata(mutate)
     _cleanup_empty_parents(path.parent)
     if update_index:
-        rebuild_catalog()
+        refresh_catalog_paths([rel_path])
 
 
 def _drop_path_keys(data: dict[str, Any], paths: list[str]) -> None:
@@ -1987,7 +2626,10 @@ def rename_batch(old_name: str, new_name: str) -> dict[str, Any]:
     snapshot, batch = _require_batch(old_name)
     if old_name == new_name:
         return batch
-    if any(item["name"] == new_name for item in snapshot["batches"]):
+    target = next((item for item in snapshot["batches"] if item["name"] == new_name), None)
+    if target is not None and (
+        int(target.get("file_count") or 0) > 0 or int(target.get("unit_count") or 0) > 0
+    ):
         raise ValueError(f"批次名已存在：{new_name}")
     mapping = {
         rec["path"]: resolve_repo_file(rec["path"]).parent.with_name(new_name)
@@ -1999,7 +2641,15 @@ def rename_batch(old_name: str, new_name: str) -> dict[str, Any]:
 
     def mutate(data):
         batches = data.setdefault("batches", {})
-        row = batches.pop(old_name, {"created_at": _now()})
+        row = dict(batches.pop(old_name, {"created_at": _now()}))
+        placeholder = batches.pop(new_name, None)
+        if isinstance(placeholder, dict):
+            if not (row.get("taxonomy_tag_ids") or {}) and placeholder.get("taxonomy_tag_ids"):
+                row["taxonomy_tag_ids"] = placeholder["taxonomy_tag_ids"]
+            if not (row.get("annotation") or {}) and placeholder.get("annotation"):
+                row["annotation"] = placeholder["annotation"]
+            if not row.get("created_at"):
+                row["created_at"] = placeholder.get("created_at") or _now()
         batches[new_name] = row
         units = data.setdefault("units", {})
         for key in list(units):
@@ -2008,7 +2658,7 @@ def rename_batch(old_name: str, new_name: str) -> dict[str, Any]:
         _remap_path_keys(data, moved)
 
     update_metadata(mutate)
-    rebuild_catalog()
+    refresh_catalog_paths([*moved.keys(), *moved.values()])
     snapshot, renamed = _require_batch(new_name)
     return renamed
 
@@ -2040,7 +2690,7 @@ def rename_unit(batch: str, old_name: str, new_name: str) -> dict[str, Any]:
         _remap_path_keys(data, moved)
 
     update_metadata(mutate)
-    rebuild_catalog()
+    refresh_catalog_paths([*moved.keys(), *moved.values()])
     _, renamed = _require_unit_row(batch, new_name)
     return renamed
 
@@ -2094,7 +2744,7 @@ def rename_file(rel_path: str, new_name: str) -> dict[str, Any]:
             units[new_key] = dict(units[old_key])
 
     update_metadata(mutate)
-    rebuild_catalog()
+    refresh_catalog_paths([*moved.keys(), *moved.values()])
     updated = inspect_data_file(new_rel)
     if updated is None:
         raise FileNotFoundError(new_rel)
@@ -2131,13 +2781,14 @@ def delete_batches(names: list[str]) -> list[str]:
 
     if removed:
         update_metadata(mutate)
-        rebuild_catalog()
+        refresh_catalog_paths(deleted_paths)
     return removed
 
 
 def delete_units(items: list[tuple[str, str]]) -> list[str]:
     removed: list[str] = []
     deleted_paths: list[str] = []
+    meta_keys: list[str] = []
     for raw_batch, raw_name in items:
         batch = safe_name(raw_batch, label="数据批次名")
         name = safe_name(raw_name, label="数据单元名")
@@ -2152,20 +2803,24 @@ def delete_units(items: list[tuple[str, str]]) -> list[str]:
                 _cleanup_empty_parents(path.parent)
             deleted_paths.append(rec["path"])
         removed.append(unit_key(batch, unit["name"]))
+        meta_keys.extend(_metadata_keys_for_unit(batch, unit["name"]))
 
     def mutate(data):
         units = data.setdefault("units", {})
-        for key in removed:
+        for key in [*removed, *meta_keys]:
             units.pop(key, None)
         _drop_path_keys(data, deleted_paths)
 
     if removed:
         update_metadata(mutate)
-        rebuild_catalog()
+        refresh_catalog_paths(deleted_paths)
     return removed
 
 
 def _file_robot_style(record: dict[str, Any], unit: dict[str, Any] | None = None) -> str:
+    path_style = str(record.get("robot_style") or "").strip()
+    if path_style:
+        return path_style
     own = str(((record.get("annotation") or {}).get("robot_style") or "")).strip()
     if own:
         return own
@@ -2183,9 +2838,9 @@ def collect_archive_entries(
     accept: Any | None = None,
 ) -> list[tuple[Path, str]]:
     snapshot = scan_data(include_empty=True)
-    wanted_batches = {safe_name(name, label="数据批次名") for name in batches or []}
+    wanted_batches = {preserved_segment(name, label="数据批次名") for name in batches or []}
     wanted_units = {
-        unit_key(safe_name(batch, label="数据批次名"), safe_name(name, label="数据单元名"))
+        unit_key(preserved_segment(batch, label="数据批次名"), preserved_segment(name, label="数据单元名"))
         for batch, name in units or []
     }
     wanted_any: set[tuple[str, str]] = set()
@@ -2347,7 +3002,7 @@ def delete_model_instance(ontology: str, name: str) -> None:
         data["models"].pop(f"{ontology}::{name}", None)
 
     update_metadata(mutate)
-    rebuild_catalog()
+    reindex_model_instance(ontology, name)
 
 
 def save_model_upload(
@@ -2379,7 +3034,7 @@ def save_model_upload(
                 shutil.rmtree(destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(source_dir, destination)
-        rebuild_catalog()
+        reindex_model_instance(ontology, instance)
         return {
             "ontology": ontology,
             "instance": instance,
@@ -2393,7 +3048,7 @@ def save_model_upload(
         raise ValueError(f"模型文件已存在：{dest.name}")
     with dest.open("wb") as out:
         shutil.copyfileobj(source, out)
-    rebuild_catalog()
+    refresh_catalog_paths([dest.relative_to(root()).as_posix()])
     return {
         "ontology": ontology,
         "instance": instance,

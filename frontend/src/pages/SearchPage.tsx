@@ -17,6 +17,8 @@ import {
   ONTOLOGY_LABEL,
   QUALITY_LABEL,
   STAGE_LABEL,
+  specificTagIds,
+  tagBriefList,
   taxonomySchemeLabel,
 } from "../types";
 
@@ -494,15 +496,24 @@ export function SearchPage() {
                         {item.has_video ? " · 视频" : ""}
                       </div>
                       <div className="browse-result-tags">
-                        {Object.values(item.taxonomy_tags || {}).map((t) => (
-                          <span
-                            key={`${t.scheme}-${t.id}`}
-                            className="tag-chip"
-                            title={`${taxonomySchemeLabel(t.scheme, schemes)}: ${tagLabel(t)}`}
-                          >
-                            {taxonomySchemeLabel(t.scheme, schemes)}:{tagLabel(t)}
-                          </span>
-                        ))}
+                        {Object.entries(item.taxonomy_tags || {}).flatMap(([scheme, value]) => {
+                          const briefs = tagBriefList(value);
+                          const keep = new Set(
+                            specificTagIds(
+                              briefs.map((tag) => tag.id),
+                              taxNodes.filter((node) => node.scheme === scheme)
+                            )
+                          );
+                          return briefs.filter((tag) => keep.has(tag.id)).map((t) => (
+                            <span
+                              key={`${t.scheme}-${t.id}`}
+                              className="tag-chip"
+                              title={`${taxonomySchemeLabel(t.scheme, schemes)}: ${tagLabel(t)}`}
+                            >
+                              {taxonomySchemeLabel(t.scheme, schemes)}:{tagLabel(t)}
+                            </span>
+                          ));
+                        })}
                       </div>
                     </div>
                   </div>

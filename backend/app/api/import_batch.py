@@ -208,10 +208,12 @@ async def import_human_zip(
         tax_raw = json.loads(taxonomy_tag_ids or "{}")
         if not isinstance(tax_raw, dict):
             raise ValueError("taxonomy_tag_ids 须为 JSON 对象")
-        tax_ids: dict[str, int | None] = {}
+        tax_ids: dict[str, int | list[int] | None] = {}
         for k, v in tax_raw.items():
-            if v is None or v == "":
+            if v is None or v == "" or v == []:
                 tax_ids[str(k)] = None
+            elif isinstance(v, list):
+                tax_ids[str(k)] = [int(item) for item in v if item not in (None, "")]
             else:
                 tax_ids[str(k)] = int(v)
     except Exception as e:

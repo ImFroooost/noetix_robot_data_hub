@@ -2,6 +2,7 @@ import { Navigate, Route, Routes, useSearchParams } from "react-router-dom";
 import { useAuth } from "./auth";
 import { Layout } from "./components/Layout";
 import { LoginPage } from "./pages/LoginPage";
+import { RetargetManagePage } from "./pages/RetargetManagePage";
 import { TaxonomyManagePage } from "./pages/TaxonomyManagePage";
 import { UsersPage } from "./pages/UsersPage";
 import { RepositoryModelsPage } from "./pages/RepositoryModelsPage";
@@ -37,6 +38,7 @@ export default function App() {
       >
         <Route index element={<StorageRoute />} />
         <Route path="taxonomies" element={<TaxonomyManagePage />} />
+        <Route path="retarget" element={<RetargetManagePage />} />
         <Route path="robots" element={<RepositoryModelsPage />} />
         <Route path="users" element={<UsersPage />} />
       </Route>

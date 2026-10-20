@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, downloadAuth, getToken } from "../api";
 import { MotionViewer } from "./MotionViewer";
-import { TaxonomySelect } from "./TaxonomyTree";
+import { TaxonomyTagPicker } from "./TaxonomyTagPicker";
 import { VersionPreviewWorkspace } from "./VersionPreviewWorkspace";
 import type {
   Clip,
@@ -22,6 +22,9 @@ import {
   isPlayableHumanFormat,
   isPlayableRobotFormat,
   processStatusLabel,
+  sameTagIds,
+  specificTagIds,
+  tagBriefList,
   taxonomySchemeLabel,
   type ReviewValue,
   type VideoKind,
@@ -573,6 +576,12 @@ export function ClipBrowsePanel({
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [clipTagOverrides, setClipTagOverrides] = useState<{
+    clipId: number;
+    ids: Record<string, number[]>;
+  }>({ clipId: 0, ids: {} });
+  const clipTagGen = useRef<Record<string, number>>({});
+  const clipTagQueue = useRef(Promise.resolve());
   const [localSchemes, setLocalSchemes] = useState<TaxonomySchemeDef[]>(schemes);
   const [localTax, setLocalTax] = useState<TaxonomyNode[]>(taxNodes);
 
@@ -775,46 +784,80 @@ export function ClipBrowsePanel({
       <div className="card stack">
         <h3 style={{ margin: 0 }}>分类标签</h3>
         {localSchemes.length === 0 && <div className="muted">暂无分类标准</div>}
-        {localSchemes.map((sch) => {
-          const cur = clip.taxonomy_tags?.[sch.key];
-          const canEdit = clip.can_annotate || clip.can_edit;
-          return (
-            <label key={sch.key}>
-              {taxonomySchemeLabel(sch.key, localSchemes)}
-              {canEdit ? (
-                <TaxonomySelect
-                  scheme={sch.key}
-                  nodes={localTax.filter((n) => n.scheme === sch.key)}
-                  value={cur?.id ?? ""}
-                  onChange={async (id) => {
-                    try {
-                      setBusy(true);
-                      await api.updateClip(clip.id, {
-                        taxonomy_tag_ids: { [sch.key]: id === "" ? null : id },
-                      });
-                      await reload();
-                      onUpdated?.();
-                      setMsg(`已更新「${sch.name}」标签`);
-                    } catch (e) {
-                      setError(e instanceof Error ? e.message : "更新标签失败");
-                    } finally {
-                      setBusy(false);
-                    }
-                  }}
-                  disabled={busy}
-                  canCreate={!!clip.can_edit}
-                  onNodesReload={reloadTaxonomies}
-                />
-              ) : (
-                <div>
-                  {cur
-                    ? `${cur.code ? cur.code + " " : ""}${cur.name}`
-                    : "未标注"}
-                </div>
-              )}
-            </label>
-          );
-        })}
+        {clip.can_annotate || clip.can_edit ? (
+          <TaxonomyTagPicker
+            schemes={localSchemes}
+            nodes={localTax}
+            value={(() => {
+              const edits = clipTagOverrides.clipId === clip.id ? clipTagOverrides.ids : {};
+              return Object.fromEntries(
+                localSchemes.map((scheme) => [
+                  scheme.key,
+                  scheme.key in edits
+                    ? edits[scheme.key]
+                    : tagBriefList(clip.taxonomy_tags?.[scheme.key]).map((item) => item.id),
+                ])
+              );
+            })()}
+            canCreate={!!clip.can_edit}
+            onNodesReload={reloadTaxonomies}
+            onChange={(scheme, ids) => {
+              const edits = clipTagOverrides.clipId === clip.id ? clipTagOverrides.ids : {};
+              const prev =
+                scheme in edits
+                  ? edits[scheme]
+                  : tagBriefList(clip.taxonomy_tags?.[scheme]).map((item) => item.id);
+              if (sameTagIds(prev, ids)) return;
+              setClipTagOverrides({
+                clipId: clip.id,
+                ids: { ...edits, [scheme]: ids },
+              });
+              const clipId = clip.id;
+              const gen = (clipTagGen.current[scheme] || 0) + 1;
+              clipTagGen.current[scheme] = gen;
+              clipTagQueue.current = clipTagQueue.current
+                .catch(() => undefined)
+                .then(async () => {
+                  if (clipTagGen.current[scheme] !== gen) return;
+                  await api.updateClip(clipId, {
+                    taxonomy_tag_ids: { [scheme]: ids.length ? ids : null },
+                  });
+                  if (clipTagGen.current[scheme] !== gen) return;
+                  await reload();
+                  onUpdated?.();
+                })
+                .catch((e) => {
+                  if (clipTagGen.current[scheme] !== gen) return;
+                  setClipTagOverrides((current) => {
+                    if (current.clipId !== clipId) return current;
+                    return { clipId, ids: { ...current.ids, [scheme]: prev } };
+                  });
+                  setError(e instanceof Error ? e.message : "更新标签失败");
+                });
+            }}
+          />
+        ) : (
+          localSchemes.map((sch) => {
+            const current = tagBriefList(clip.taxonomy_tags?.[sch.key]);
+            const keep = new Set(
+              specificTagIds(
+                current.map((item) => item.id),
+                localTax.filter((node) => node.scheme === sch.key)
+              )
+            );
+            const shown = current.filter((item) => keep.has(item.id));
+            return (
+              <div key={sch.key}>
+                {taxonomySchemeLabel(sch.key, localSchemes)}：
+                {shown.length
+                  ? shown
+                      .map((item) => `${item.code ? item.code + " " : ""}${item.name}`)
+                      .join("、")
+                  : "未标注"}
+              </div>
+            );
+          })
+        )}
       </div>
 
       {/* ===== 数据单元 · 人体（视频 + 动作数据） ===== */}

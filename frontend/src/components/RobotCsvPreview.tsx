@@ -1,4 +1,4 @@
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Html, OrbitControls } from "@react-three/drei";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
@@ -24,6 +24,8 @@ import {
 } from "../viewerUpAxis";
 
 const _robotBox = new THREE.Box3();
+const _rootPos = new THREE.Vector3();
+const _rootDelta = new THREE.Vector3();
 
 function centerFromFrames(frames: RobotCsvFrame[], rotationX: number): [number, number, number] {
   let sumX = 0;
@@ -117,6 +119,8 @@ function RobotCsvScene({
   durationHint,
   time,
   rotationX = 0,
+  viewNonce = 0,
+  followRoot = false,
   onReady,
   onError,
   onDetectedUpAxis,
@@ -128,6 +132,8 @@ function RobotCsvScene({
   durationHint?: number | null;
   time: number;
   rotationX?: number;
+  viewNonce?: number;
+  followRoot?: boolean;
   onReady: (info: { duration: number; fps: number; jointCount: number; note: string }) => void;
   onError: (message: string) => void;
   onDetectedUpAxis?: (up: UpAxis) => void;
@@ -144,9 +150,17 @@ function RobotCsvScene({
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
   const onDetectedRef = useRef(onDetectedUpAxis);
+  const followRef = useRef(followRoot);
+  const lastRoot = useRef(new THREE.Vector3());
+  const hasLastRoot = useRef(false);
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | undefined;
   onReadyRef.current = onReady;
   onErrorRef.current = onError;
   onDetectedRef.current = onDetectedUpAxis;
+  followRef.current = followRoot;
 
   useEffect(() => {
     let cancelled = false;
@@ -155,6 +169,7 @@ function RobotCsvScene({
     setRobot(null);
     robotRef.current = null;
     framesRef.current = [];
+    hasLastRoot.current = false;
 
     const root = packageRoot.replace(/\/?$/, "/");
     Promise.all([
@@ -235,6 +250,10 @@ function RobotCsvScene({
     setCenter(centerFromFrames(framesRef.current, rotationX));
   }, [rotationX, robot]);
 
+  useEffect(() => {
+    hasLastRoot.current = false;
+  }, [followRoot, csvUrl, rotationX]);
+
   useFrame(() => {
     const model = robotRef.current;
     const frames = framesRef.current;
@@ -244,6 +263,20 @@ function RobotCsvScene({
       frames.length - 1
     );
     applyFrame(model, frames[idx], namesRef.current);
+    model.updateMatrixWorld(true);
+    model.getWorldPosition(_rootPos);
+    if (followRef.current && hasLastRoot.current) {
+      _rootDelta.subVectors(_rootPos, lastRoot.current);
+      if (_rootDelta.lengthSq() > 1e-12) {
+        camera.position.add(_rootDelta);
+        if (controls) {
+          controls.target.add(_rootDelta);
+          controls.update();
+        }
+      }
+    }
+    lastRoot.current.copy(_rootPos);
+    hasLastRoot.current = true;
   });
 
   return (
@@ -253,6 +286,7 @@ function RobotCsvScene({
         objectRef={figureRef}
         ready={status === "ready"}
         resetKey={`${csvUrl}:${rotationX}`}
+        nonce={viewNonce}
       />
       {status === "loading" && (
         <Html center style={{ pointerEvents: "none" }}>
@@ -278,6 +312,8 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
   const [note, setNote] = useState("");
   const [upAxisMode, setUpAxisMode] = useUpAxisMode();
   const [detectedUp, setDetectedUp] = useState<UpAxis>("z");
+  const [viewNonce, setViewNonce] = useState(0);
+  const [followRoot, setFollowRoot] = useState(true);
   const duration = mediaDuration || file.duration_sec || 1;
   const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
   const style = String(file.robot_style || file.annotation?.robot_style || "");
@@ -384,6 +420,8 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
               durationHint={null}
               time={time}
               rotationX={rotationX}
+              viewNonce={viewNonce}
+              followRoot={followRoot}
               onReady={handleReady}
               onError={() => undefined}
               onDetectedUpAxis={setDetectedUp}
@@ -444,9 +482,31 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
         <button
           type="button"
           className="follow-root-toggle secondary"
+          title="重新把机器人对准到画面中央"
+          disabled={missingStyle}
+          onClick={() => setViewNonce((n) => n + 1)}
+        >
+          复位视角
+        </button>
+        <button
+          type="button"
+          className={`follow-root-toggle secondary ${followRoot ? "is-on" : ""}`}
+          title="打开后，相机保持当前相对位置，并随机器人根节点一起移动"
+          aria-pressed={followRoot}
+          disabled={missingStyle}
+          onClick={() => setFollowRoot((current) => !current)}
+        >
+          跟随视角
+        </button>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
           title="切换坐标系方向：自动识别 / Y-up / Z-up"
           disabled={missingStyle}
-          onClick={() => setUpAxisMode(cycleUpAxisMode(upAxisMode))}
+          onClick={() => {
+            setUpAxisMode(cycleUpAxisMode(upAxisMode));
+            setViewNonce((n) => n + 1);
+          }}
         >
           {upAxisModeLabel(upAxisMode, detectedUp)}
         </button>

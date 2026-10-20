@@ -4,9 +4,17 @@ import { api, downloadAuth } from "../api";
 import { useAuth } from "../auth";
 import { RepoTaxonomyNav } from "../components/RepoTaxonomyNav";
 import { ResizableHeight } from "../components/ResizableColumns";
-import { TaxonomySelect } from "../components/TaxonomyTree";
+import { TaxonomyTagPicker } from "../components/TaxonomyTagPicker";
 import type { RepoFile, RepoPack, TaxonomyNode, TaxonomySchemeDef } from "../types";
-import { MODALITY_LABEL, ONTOLOGY_LABEL, QUALITY_LABEL, taxonomySchemeLabel } from "../types";
+import {
+  MODALITY_LABEL,
+  ONTOLOGY_LABEL,
+  QUALITY_LABEL,
+  compactTaxonomyTagIds,
+  specificTagIds,
+  tagIdList,
+  taxonomySchemeLabel,
+} from "../types";
 
 type Tree = Record<
   string,
@@ -38,75 +46,91 @@ function str(v: unknown): string {
   return v == null ? "" : String(v);
 }
 
-function taxonomyTagIdsPayload(ids: Record<string, number | "">): Record<string, number | null> {
-  const out: Record<string, number | null> = {};
-  for (const [k, v] of Object.entries(ids)) {
-    out[k] = v === "" ? null : v;
-  }
-  return out;
+function taxonomyTagIdsPayload(
+  ids: Record<string, number | number[] | "">
+): Record<string, number[]> {
+  return compactTaxonomyTagIds(ids);
 }
 
-function emptyTaxIds(schemes: TaxonomySchemeDef[]): Record<string, number | ""> {
-  const out: Record<string, number | ""> = {};
-  for (const sch of schemes) out[sch.key] = "";
-  return out;
+function emptyTaxIds(_schemes: TaxonomySchemeDef[]): Record<string, number[]> {
+  return {};
 }
 
 /** 从已存 meta / action_def 恢复分类选择 */
 function taxIdsFromSaved(
   meta: Record<string, unknown>,
   actionDef: Record<string, unknown>,
-  schemes: TaxonomySchemeDef[]
-): Record<string, number | ""> {
-  const out = emptyTaxIds(schemes);
+  _schemes: TaxonomySchemeDef[]
+): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
   const raw = meta.taxonomy_tag_ids;
   if (raw && typeof raw === "object") {
     for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
-      else if (typeof v === "string" && v !== "" && !Number.isNaN(Number(v))) out[k] = Number(v);
+      const list = tagIdList(v);
+      if (list.length) out[k] = list;
     }
   }
   const tax = actionDef.taxonomy;
   if (tax && typeof tax === "object") {
     for (const [k, v] of Object.entries(tax as Record<string, unknown>)) {
-      if (out[k]) continue;
-      if (v && typeof v === "object" && typeof (v as { id?: unknown }).id === "number") {
-        out[k] = (v as { id: number }).id;
-      }
+      if (out[k]?.length) continue;
+      const list = tagIdList(v);
+      if (list.length) out[k] = list;
     }
   }
   return out;
 }
 
-function taxBriefOf(
+function taxBriefsOf(
   schemeKey: string,
-  ids: Record<string, number | "">,
+  ids: Record<string, number | number[] | "">,
   taxNodes: TaxonomyNode[]
 ) {
-  const id = ids[schemeKey];
-  if (id === "" || id == null) return null;
-  const n = taxNodes.find((x) => x.id === id);
-  if (!n) return null;
-  return { id: n.id, name: n.name, code: n.code, path: n.path, scheme: n.scheme };
+  return specificTagIds(
+    tagIdList(ids[schemeKey]),
+    taxNodes.filter((node) => node.scheme === schemeKey)
+  )
+    .map((id) => taxNodes.find((node) => node.id === id))
+    .filter((node): node is TaxonomyNode => !!node)
+    .map((node) => ({
+      id: node.id,
+      name: node.name,
+      code: node.code,
+      path: node.path,
+      scheme: node.scheme,
+    }));
 }
 
 function buildTaxonomyMap(
   schemes: TaxonomySchemeDef[],
-  ids: Record<string, number | "">,
+  ids: Record<string, number | number[] | "">,
   taxNodes: TaxonomyNode[]
 ): Record<string, unknown> {
   const taxonomy: Record<string, unknown> = {};
   for (const sch of schemes) {
-    const b = taxBriefOf(sch.key, ids, taxNodes);
-    if (b) taxonomy[sch.key] = b;
+    const briefs = taxBriefsOf(sch.key, ids, taxNodes);
+    if (briefs.length === 1) taxonomy[sch.key] = briefs[0];
+    else if (briefs.length) taxonomy[sch.key] = briefs;
   }
   return taxonomy;
 }
 
 /** 从分类树选择推导动作定义 / 工程标记（不再单独维护重复文本框） */
+function joinedNames(
+  briefs: { code?: string; name: string }[],
+  withCode = false
+) {
+  return briefs
+    .map((brief) =>
+      withCode ? `${brief.code ? brief.code + " " : ""}${brief.name}`.trim() : brief.name
+    )
+    .filter(Boolean)
+    .join("、");
+}
+
 function dimsFromTaxonomy(
   schemes: TaxonomySchemeDef[],
-  ids: Record<string, number | "">,
+  ids: Record<string, number | number[] | "">,
   taxNodes: TaxonomyNode[]
 ): {
   taxonomy: Record<string, unknown>;
@@ -119,41 +143,40 @@ function dimsFromTaxonomy(
   acquire_device: string;
 } {
   const taxonomy = buildTaxonomyMap(schemes, ids, taxNodes);
-  const atomic = taxBriefOf("atomic", ids, taxNodes);
-  const intent = taxBriefOf("intent", ids, taxNodes);
-  const style = taxBriefOf("style", ids, taxNodes);
+  const atomic = taxBriefsOf("atomic", ids, taxNodes);
+  const intent = taxBriefsOf("intent", ids, taxNodes);
+  const style = taxBriefsOf("style", ids, taxNodes);
   let project = "";
   let acquire_location = "";
   let acquire_method = "";
   let acquire_device = "";
   for (const sch of schemes) {
-    const brief = taxBriefOf(sch.key, ids, taxNodes);
-    if (!brief) continue;
+    const briefs = taxBriefsOf(sch.key, ids, taxNodes);
+    if (!briefs.length) continue;
     const key = sch.key.toLowerCase();
     const name = sch.name || "";
+    const text = joinedNames(briefs);
     if (key.includes("location") || key.includes("place") || name.includes("地点") || name.includes("录制")) {
-      acquire_location = brief.name;
+      acquire_location = text;
     } else if (
       key.includes("method") ||
       key.includes("acquire") ||
       name.includes("获取方式") ||
       (name.includes("方式") && !name.includes("设备"))
     ) {
-      acquire_method = brief.name;
+      acquire_method = text;
     } else if (key.includes("device") || key.includes("equipment") || name.includes("设备")) {
-      acquire_device = brief.name;
+      acquire_device = text;
     }
     if (key.includes("project") || name.includes("项目")) {
-      project = brief.name;
+      project = text;
     }
   }
   return {
     taxonomy,
-    atomic_action: atomic
-      ? `${atomic.code ? atomic.code + " " : ""}${atomic.name}`.trim()
-      : "",
-    type: intent?.name || "",
-    style: style?.name || "",
+    atomic_action: joinedNames(atomic, true),
+    type: joinedNames(intent),
+    style: joinedNames(style),
     project,
     acquire_location,
     acquire_method,
@@ -164,8 +187,8 @@ function dimsFromTaxonomy(
 function TaxonomyPickSection(props: {
   schemes: TaxonomySchemeDef[];
   taxNodes: TaxonomyNode[];
-  taxonomyTagIds: Record<string, number | "">;
-  setTaxonomyTagIds: (v: Record<string, number | "">) => void;
+  taxonomyTagIds: Record<string, number[]>;
+  setTaxonomyTagIds: (v: Record<string, number[]>) => void;
   canCreateTax: boolean;
   reloadTax: () => Promise<unknown>;
   disabled?: boolean;
@@ -173,32 +196,23 @@ function TaxonomyPickSection(props: {
   const { schemes, taxNodes, taxonomyTagIds, setTaxonomyTagIds, canCreateTax, reloadTax, disabled } =
     props;
   if (!schemes.length) {
-    return (
-      <div className="muted">
-        暂无分类标准，请先到「分类管理」维护树，再回此页选择；也可在各级用 + 新建。
-      </div>
-    );
+    return <div className="muted">暂无分类标准，请先到「分类管理」维护树。</div>;
   }
   return (
     <>
-      <h4 style={{ margin: "4px 0 0" }}>分类（在分类管理中维护，此处选择或新建）</h4>
+      <h4 style={{ margin: "4px 0 0" }}>分类标签</h4>
       <p className="muted" style={{ margin: 0, fontSize: "0.85rem" }}>
-        原子动作 / 意图 / 风格 / 地点 / 项目 / 获取方式 / 设备等请直接选树节点，无需再填重复文本。
+        同一分类可以勾选多个标签。
       </p>
-      {schemes.map((sch) => (
-        <label key={sch.key}>
-          {sch.name}
-          <TaxonomySelect
-            scheme={sch.key}
-            nodes={taxNodes.filter((n) => n.scheme === sch.key)}
-            value={taxonomyTagIds[sch.key] ?? ""}
-            disabled={disabled}
-            canCreate={canCreateTax && !disabled}
-            onNodesReload={reloadTax}
-            onChange={(id) => setTaxonomyTagIds({ ...taxonomyTagIds, [sch.key]: id })}
-          />
-        </label>
-      ))}
+      <TaxonomyTagPicker
+        schemes={schemes}
+        nodes={taxNodes}
+        value={taxonomyTagIds}
+        disabled={disabled}
+        canCreate={canCreateTax && !disabled}
+        onNodesReload={reloadTax}
+        onChange={(scheme, ids) => setTaxonomyTagIds({ ...taxonomyTagIds, [scheme]: ids })}
+      />
     </>
   );
 }

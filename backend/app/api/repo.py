@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload
 
-from ..core.deps import get_current_user
+from ..config import settings
+from ..core.deps import get_current_user, require_admin
 from ..database import get_db
 from ..models import ActionUnit, Capability, RepoFile, TaxonomyNode, User
 from ..services.audit import write_audit
@@ -41,7 +43,7 @@ from ..services.hub_repo import (
     upsert_catalog_entry,
 )
 from ..services.permissions import ensure_capability, normalize_path
-from ..services.repo_taxonomy import repo_file_tag_id as _repo_file_tag_id
+from ..services.repo_taxonomy import repo_file_tag_ids as _repo_file_tag_ids
 from ..services.repo_taxonomy import scheme_str as _scheme_str
 
 router = APIRouter(prefix="/repo", tags=["repo"])
@@ -518,7 +520,11 @@ def list_packs(
     scheme = (taxonomy_scheme or "").strip()
     if match_ids is not None and scheme:
         allow = set(match_ids)
-        rows = [rf for rf in rows if (_repo_file_tag_id(rf, scheme) in allow)]
+        rows = [
+            rf
+            for rf in rows
+            if any(tag_id in allow for tag_id in _repo_file_tag_ids(rf, scheme))
+        ]
 
     groups: dict[tuple[str, str, str], list[RepoFile]] = {}
     for rf in rows:
@@ -1118,3 +1124,160 @@ def batch_delete_repo_files(
         deleted += 1
     db.commit()
     return {"ok": True, "count": deleted}
+
+
+_RETARGET_STALE_SEC = 40
+
+
+def _empty_retarget_status() -> dict[str, Any]:
+    return {
+        "running": False,
+        "phase": "stopped",
+        "updated_at": None,
+        "started_at": None,
+        "priority_style": "",
+        "styles": [],
+        "workers": 0,
+        "reserved_cpus": 0,
+        "mem_reserve_gb": 0,
+        "priority_note": "",
+        "queues": [],
+        "current": [],
+        "recent": [],
+        "round_total": 0,
+        "round_done": 0,
+        "round_failed": 0,
+        "round_running": 0,
+        "round_started_at": None,
+        "seconds_per_job": None,
+        "pace_measured": False,
+        "message": "还没有自动重定向进度",
+    }
+
+
+@router.get("/retarget/status")
+def get_retarget_status(
+    _: User = Depends(require_admin),
+):
+    """超级管理者查看自动重定向进度和优先级。进度由宿主机循环写入。"""
+    path = Path(settings.hub_repo_root) / "index" / "auto_retarget_status.json"
+    if not path.is_file():
+        return _empty_retarget_status()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = _empty_retarget_status()
+        payload["message"] = "进度文件暂时无法读取"
+        return payload
+    if not isinstance(data, dict):
+        return _empty_retarget_status()
+    age = time.time() - path.stat().st_mtime
+    if age > _RETARGET_STALE_SEC:
+        data["running"] = False
+        data["phase"] = "stopped"
+        data["round_running"] = 0
+        data["current"] = []
+        data["message"] = "自动重定向进程没有心跳"
+    return data
+
+
+class RetargetPriorityBody(BaseModel):
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RetargetPresetBody(BaseModel):
+    name: str = ""
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.get("/retarget/priority")
+def get_retarget_priority(
+    _: User = Depends(require_admin),
+):
+    """超级管理者读取重定向优先级规则。"""
+    from ..services.retarget_priority import public_config
+
+    return public_config(Path(settings.hub_repo_root))
+
+
+@router.put("/retarget/priority")
+def put_retarget_priority(
+    body: RetargetPriorityBody,
+    _: User = Depends(require_admin),
+):
+    """保存后，自动重定向会在当前这一波结束后按新规则重新扫描。"""
+    from ..services.retarget_priority import public_config, save_config
+
+    hub = Path(settings.hub_repo_root)
+    try:
+        save_config(hub, {"rules": body.rules})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return public_config(hub)
+
+
+class RetargetPinBody(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/retarget/pin")
+def post_retarget_pin(
+    body: RetargetPinBody,
+    _: User = Depends(require_admin),
+):
+    """把指定批次或数据单元插到自动重定向队列最前面。"""
+    from ..services.retarget_priority import add_pins
+
+    hub = Path(settings.hub_repo_root)
+    try:
+        items = add_pins(hub, body.items)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "count": len(items)}
+
+
+@router.post("/retarget/priority/presets")
+def post_retarget_preset(
+    body: RetargetPresetBody,
+    _: User = Depends(require_admin),
+):
+    """把当前编辑中的规则存成一套可切换的默认规则。"""
+    from ..services.retarget_priority import public_config, save_preset
+
+    hub = Path(settings.hub_repo_root)
+    try:
+        save_preset(hub, body.name, body.rules)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return public_config(hub)
+
+
+@router.delete("/retarget/priority/presets/{preset_id}")
+def delete_retarget_preset(
+    preset_id: str,
+    _: User = Depends(require_admin),
+):
+    from ..services.retarget_priority import delete_preset, public_config
+
+    hub = Path(settings.hub_repo_root)
+    try:
+        delete_preset(hub, preset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return public_config(hub)
+
+
+@router.post("/retarget/priority/presets/{preset_id}/apply")
+def apply_retarget_preset(
+    preset_id: str,
+    _: User = Depends(require_admin),
+):
+    """切换到一套已保存的规则，并让自动重定向在当前这一波结束后重新扫描。"""
+    from ..services.retarget_priority import preset_rules, public_config, save_config
+
+    hub = Path(settings.hub_repo_root)
+    try:
+        save_config(hub, {"rules": preset_rules(hub, preset_id)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return public_config(hub)

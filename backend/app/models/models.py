@@ -124,11 +124,11 @@ class TaxonomyNode(Base):
 
 
 class ClipTaxonomyTag(Base):
-    """Per-clip tag for one taxonomy scheme (at most one node per scheme)."""
+    """Per-clip tags. One clip can carry several nodes of the same scheme."""
 
     __tablename__ = "clip_taxonomy_tags"
     __table_args__ = (
-        UniqueConstraint("clip_id", "scheme", name="uq_clip_taxonomy_scheme"),
+        UniqueConstraint("clip_id", "scheme", "node_id", name="uq_clip_taxonomy_node"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

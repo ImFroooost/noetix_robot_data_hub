@@ -95,7 +95,7 @@ def _resolve_tag(db: Session, tag_id: int | None, scheme: str) -> int | None:
     return node.id
 
 
-def _taxonomy_tags_dict(db: Session, clip: MotionClip) -> dict[str, TaxonomyTagBrief]:
+def _taxonomy_tags_dict(db: Session, clip: MotionClip) -> dict[str, list[TaxonomyTagBrief]]:
     mapping = clip_taxonomy_tag_map(db, clip.id)
     # fallback to legacy columns if join rows missing
     if not mapping:
@@ -105,8 +105,13 @@ def _taxonomy_tags_dict(db: Session, clip: MotionClip) -> dict[str, TaxonomyTagB
             (TaxonomyScheme.style.value, clip.style_tag),
         ):
             if node:
-                mapping[scheme] = node
-    return {k: _tag_brief(v) for k, v in mapping.items() if v}  # type: ignore[misc]
+                mapping[scheme] = [node]
+    out: dict[str, list[TaxonomyTagBrief]] = {}
+    for scheme, nodes in mapping.items():
+        briefs = [brief for node in nodes if (brief := _tag_brief(node))]
+        if briefs:
+            out[scheme] = briefs
+    return out
 
 
 def _apply_taxonomy_writes(
@@ -116,14 +121,23 @@ def _apply_taxonomy_writes(
     atomic_tag_id=...,
     intent_tag_id=...,
     style_tag_id=...,
-    taxonomy_tag_ids: dict[str, int | None] | None = None,
+    taxonomy_tag_ids: dict[str, int | list[int] | None] | None = None,
 ) -> None:
-    updates: dict[str, int | None] = {}
+    updates: dict[str, int | list[int] | None] = {}
     if taxonomy_tag_ids:
         for scheme, nid in taxonomy_tag_ids.items():
-            updates[_scheme_str(scheme)] = (
-                None if nid is None else _resolve_tag(db, nid, scheme)
-            )
+            key = _scheme_str(scheme)
+            if nid is None:
+                updates[key] = None
+            elif isinstance(nid, list):
+                updates[key] = [
+                    resolved
+                    for item in nid
+                    if item is not None
+                    and (resolved := _resolve_tag(db, item, key)) is not None
+                ]
+            else:
+                updates[key] = _resolve_tag(db, nid, key)
     if atomic_tag_id is not ...:
         updates[TaxonomyScheme.atomic.value] = _resolve_tag(
             db, atomic_tag_id, TaxonomyScheme.atomic.value
@@ -154,9 +168,9 @@ def _clip_out(db: Session, clip: MotionClip, user: User) -> ClipOut:
         atomic_tag_id=clip.atomic_tag_id,
         intent_tag_id=clip.intent_tag_id,
         style_tag_id=clip.style_tag_id,
-        atomic_tag=tax.get(TaxonomyScheme.atomic.value) or _tag_brief(clip.atomic_tag),
-        intent_tag=tax.get(TaxonomyScheme.intent.value) or _tag_brief(clip.intent_tag),
-        style_tag=tax.get(TaxonomyScheme.style.value) or _tag_brief(clip.style_tag),
+        atomic_tag=(tax.get(TaxonomyScheme.atomic.value) or [None])[0] or _tag_brief(clip.atomic_tag),
+        intent_tag=(tax.get(TaxonomyScheme.intent.value) or [None])[0] or _tag_brief(clip.intent_tag),
+        style_tag=(tax.get(TaxonomyScheme.style.value) or [None])[0] or _tag_brief(clip.style_tag),
         taxonomy_tags=tax,
         category=clip.category,
         subcategory=clip.subcategory,

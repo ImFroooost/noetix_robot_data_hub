@@ -7,7 +7,7 @@ import { undoUploadSession } from "../undo/storageMeta";
 import { DEFAULT_HUMAN_MODEL, HumanModelFields, resolveHumanModelName } from "./HumanModelFields";
 import { MotionKindFields } from "./MotionKindFields";
 import { RobotStyleFields } from "./RobotStyleFields";
-import { TaxonomySelect } from "./TaxonomyTree";
+import { TaxonomyTagPicker } from "./TaxonomyTagPicker";
 import type {
   ModelInstance,
   StorageFolderUploadResult,
@@ -23,7 +23,6 @@ import {
   needsManualCsvFps,
   parseCsvFps,
   resolveMotionKind,
-  taxonomySchemeLabel,
   type MotionKind,
 } from "../types";
 import {
@@ -34,6 +33,7 @@ import {
   guessFolderName,
   type RelFile,
 } from "../utils/folderUpload";
+import { planClipUnits, planFollowedPaths } from "../utils/motionUnits";
 
 const MODALITIES = [
   ["tpv_video", "第三视角视频"],
@@ -66,6 +66,7 @@ type ZipImportDraft = {
   fps: string;
   motionKind: MotionKind;
   replace: boolean;
+  followPaths: boolean;
 };
 
 type FolderImportDraft = {
@@ -88,6 +89,7 @@ type FolderImportDraft = {
   motionKind: MotionKind;
   actions: Record<string, FolderAction>;
   replace: boolean;
+  followPaths: boolean;
 };
 
 const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
@@ -142,53 +144,24 @@ export function UploadTaxonomyFields({
 }: {
   schemes: TaxonomySchemeDef[];
   nodes: TaxonomyNode[];
-  value: Record<string, number | "">;
-  onChange: (next: Record<string, number | "">) => void;
+  value: Record<string, number | number[] | "">;
+  onChange: (next: Record<string, number[]>) => void;
   canCreate?: boolean;
   onNodesReload?: () => Promise<void> | void;
   disabled?: boolean;
 }) {
-  if (!schemes.length) {
-    return <div className="muted">分类标准加载中…</div>;
-  }
-  const selected = schemes
-    .map((scheme) => {
-      const id = value[scheme.key];
-      const node = typeof id === "number" ? nodes.find((item) => item.id === id) : null;
-      return node
-        ? `${taxonomySchemeLabel(scheme.key, schemes)}：${node.path}`
-        : null;
-    })
-    .filter(Boolean);
   return (
-    <section className="storage-upload-taxonomy">
-      {selected.length ? (
-        <div className="storage-upload-taxonomy-picks">
-          {selected.map((item) => (
-            <span key={item}>{item}</span>
-          ))}
-        </div>
-      ) : (
-        <span className="muted">尚未选择分类标签</span>
-      )}
-      {schemes.map((scheme) => (
-        <div className="storage-upload-taxonomy-row" key={scheme.key}>
-          <span title={taxonomySchemeLabel(scheme.key, schemes)}>
-            {taxonomySchemeLabel(scheme.key, schemes)}
-          </span>
-          <TaxonomySelect
-            scheme={scheme.key}
-            compact
-            nodes={nodes.filter((node) => node.scheme === scheme.key)}
-            value={value[scheme.key] ?? ""}
-            canCreate={canCreate}
-            onNodesReload={onNodesReload}
-            disabled={disabled}
-            onChange={(id) => onChange({ ...value, [scheme.key]: id })}
-          />
-        </div>
-      ))}
-    </section>
+    <TaxonomyTagPicker
+      schemes={schemes}
+      nodes={nodes}
+      value={value}
+      disabled={disabled}
+      canCreate={canCreate}
+      onNodesReload={onNodesReload}
+      onChange={(scheme, ids) =>
+        onChange({ ...compactTaxonomyTagIds(value), [scheme]: ids })
+      }
+    />
   );
 }
 
@@ -216,8 +189,8 @@ export function FolderBatchImport({
   nodes: TaxonomyNode[];
   canCreateTaxonomy?: boolean;
   onNodesReload?: () => Promise<void> | void;
-  taxonomyTagIds: Record<string, number | "">;
-  onTaxonomyTagIdsChange: (next: Record<string, number | "">) => void;
+  taxonomyTagIds: Record<string, number | number[] | "">;
+  onTaxonomyTagIdsChange: (next: Record<string, number[]>) => void;
   showInlinePreset?: boolean;
   layout?: "pane" | "dock";
   onImported: (batchName: string, sessionId?: string) => void;
@@ -318,6 +291,7 @@ export function FolderBatchImport({
       fps: "30",
       motionKind: DEFAULT_MOTION_KIND,
       replace: false,
+      followPaths: false,
     });
   };
 
@@ -365,6 +339,7 @@ export function FolderBatchImport({
       motionKind: DEFAULT_MOTION_KIND,
       actions: {},
       replace: false,
+      followPaths: false,
     });
   };
 
@@ -436,6 +411,7 @@ export function FolderBatchImport({
       form.set("channel", zipDraft.modality === "fpv_video" ? zipDraft.channel : "");
       form.set("batch", targetBatch);
       form.set("replace", String(zipDraft.replace));
+      form.set("follow_paths", zipDraft.followPaths ? "1" : "0");
       form.set(
         "annotation",
         JSON.stringify({
@@ -511,29 +487,21 @@ export function FolderBatchImport({
         : folderDraft.batchName.trim();
     const existingUnits =
       overview?.batches.find((item) => item.name === targetBatch)?.units || [];
-    const seenUnits = new Map<string, string>();
+    const clipPlan = folderDraft.followPaths
+      ? planFollowedPaths(
+          folderDraft.files.map((item) => item.path),
+          true
+        )
+      : planClipUnits(folderDraft.files.map((item) => item.path));
+    const seenStored = new Set<string>();
     return folderDraft.files.map((relFile) => {
-      const baseUnitName = fileUnitName(relFile);
-      let unitName = baseUnitName;
-      let duplicate = false;
-      const prev = [...seenUnits.keys()].find((name) => stemsSameUnit(name, baseUnitName));
-      if (prev) {
-        const prevDir = seenUnits.get(prev) || "";
-        const curDir = relFile.path.split("/").slice(0, -1).join("/");
-        if (prevDir && curDir && prevDir !== curDir) {
-          const parentDir = curDir.split("/").pop() || "";
-          unitName = parentDir ? `${parentDir}_${baseUnitName}` : baseUnitName;
-          const prevParent = prevDir.split("/").pop() || "";
-          if (prevParent && prevParent !== parentDir) {
-            const renamed = `${prevParent}_${prev}`;
-            seenUnits.delete(prev);
-            seenUnits.set(renamed, prevDir);
-          }
-        } else {
-          duplicate = true;
-        }
-      }
-      seenUnits.set(unitName, relFile.path.split("/").slice(0, -1).join("/"));
+      const planned = clipPlan.get(relFile.path);
+      const unitName = planned?.skip
+        ? relFile.file.name
+        : planned?.unitName || fileUnitName(relFile);
+      const storedName = planned?.storedName || relFile.file.name;
+      const duplicate = !planned?.skip && seenStored.has(storedName);
+      if (!planned?.skip) seenStored.add(storedName);
       const existingUnit = matchExistingUnit(unitName, existingUnits);
       const newRobotStyle = folderDraft.ontology === "robot" ? folderDraft.robotStyle.trim() : "";
       const existingFile = existingUnit?.files.find(
@@ -543,7 +511,7 @@ export function FolderBatchImport({
           item.channel ===
             (folderDraft.modality === "fpv_video" ? folderDraft.channel : "") &&
           item.format === (fileExtension(relFile) || folderDraft.format) &&
-          item.name === relFile.file.name &&
+          item.name === storedName &&
           String(item.robot_style || item.annotation?.robot_style || "").trim() === newRobotStyle
       );
       const existingRobotStyle = existingFile ? String(existingFile.robot_style || existingFile.annotation?.robot_style || "").trim() : "";
@@ -552,8 +520,9 @@ export function FolderBatchImport({
         !!newRobotStyle &&
         !!existingRobotStyle &&
         newRobotStyle !== existingRobotStyle;
-      const existingConflict = !!existingFile;
-      const defaultAction: FolderAction = duplicate || existingConflict ? "skip" : "upload";
+      const existingConflict = !!existingFile && !planned?.skip;
+      const defaultAction: FolderAction =
+        planned?.skip || duplicate || existingConflict ? "skip" : "upload";
       return {
         relFile,
         unitName,
@@ -607,6 +576,7 @@ export function FolderBatchImport({
       );
       form.set("format", folderDraft.format.trim());
       form.set("batch", targetBatch);
+      form.set("follow_paths", folderDraft.followPaths ? "1" : "0");
       form.set("actions", JSON.stringify(folderRows.map((row) => row.action)));
       form.set(
         "annotation",
@@ -878,6 +848,22 @@ export function FolderBatchImport({
                 )}
               </label>
             )}
+
+            <label className="storage-follow-path">
+              <input
+                type="checkbox"
+                checked={folderDraft.followPaths}
+                onChange={(event) =>
+                  updateFolderDraft({ followPaths: event.target.checked, actions: {} })
+                }
+              />
+              遵循文件中的路径
+              <small>
+                {folderDraft.followPaths
+                  ? "按文件夹里的目录显示"
+                  : "同一条动作的不同格式合成一个数据单元，批次内不再分层"}
+              </small>
+            </label>
 
             <div className="storage-folder-fields">
               <label>
@@ -1309,6 +1295,19 @@ export function FolderBatchImport({
                   />
                 </label>
               )}
+              <label className="storage-follow-path">
+                <input
+                  type="checkbox"
+                  checked={zipDraft.followPaths}
+                  onChange={(event) => updateZipDraft({ followPaths: event.target.checked })}
+                />
+                遵循文件中的路径
+                <small>
+                  {zipDraft.followPaths
+                    ? "按压缩包里的目录显示"
+                    : "同一条动作的不同格式合成一个数据单元，批次内不再分层"}
+                </small>
+              </label>
               <div className="grid-2">
                 <label>
                   本体

@@ -1,4 +1,4 @@
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Html, OrbitControls } from "@react-three/drei";
 import { Component, useEffect, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
@@ -8,13 +8,14 @@ import { getToken } from "../api";
 import {
   applyViewerFigureColors,
   FrameFigure,
+  shiftCameraWithPoint,
   SkeletonLines,
   useViewerLook,
   ViewerSceneChrome,
 } from "./ViewerSceneChrome";
 import {
   cycleUpAxisMode,
-  detectUpAxisFromExtents,
+  detectUpAxisFromPointFrames,
   resolveUpAxis,
   upAxisModeLabel,
   upAxisToRotationX,
@@ -34,6 +35,7 @@ import {
 } from "../viewerUnits";
 
 const _bvhHips = new THREE.Vector3();
+const _followPoint = new THREE.Vector3();
 const _bvhBox = new THREE.Box3();
 const _bvhPt = new THREE.Vector3();
 const _meshBox = new THREE.Box3();
@@ -82,6 +84,7 @@ export function BvhScene({
   viewNonce = 0,
   rotationX = 0,
   unitMode = "auto",
+  followRoot = false,
   onDetectedUpAxis,
   onDetectedLengthUnit,
 }: {
@@ -92,6 +95,7 @@ export function BvhScene({
   viewNonce?: number;
   rotationX?: number;
   unitMode?: LengthUnitMode;
+  followRoot?: boolean;
   onDetectedUpAxis?: (up: UpAxis) => void;
   onDetectedLengthUnit?: (unit: LengthUnit) => void;
 }) {
@@ -117,12 +121,25 @@ export function BvhScene({
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
   const look = useViewerLook();
+  const followRef = useRef(followRoot);
+  const lastRoot = useRef(new THREE.Vector3());
+  const hasLastRoot = useRef(false);
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | undefined;
+  followRef.current = followRoot;
+
+  useEffect(() => {
+    hasLastRoot.current = false;
+  }, [followRoot, url, rotationX]);
 
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
     setError("");
     setBoneRoot(null);
+    hasLastRoot.current = false;
     setHelper(null);
     setOffset([0, 0, 0]);
     boneRootRef.current = null;
@@ -162,8 +179,7 @@ export function BvhScene({
         let minY = Infinity;
         let spanY = 0;
         let spanZ = 0;
-        let midY = 0;
-        let midZ = 0;
+        const poseFrames: { y: number; z: number }[][] = [];
         const n = 24;
         for (let i = 0; i < n; i++) {
           probeAction.time = (i / Math.max(n - 1, 1)) * clipDur;
@@ -173,28 +189,24 @@ export function BvhScene({
           sumX += _bvhHips.x;
           sumZ += _bvhHips.z;
           samples++;
+          const pose = collectPoseSamples(bone0);
+          if (pose.length) poseFrames.push(pose);
           _bvhBox.makeEmpty();
-          bone0.traverse((obj) => {
-            if ((obj as THREE.Bone).isBone) {
-              obj.getWorldPosition(_bvhPt);
-              _bvhBox.expandByPoint(_bvhPt);
-            }
-          });
+          for (const point of pose) {
+            _bvhPt.set(0, point.y, point.z);
+            _bvhBox.expandByPoint(_bvhPt);
+          }
           if (!_bvhBox.isEmpty()) {
             minY = Math.min(minY, _bvhBox.min.y);
-            const sy = _bvhBox.max.y - _bvhBox.min.y;
-            const sz = _bvhBox.max.z - _bvhBox.min.z;
-            spanY = Math.max(spanY, sy);
-            spanZ = Math.max(spanZ, sz);
-            midY += (_bvhBox.max.y + _bvhBox.min.y) / 2;
-            midZ += (_bvhBox.max.z + _bvhBox.min.z) / 2;
+            spanY = Math.max(spanY, _bvhBox.max.y - _bvhBox.min.y);
+            spanZ = Math.max(spanZ, _bvhBox.max.z - _bvhBox.min.z);
           }
         }
         const meanX = samples ? sumX / samples : 0;
         const meanZ = samples ? sumZ / samples : 0;
         if (!Number.isFinite(minY)) minY = 0;
         const maxHeight = Math.max(spanY, spanZ);
-        onDetectedRef.current?.(detectUpAxisFromExtents(spanY, spanZ, midY / Math.max(samples, 1), midZ / Math.max(samples, 1)));
+        onDetectedRef.current?.(detectUpAxisFromPointFrames(poseFrames));
         const unit = detectLengthUnit(maxHeight);
         setDetectedUnit(unit);
         onDetectedUnitRef.current?.(unit);
@@ -293,6 +305,17 @@ export function BvhScene({
     if (offsetReady.current) {
       center.position.copy(fixedOffset.current);
     }
+    const root = boneRootRef.current;
+    if (!root) return;
+    root.getWorldPosition(_followPoint);
+    shiftCameraWithPoint(
+      _followPoint,
+      camera,
+      controls,
+      lastRoot.current,
+      hasLastRoot,
+      followRef.current,
+    );
   });
 
   return (
@@ -326,6 +349,44 @@ export function BvhScene({
       </group>
     </>
   );
+}
+
+/** 骨架关节，以及刚体 / marker 网格的包围盒角点。 */
+function collectPoseSamples(root: THREE.Object3D): { y: number; z: number }[] {
+  const points: { y: number; z: number }[] = [];
+  root.updateMatrixWorld(true);
+  root.traverse((obj) => {
+    const bone = obj as THREE.Bone;
+    const mesh = obj as THREE.Mesh;
+    if (bone.isBone) {
+      obj.getWorldPosition(_bvhPt);
+      points.push({ y: _bvhPt.y, z: _bvhPt.z });
+      return;
+    }
+    if (
+      !mesh.isMesh ||
+      (mesh as THREE.SkinnedMesh).isSkinnedMesh ||
+      mesh.name.startsWith("__") ||
+      !mesh.geometry?.attributes?.position?.count
+    ) {
+      return;
+    }
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+    const local = mesh.geometry.boundingBox;
+    if (!local || local.isEmpty()) return;
+    const xs = [local.min.x, local.max.x];
+    const ys = [local.min.y, local.max.y];
+    const zs = [local.min.z, local.max.z];
+    for (const x of xs) {
+      for (const y of ys) {
+        for (const z of zs) {
+          _bvhPt.set(x, y, z).applyMatrix4(mesh.matrixWorld);
+          points.push({ y: _bvhPt.y, z: _bvhPt.z });
+        }
+      }
+    }
+  });
+  return points;
 }
 
 function expandSkeletonBox(root: THREE.Object3D, box: THREE.Box3) {
@@ -496,6 +557,7 @@ export function FbxScene({
   viewNonce = 0,
   rotationX = 0,
   unitMode = "auto",
+  followRoot = false,
   onDetectedUpAxis,
   onDetectedLengthUnit,
 }: {
@@ -506,6 +568,7 @@ export function FbxScene({
   viewNonce?: number;
   rotationX?: number;
   unitMode?: LengthUnitMode;
+  followRoot?: boolean;
   onDetectedUpAxis?: (up: UpAxis) => void;
   onDetectedLengthUnit?: (unit: LengthUnit) => void;
 }) {
@@ -531,12 +594,27 @@ export function FbxScene({
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
   const look = useViewerLook();
+  const rootRef = useRef<THREE.Object3D | null>(null);
+  const followRef = useRef(followRoot);
+  const lastRoot = useRef(new THREE.Vector3());
+  const hasLastRoot = useRef(false);
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | undefined;
+  followRef.current = followRoot;
+
+  useEffect(() => {
+    hasLastRoot.current = false;
+  }, [followRoot, url, rotationX]);
 
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
     setError("");
     setObject(null);
+    hasLastRoot.current = false;
+    rootRef.current = null;
     setHelper(null);
     setOffset([0, 0, 0]);
     objectRef.current = null;
@@ -583,8 +661,7 @@ export function FbxScene({
         let minY = Infinity;
         let spanY = 0;
         let spanZ = 0;
-        let midY = 0;
-        let midZ = 0;
+        const poseFrames: { y: number; z: number }[][] = [];
         const measureRoot = primaryBoneRoot(obj) ?? obj;
         const n = probeAction && probeMixer ? 24 : 1;
         for (let i = 0; i < n; i++) {
@@ -592,6 +669,8 @@ export function FbxScene({
             probeAction.time = (i / Math.max(n - 1, 1)) * clipDur;
             probeMixer.update(0);
           }
+          const pose = collectPoseSamples(obj);
+          if (pose.length >= 3) poseFrames.push(pose);
           expandSkeletonBox(measureRoot, _bvhBox);
           if (_bvhBox.isEmpty()) continue;
           const mid = _bvhBox.getCenter(_bvhHips);
@@ -599,12 +678,8 @@ export function FbxScene({
           sumZ += mid.z;
           samples += 1;
           minY = Math.min(minY, _bvhBox.min.y);
-          const sy = _bvhBox.max.y - _bvhBox.min.y;
-          const sz = _bvhBox.max.z - _bvhBox.min.z;
-          spanY = Math.max(spanY, sy);
-          spanZ = Math.max(spanZ, sz);
-          midY += (_bvhBox.max.y + _bvhBox.min.y) / 2;
-          midZ += (_bvhBox.max.z + _bvhBox.min.z) / 2;
+          spanY = Math.max(spanY, _bvhBox.max.y - _bvhBox.min.y);
+          spanZ = Math.max(spanZ, _bvhBox.max.z - _bvhBox.min.z);
         }
         const meanX = samples ? sumX / samples : 0;
         const meanZ = samples ? sumZ / samples : 0;
@@ -618,9 +693,7 @@ export function FbxScene({
               _meshBox.max.y - _meshBox.min.y,
               _meshBox.max.z - _meshBox.min.z
             );
-        onDetectedRef.current?.(
-          detectUpAxisFromExtents(spanY, spanZ, midY / Math.max(samples, 1), midZ / Math.max(samples, 1))
-        );
+        onDetectedRef.current?.(detectUpAxisFromPointFrames(poseFrames));
         const unit = detectLengthUnitFromExtents(skelHeight, meshHeight);
         setDetectedUnit(unit);
         onDetectedUnitRef.current?.(unit);
@@ -655,6 +728,7 @@ export function FbxScene({
         }
 
         objectRef.current = obj;
+        rootRef.current = primaryBoneRoot(obj) ?? obj;
         mixer.current = probeMixer;
         action.current = probeAction;
         if (clip && clip.duration > 0) onDurationRef.current?.(clip.duration);
@@ -684,6 +758,7 @@ export function FbxScene({
       }
       detachJointDots(objectRef.current);
       detachFbxMarkers(objectRef.current);
+      rootRef.current = null;
     };
   }, [url]);
 
@@ -709,6 +784,17 @@ export function FbxScene({
     if (center && offsetReady.current) {
       center.position.copy(fixedOffset.current);
     }
+    const root = rootRef.current;
+    if (!root) return;
+    root.getWorldPosition(_followPoint);
+    shiftCameraWithPoint(
+      _followPoint,
+      camera,
+      controls,
+      lastRoot.current,
+      hasLastRoot,
+      followRef.current,
+    );
   });
 
   return (
@@ -767,6 +853,7 @@ export function AnimationFormatPreview({
   const [mediaDuration, setMediaDuration] = useState(0);
   const [glProblem, setGlProblem] = useState("");
   const [viewNonce, setViewNonce] = useState(0);
+  const [followRoot, setFollowRoot] = useState(true);
   const [upAxisMode, setUpAxisMode] = useUpAxisMode();
   const [detectedUp, setDetectedUp] = useState<UpAxis>("y");
   const [unitMode, setUnitMode] = useLengthUnitMode();
@@ -853,6 +940,7 @@ export function AnimationFormatPreview({
               viewNonce={viewNonce}
               rotationX={rotationX}
               unitMode={unitMode}
+              followRoot={followRoot}
               onDetectedUpAxis={setDetectedUp}
               onDetectedLengthUnit={setDetectedUnit}
             />
@@ -865,6 +953,7 @@ export function AnimationFormatPreview({
               viewNonce={viewNonce}
               rotationX={rotationX}
               unitMode={unitMode}
+              followRoot={followRoot}
               onDetectedUpAxis={setDetectedUp}
               onDetectedLengthUnit={setDetectedUnit}
             />
@@ -926,6 +1015,15 @@ export function AnimationFormatPreview({
           onClick={() => setViewNonce((n) => n + 1)}
         >
           复位视角
+        </button>
+        <button
+          type="button"
+          className={`follow-root-toggle secondary ${followRoot ? "is-on" : ""}`}
+          title="打开后，相机保持当前相对位置，并随人体根节点一起移动"
+          aria-pressed={followRoot}
+          onClick={() => setFollowRoot((current) => !current)}
+        >
+          跟随视角
         </button>
         <button
           type="button"

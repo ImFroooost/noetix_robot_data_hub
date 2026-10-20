@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from starlette.requests import Request as StarletteRequest
 
 # Raise Starlette's multipart parser limits (default 1000 files/fields)
@@ -25,7 +26,11 @@ from .config import settings
 from .core.security import hash_password
 from .database import SessionLocal, init_db
 from .models import User, UserRole
-from .services.disk_repository import schedule_catalog_rebuild
+from .services.disk_repository import (
+    catalog_full_rebuild_age_sec,
+    catalog_rebuild_status,
+    start_catalog_rebuild,
+)
 from .services.hub_repo import ensure_hub_skeleton
 from .services.storage import data_root
 
@@ -55,10 +60,44 @@ async def lifespan(_: FastAPI):
         pass
     init_db()
     ensure_admin()
-    try:
-        schedule_catalog_rebuild()
-    except Exception:
-        pass
+
+    def _daily_full_rebuild() -> None:
+        import os
+        import time
+
+        # Full scans stay rare: at most once a day, and only while the machine is quiet.
+        time.sleep(180)
+        while True:
+            try:
+                age = catalog_full_rebuild_age_sec()
+                due = age is None or age >= 20 * 3600
+                overdue = age is None or age >= 36 * 3600
+                running = catalog_rebuild_status().get("status") == "running"
+                if due and not running:
+                    try:
+                        load1 = os.getloadavg()[0]
+                    except OSError:
+                        load1 = 0.0
+                    cpus = os.cpu_count() or 1
+                    limit = max(1.0, cpus * (0.8 if overdue else 0.35))
+                    if load1 <= limit:
+                        start_catalog_rebuild(force=True)
+            except Exception:
+                pass
+            time.sleep(15 * 60)
+
+    def _warm_browse_index() -> None:
+        try:
+            from .services.disk_repository import load_data_index
+
+            load_data_index(include_empty=False)
+        except Exception:
+            pass
+
+    import threading
+
+    threading.Thread(target=_warm_browse_index, name="browse-index-warm", daemon=True).start()
+    threading.Thread(target=_daily_full_rebuild, name="catalog-daily-rebuild", daemon=True).start()
     yield
 
 
@@ -76,6 +115,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.middleware("http")

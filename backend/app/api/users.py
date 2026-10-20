@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..core.deps import require_admin
@@ -14,6 +15,7 @@ from ..schemas import (
     UserUpdate,
 )
 from ..services.audit import write_audit
+from ..services.disk_repository import rename_user_snapshots
 from ..services.permissions import permission_summary, set_user_permissions
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -94,6 +96,20 @@ def update_user(
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
+    if body.username is not None:
+        name = body.username.strip()
+        if len(name) < 2 or len(name) > 64:
+            raise HTTPException(status_code=400, detail="用户名需要 2 到 64 个字符")
+        if name != user.username:
+            taken = (
+                db.query(User)
+                .filter(User.username == name, User.id != user.id)
+                .first()
+            )
+            if taken:
+                raise HTTPException(status_code=400, detail="用户名已存在")
+            user.username = name
+            rename_user_snapshots(user.id, name)
     if body.password is not None:
         user.password_hash = hash_password(body.password)
     if body.role is not None:
@@ -119,7 +135,11 @@ def update_user(
         entity_id=user.id,
         detail=body.model_dump(exclude_unset=True),
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="用户名已存在")
     db.refresh(user)
     return _user_out(db, user)
 

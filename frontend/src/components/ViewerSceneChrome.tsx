@@ -18,6 +18,7 @@ function readTheme(): Theme {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
 }
 
+const _followDelta = new THREE.Vector3();
 const _fitBox = new THREE.Box3();
 const _fitSize = new THREE.Vector3();
 const _fitCenter = new THREE.Vector3();
@@ -110,6 +111,29 @@ export function SkeletonLines({
   });
 
   return <primitive object={lines} />;
+}
+
+/** 把相机和观察点平移同样的位移，使角色根节点留在画面中的相对位置不变。 */
+export function shiftCameraWithPoint(
+  worldPos: THREE.Vector3,
+  camera: THREE.Camera,
+  controls: { target: THREE.Vector3; update: () => void } | null | undefined,
+  last: THREE.Vector3,
+  hasLast: { current: boolean },
+  enabled: boolean,
+) {
+  if (enabled && hasLast.current) {
+    _followDelta.subVectors(worldPos, last);
+    if (_followDelta.lengthSq() > 1e-12) {
+      camera.position.add(_followDelta);
+      if (controls) {
+        controls.target.add(_followDelta);
+        controls.update();
+      }
+    }
+  }
+  last.copy(worldPos);
+  hasLast.current = true;
 }
 
 /** 模型入场后再对准相机，避免角色在画面外或缩成一个点。nonce 变化时重新取景（复位视角）。 */

@@ -157,6 +157,23 @@ def safe_extract_member(
     return target
 
 
+def extract_zip_files(zip_path: Path, work_dir: Path) -> tuple[list[Path], list[str]]:
+    """Extract every importable member, keeping its path and filename."""
+    warnings: list[str] = []
+    work_dir.mkdir(parents=True, exist_ok=True)
+    extracted: list[Path] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        members = iter_zip_human_members(zf)
+        if not members:
+            return [], ["ZIP 中未找到可导入文件（按后缀识别格式，如 bvh/csv/fbx/tak 或新后缀）"]
+        for info, name in members:
+            try:
+                extracted.append(safe_extract_member(zf, info, work_dir, filename=name))
+            except Exception as e:
+                warnings.append(f"解压失败 {name}: {e}")
+    return extracted, warnings
+
+
 def extract_and_group_zip(zip_path: Path, work_dir: Path) -> tuple[list[GroupedMotion], list[str]]:
     warnings: list[str] = []
     work_dir.mkdir(parents=True, exist_ok=True)

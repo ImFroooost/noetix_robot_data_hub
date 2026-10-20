@@ -9,10 +9,10 @@ import {
   resolveHumanModelFile,
   resolveHumanModelName,
 } from "./HumanModelFields";
-import { useViewerLook, ViewerSceneChrome } from "./ViewerSceneChrome";
+import { shiftCameraWithPoint, useViewerLook, ViewerSceneChrome } from "./ViewerSceneChrome";
 import {
   cycleUpAxisMode,
-  detectUpAxisFromExtents,
+  detectUpAxisFromPointFrames,
   upAxisModeLabel,
   upAxisToRotationX,
   useUpAxisMode,
@@ -73,30 +73,19 @@ const _frameQuats = Array.from({ length: JOINT_COUNT }, () => new THREE.Quaterni
 export type { UpAxis, UpAxisMode };
 export { useUpAxisMode };
 
-/** 自动识别：采样多帧，看「头 − 双脚中点」连线主要沿哪个轴，那就是竖直方向。 */
+/** 自动识别：采样多帧关节，看哪种朝向几乎不穿进地面。 */
 function detectUpAxis(motion: SmplMotion): UpAxis {
   const positions = Array.from({ length: JOINT_COUNT }, () => new THREE.Vector3());
   const frameCount = motion.poses.length;
   const n = Math.min(24, frameCount);
   if (!n) return "y";
-  let absY = 0;
-  let absZ = 0;
-  let midY = 0;
-  let midZ = 0;
+  const frames: { y: number; z: number }[][] = [];
   for (let i = 0; i < n; i++) {
     const f = Math.min(Math.floor((i / Math.max(n - 1, 1)) * (frameCount - 1)), frameCount - 1);
     computeFrame(motion, f, positions);
-    const head = positions[15];
-    const feetY = (positions[7].y + positions[8].y) / 2;
-    const feetZ = (positions[7].z + positions[8].z) / 2;
-    const dy = head.y - feetY;
-    const dz = head.z - feetZ;
-    absY += Math.abs(dy);
-    absZ += Math.abs(dz);
-    midY += dy;
-    midZ += dz;
+    frames.push(positions.map((point) => ({ y: point.y, z: point.z })));
   }
-  return detectUpAxisFromExtents(absY, absZ, midY, midZ);
+  return detectUpAxisFromPointFrames(frames);
 }
 
 export type SmplMotion = {
@@ -257,6 +246,41 @@ function FrameSmpl({
     }
     framed.current = nonce;
   });
+
+  return null;
+}
+
+function FollowSmplRoot({
+  positionsRef,
+  rotationX,
+  enabled,
+}: {
+  positionsRef: RefObject<Vec3Array>;
+  rotationX: number;
+  enabled: boolean;
+}) {
+  const camera = useThree((state) => state.camera);
+  const controls = useThree((state) => state.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | undefined;
+  const last = useRef(new THREE.Vector3());
+  const hasLast = useRef(false);
+  const enabledRef = useRef(enabled);
+  const point = useMemo(() => new THREE.Vector3(), []);
+  enabledRef.current = enabled;
+
+  useEffect(() => {
+    hasLast.current = false;
+  }, [enabled, rotationX]);
+
+  useFrame(() => {
+    const pelvis = positionsRef.current?.[0];
+    if (!pelvis) return;
+    const c = Math.cos(rotationX);
+    const s = Math.sin(rotationX);
+    point.set(pelvis.x, pelvis.y * c - pelvis.z * s, pelvis.y * s + pelvis.z * c);
+    shiftCameraWithPoint(point, camera, controls, last.current, hasLast, enabledRef.current);
+  }, -1);
 
   return null;
 }
@@ -446,6 +470,7 @@ function SmplScene({
   time,
   viewNonce,
   upAxisMode,
+  followRoot = false,
   onDuration,
   onStatus,
   onDetectedUpAxis,
@@ -455,6 +480,7 @@ function SmplScene({
   time: number;
   viewNonce: number;
   upAxisMode: UpAxisMode;
+  followRoot?: boolean;
   onDuration?: (sec: number) => void;
   onStatus?: (status: "loading" | "ready" | "error", message?: string) => void;
   onDetectedUpAxis?: (up: UpAxis) => void;
@@ -539,6 +565,7 @@ function SmplScene({
           visible={!body}
         />
       )}
+      <FollowSmplRoot positionsRef={positionsRef} rotationX={rotationX} enabled={followRoot} />
       <FrameSmpl positionsRef={positionsRef} ready={!!motion} nonce={viewNonce} rotationX={rotationX} />
       {!motion && !error && (
         <Html center style={{ pointerEvents: "none" }}>
@@ -562,6 +589,7 @@ export function SmplPreview({ file }: { file: StorageFile }) {
   const [speed, setSpeed] = useState(1);
   const [duration, setDuration] = useState(0);
   const [viewNonce, setViewNonce] = useState(0);
+  const [followRoot, setFollowRoot] = useState(true);
   const [upAxisMode, setUpAxisMode] = useUpAxisMode();
   const [detectedUp, setDetectedUp] = useState<UpAxis>("y");
   const [instances, setInstances] = useState<ModelInstance[]>([]);
@@ -650,6 +678,7 @@ export function SmplPreview({ file }: { file: StorageFile }) {
             time={time}
             viewNonce={viewNonce}
             upAxisMode={upAxisMode}
+            followRoot={followRoot}
             onDuration={setDuration}
             onDetectedUpAxis={setDetectedUp}
           />
@@ -733,6 +762,15 @@ export function SmplPreview({ file }: { file: StorageFile }) {
           onClick={() => setViewNonce((n) => n + 1)}
         >
           复位视角
+        </button>
+        <button
+          type="button"
+          className={`follow-root-toggle secondary ${followRoot ? "is-on" : ""}`}
+          title="打开后，相机保持当前相对位置，并随人体根节点一起移动"
+          aria-pressed={followRoot}
+          onClick={() => setFollowRoot((current) => !current)}
+        >
+          跟随视角
         </button>
         <button
           type="button"

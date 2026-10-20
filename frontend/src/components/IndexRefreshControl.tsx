@@ -139,6 +139,7 @@ export function IndexRefreshControl({ className = "btn-primary" }: { className?:
         type="button"
         className={className}
         disabled={running}
+        title="完整扫描并重建索引。上传、删除和重命名只会更新变动的部分；空闲时每天自动完整重建一次"
         onClick={() => void startRefresh()}
       >
         {running ? "更新中…" : "更新索引"}

@@ -48,6 +48,7 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    username: str | None = None
     password: str | None = None
     role: UserRole | None = None
     is_active: bool | None = None
@@ -186,7 +187,7 @@ class ClipCreate(BaseModel):
     intent_tag_id: int | None = None
     style_tag_id: int | None = None
     # scheme_key -> node_id (null clears). Keyword tags remain in `tags`.
-    taxonomy_tag_ids: dict[str, int | None] = Field(default_factory=dict)
+    taxonomy_tag_ids: dict[str, int | list[int] | None] = Field(default_factory=dict)
     category: str = ""
     subcategory: str = ""
     summary: str = ""
@@ -211,7 +212,7 @@ class ClipUpdate(BaseModel):
     atomic_tag_id: int | None = None
     intent_tag_id: int | None = None
     style_tag_id: int | None = None
-    taxonomy_tag_ids: dict[str, int | None] | None = None
+    taxonomy_tag_ids: dict[str, int | list[int] | None] | None = None
     category: str | None = None
     subcategory: str | None = None
     summary: str | None = None
@@ -352,7 +353,7 @@ class ClipOut(ORMModel):
     atomic_tag: TaxonomyTagBrief | None = None
     intent_tag: TaxonomyTagBrief | None = None
     style_tag: TaxonomyTagBrief | None = None
-    taxonomy_tags: dict[str, TaxonomyTagBrief] = Field(default_factory=dict)
+    taxonomy_tags: dict[str, list[TaxonomyTagBrief]] = Field(default_factory=dict)
     category: str
     subcategory: str
     summary: str
@@ -397,7 +398,7 @@ class ClipListItem(ORMModel):
     atomic_tag: TaxonomyTagBrief | None = None
     intent_tag: TaxonomyTagBrief | None = None
     style_tag: TaxonomyTagBrief | None = None
-    taxonomy_tags: dict[str, TaxonomyTagBrief] = Field(default_factory=dict)
+    taxonomy_tags: dict[str, list[TaxonomyTagBrief]] = Field(default_factory=dict)
     category: str
     subcategory: str
     summary: str

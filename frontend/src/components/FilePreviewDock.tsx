@@ -141,8 +141,11 @@ export function FilePreviewDock({
         <div>
           <h3>同屏预览</h3>
           <p className="muted">
-            可同时打开任意批次、任意单元中的文件；切换左侧列表不会清空。已打开{" "}
-            {preview.filledCount} 个
+            {preview.contrastMode
+              ? "对比模式：先点选一个窗口，再点具体文件，该窗口会换成这个文件。点数据单元或数据节点不会自动播放。"
+              : "可同时打开任意批次、任意单元中的文件；切换左侧列表不会清空。"}
+            {" "}
+            已打开 {preview.filledCount} 个
             {overlayOpen ? " · Esc 退出全屏" : ""}
             {" · 构建 "}
             {BUILD_ID}
@@ -152,7 +155,7 @@ export function FilePreviewDock({
           <button
             type="button"
             className={preview.contrastMode ? "" : "secondary"}
-            title="激活后点击文件会依次添加为新窗口；不激活时只显示最新点击的文件"
+            title="激活后先点选窗口，再点具体文件，该窗口显示这个文件。点数据单元或数据节点不会自动播放"
             onClick={() => preview.setContrastMode(!preview.contrastMode)}
           >
             对比模式
@@ -236,9 +239,12 @@ export function FilePreviewDock({
                 preview.activeIndex === index ? "active" : ""
               } ${isDropTarget ? "is-drop-target" : ""} ${dragIndex === index ? "is-dragging" : ""}`}
               style={span > 1 ? { gridColumn: `span ${span}` } : undefined}
+              onClickCapture={() => {
+                if (preview.contrastMode) preview.setActive(index);
+              }}
               onClick={() => {
                 preview.setActive(index);
-                if (file) onActivate?.(file);
+                if (file && !preview.contrastMode) onActivate?.(file);
               }}
               onDragOver={(e) => onDragOver(e, index)}
               onDrop={(e) => onDrop(e, index)}
@@ -298,7 +304,9 @@ export function FilePreviewDock({
                   <div className="storage-preview-empty">
                     窗口 {index + 1}
                     <br />
-                    点击数据单元中的文件添加到此窗口
+                    {preview.contrastMode
+                      ? "先点选此窗口，再点击具体文件"
+                      : "点击数据单元中的文件添加到此窗口"}
                   </div>
                 )}
               </div>

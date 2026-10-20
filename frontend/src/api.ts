@@ -328,7 +328,7 @@ export const api = {
     request<import("./types").CatalogRebuildStatus>("/api/storage/rescan/status"),
   storageCreateBatch: (
     name: string,
-    extra?: { taxonomy_tag_ids?: Record<string, number> }
+    extra?: { taxonomy_tag_ids?: Record<string, number | number[] | null> }
   ) =>
     request<import("./types").StorageBatch>("/api/storage/batches", {
       method: "POST",
@@ -371,7 +371,7 @@ export const api = {
     ),
   storageUpdateNodeTaxonomy: (body: {
     batch: string;
-    units: { name: string; taxonomy_tag_ids: Record<string, number | null> }[];
+    units: { name: string; taxonomy_tag_ids: Record<string, number | number[] | null> }[];
   }) =>
     request<{ updated: number }>("/api/storage/nodes/taxonomy", {
       method: "POST",
@@ -516,6 +516,39 @@ export const api = {
     request<import("./types").RepoFile[]>("/api/repo/upload", { method: "POST", body: form }),
   repoUploadZip: (form: FormData) =>
     request<import("./types").RepoFile[]>("/api/repo/upload-zip", { method: "POST", body: form }),
+  retargetStatus: () =>
+    request<import("./pages/RetargetManagePage").RetargetStatus>("/api/repo/retarget/status", {
+      quiet: true,
+    }),
+  retargetPriority: () =>
+    request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority", {
+      quiet: true,
+    }),
+  saveRetargetPriority: (rules: import("./pages/RetargetManagePage").PriorityRule[]) =>
+    request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority", {
+      method: "PUT",
+      body: JSON.stringify({ rules }),
+    }),
+  saveRetargetPreset: (name: string, rules: import("./pages/RetargetManagePage").PriorityRule[]) =>
+    request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority/presets", {
+      method: "POST",
+      body: JSON.stringify({ name, rules }),
+    }),
+  deleteRetargetPreset: (presetId: string) =>
+    request<import("./pages/RetargetManagePage").RetargetPriority>(
+      `/api/repo/retarget/priority/presets/${encodeURIComponent(presetId)}`,
+      { method: "DELETE" },
+    ),
+  pinRetarget: (items: { batch: string; units: string[] }[]) =>
+    request<{ ok: boolean; count: number }>("/api/repo/retarget/pin", {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    }),
+  applyRetargetPreset: (presetId: string) =>
+    request<import("./pages/RetargetManagePage").RetargetPriority>(
+      `/api/repo/retarget/priority/presets/${encodeURIComponent(presetId)}/apply`,
+      { method: "POST" },
+    ),
 
   previewUrl: (kind: "human" | "robot", id: number) => `/api/previews/${kind}/${id}`,
   smplMotionUrl: (id: number) => `/api/previews/human/${id}/smpl`,
@@ -543,6 +576,16 @@ export async function fetchJsonAuth(url: string) {
   return data;
 }
 
+async function downloadError(res: Response): Promise<string> {
+  try {
+    const data = await res.json();
+    if (typeof data.detail === "string" && data.detail) return data.detail;
+  } catch {
+    /* ignore */
+  }
+  return "下载失败";
+}
+
 export async function downloadAuth(url: string, filename?: string) {
   const token = getToken();
   startLoading("下载中…");
@@ -550,8 +593,9 @@ export async function downloadAuth(url: string, filename?: string) {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) {
+    const detail = await downloadError(res);
     stopLoading();
-    throw new Error("下载失败");
+    throw new Error(detail);
   }
   const blob = await res.blob();
   stopLoading();
@@ -579,8 +623,9 @@ export async function downloadAuthPost(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
+    const detail = await downloadError(res);
     stopLoading();
-    throw new Error("下载失败");
+    throw new Error(detail);
   }
   const blob = await res.blob();
   stopLoading();

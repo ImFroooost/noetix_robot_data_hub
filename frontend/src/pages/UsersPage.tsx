@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { fetchStorageOverview } from "../storageOverviewCache";
@@ -326,8 +326,66 @@ function PermissionEditor({
   );
 }
 
+function UsernameCell({
+  user,
+  onRename,
+}: {
+  user: User;
+  onRename: (next: string) => Promise<void>;
+}) {
+  const [value, setValue] = useState(user.username);
+  const [busy, setBusy] = useState(false);
+  const skipBlur = useRef(false);
+  useEffect(() => setValue(user.username), [user.username]);
+
+  const commit = async () => {
+    const next = value.trim();
+    if (!next || next === user.username || busy) {
+      setValue(user.username);
+      return;
+    }
+    setBusy(true);
+    try {
+      await onRename(next);
+    } catch {
+      setValue(user.username);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <span className="user-name-edit">
+      <input
+        value={value}
+        maxLength={64}
+        disabled={busy}
+        aria-label={`修改 ${user.username} 的用户名`}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => {
+          if (skipBlur.current) {
+            skipBlur.current = false;
+            return;
+          }
+          void commit();
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            (e.currentTarget as HTMLInputElement).blur();
+          } else if (e.key === "Escape") {
+            skipBlur.current = true;
+            setValue(user.username);
+            (e.currentTarget as HTMLInputElement).blur();
+          }
+        }}
+      />
+    </span>
+  );
+}
+
 export function UsersPage() {
-  const { hasPerm, user: me, impersonate } = useAuth();
+  const { hasPerm, user: me, impersonate, refresh } = useAuth();
   const { execute } = useUndo();
   const canManageUsers = hasPerm("manage_users");
   const [users, setUsers] = useState<User[]>([]);
@@ -477,23 +535,58 @@ export function UsersPage() {
               <>
                 <tr key={u.id}>
                   <td>{u.id}</td>
-                  <td>{u.username}</td>
+                  <td>
+                    <UsernameCell
+                      user={u}
+                      onRename={async (next) => {
+                        const prev = u.username;
+                        setError("");
+                        try {
+                          await execute({
+                            label: `将用户名 ${prev} 改为 ${next}`,
+                            do: async () => {
+                              await api.updateUser(u.id, { username: next });
+                              await refresh();
+                              await reload();
+                            },
+                            undo: async () => {
+                              await api.updateUser(u.id, { username: prev });
+                              await refresh();
+                            },
+                          });
+                        } catch (err) {
+                          setError(err instanceof Error ? err.message : "修改用户名失败");
+                          throw err;
+                        }
+                      }}
+                    />
+                  </td>
                   <td>
                     <select
                       value={u.role}
                       onChange={async (e) => {
                         const prev = u.role;
                         const next = e.target.value as Role;
-                        await execute({
-                          label: `将 ${u.username} 改为${ROLE_LABEL[next] || next}`,
-                          do: async () => {
-                            await api.updateUser(u.id, { role: next });
-                            await reload();
-                          },
-                          undo: async () => {
-                            await api.updateUser(u.id, { role: prev });
-                          },
-                        });
+                        setUsers((rows) =>
+                          rows.map((row) => (row.id === u.id ? { ...row, role: next } : row))
+                        );
+                        try {
+                          await execute({
+                            label: `将 ${u.username} 改为${ROLE_LABEL[next] || next}`,
+                            do: async () => {
+                              await api.updateUser(u.id, { role: next });
+                              await reload();
+                            },
+                            undo: async () => {
+                              await api.updateUser(u.id, { role: prev });
+                            },
+                          });
+                        } catch (err) {
+                          setUsers((rows) =>
+                            rows.map((row) => (row.id === u.id ? { ...row, role: prev } : row))
+                          );
+                          setError(err instanceof Error ? err.message : "修改角色失败");
+                        }
                       }}
                     >
                       {ROLE_OPTIONS.map((r) => (
@@ -517,16 +610,30 @@ export function UsersPage() {
                         className="secondary"
                         onClick={async () => {
                           const prev = u.is_active;
-                          await execute({
-                            label: prev ? `禁用 ${u.username}` : `启用 ${u.username}`,
-                            do: async () => {
-                              await api.updateUser(u.id, { is_active: !prev });
-                              await reload();
-                            },
-                            undo: async () => {
-                              await api.updateUser(u.id, { is_active: prev });
-                            },
-                          });
+                          setUsers((rows) =>
+                            rows.map((row) =>
+                              row.id === u.id ? { ...row, is_active: !prev } : row
+                            )
+                          );
+                          try {
+                            await execute({
+                              label: prev ? `禁用 ${u.username}` : `启用 ${u.username}`,
+                              do: async () => {
+                                await api.updateUser(u.id, { is_active: !prev });
+                                await reload();
+                              },
+                              undo: async () => {
+                                await api.updateUser(u.id, { is_active: prev });
+                              },
+                            });
+                          } catch (err) {
+                            setUsers((rows) =>
+                              rows.map((row) =>
+                                row.id === u.id ? { ...row, is_active: prev } : row
+                              )
+                            );
+                            setError(err instanceof Error ? err.message : "修改状态失败");
+                          }
                         }}
                       >
                         {u.is_active ? "禁用" : "启用"}

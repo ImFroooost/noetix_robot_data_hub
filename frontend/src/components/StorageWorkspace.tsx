@@ -20,7 +20,7 @@ import {
   normalizeRobotVersion,
 } from "./RobotStyleFields";
 import { clampPane, SplitHandle, useStoredNumber } from "./SplitHandle";
-import { TaxonomySelect } from "./TaxonomyTree";
+import { TaxonomyTagPicker } from "./TaxonomyTagPicker";
 import { setPresenceDetail } from "../presence";
 import { fetchStorageOverview, INDEX_UPDATED_EVENT } from "../storageOverviewCache";
 import { useUndo } from "../undo/UndoContext";
@@ -49,6 +49,14 @@ import {
   needsManualCsvFps,
   parseCsvFps,
   resolveMotionKind,
+  childrenByParent,
+  sameTagIds,
+  selectionAfterCheck,
+  selectionCovers,
+  specificSelection,
+  specificTagIds,
+  tagBriefList,
+  tagIdList,
   taxonomySchemeLabel,
   type MotionKind,
 } from "../types";
@@ -319,17 +327,21 @@ function TreeToolbar({
 function TreeActions({
   canDownload,
   canEdit,
+  canPrioritize,
   onDownload,
   onRename,
+  onPrioritize,
   onDelete,
 }: {
   canDownload?: boolean;
   canEdit?: boolean;
+  canPrioritize?: boolean;
   onDownload?: () => void;
   onRename?: () => void;
+  onPrioritize?: () => void;
   onDelete?: () => void;
 }) {
-  if (!canDownload && !canEdit) return null;
+  if (!canDownload && !canEdit && !canPrioritize) return null;
   return (
     <span className="storage-tree-actions">
       {canDownload && onDownload && (
@@ -340,6 +352,11 @@ function TreeActions({
       {canEdit && onRename && (
         <button type="button" className="secondary" onClick={(e) => { e.stopPropagation(); onRename(); }}>
           重命名
+        </button>
+      )}
+      {canPrioritize && onPrioritize && (
+        <button type="button" className="secondary" onClick={(e) => { e.stopPropagation(); onPrioritize(); }}>
+          重定向
         </button>
       )}
       {canEdit && onDelete && (
@@ -560,18 +577,22 @@ function unitsUnderPath(units: StorageUnit[], dirPath: string): StorageUnit[] {
   });
 }
 
-function sharedUnitTag(units: StorageUnit[], scheme: string): { id: number | ""; mixed: boolean } {
-  let current: number | null | undefined;
+function sharedUnitTag(
+  units: StorageUnit[],
+  scheme: string,
+  nodes: TaxonomyNode[]
+): { ids: number[]; mixed: boolean } {
+  const schemeNodes = nodes.filter((node) => node.scheme === scheme);
+  let current: number[] | undefined;
   for (const unit of units) {
-    const raw = unit.taxonomy_tag_ids?.[scheme];
-    const id = raw == null ? null : raw;
+    const ids = specificTagIds(tagIdList(unit.taxonomy_tag_ids?.[scheme]), schemeNodes);
     if (current === undefined) {
-      current = id;
+      current = ids;
       continue;
     }
-    if (current !== id) return { id: "", mixed: true };
+    if (!sameTagIds(current, ids)) return { ids: [], mixed: true };
   }
-  return { id: current == null ? "" : current, mixed: false };
+  return { ids: current || [], mixed: false };
 }
 
 const VIRTUAL_UNIT_ROW = 46;
@@ -657,7 +678,9 @@ function renderDirTree(
   setCheckedUnits: (fn: (prev: Record<string, boolean>) => Record<string, boolean>) => void,
   onRenameUnit: (unit: StorageUnit) => void,
   onDelete: (batches: StorageBatch[], units: StorageUnit[]) => void,
-  onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void
+  onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void,
+  canPrioritize?: boolean,
+  onPrioritize?: (units: StorageUnit[]) => void
 ): ReactNode {
   const dirEntries = [...node.children.entries()].sort((left, right) =>
     left[0].localeCompare(right[0], "zh")
@@ -701,6 +724,14 @@ function renderDirTree(
                   }
                 : undefined
             }
+            actions={
+              canPrioritize && onPrioritize ? (
+                <TreeActions
+                  canPrioritize
+                  onPrioritize={() => onPrioritize(unitsInDir(child))}
+                />
+              ) : undefined
+            }
           >
             {open
               ? renderDirTree(
@@ -721,7 +752,9 @@ function renderDirTree(
                   setCheckedUnits,
                   onRenameUnit,
                   onDelete,
-                  onDownload
+                  onDownload,
+                  canPrioritize,
+                  onPrioritize
                 )
               : null}
           </TreeGroup>
@@ -747,8 +780,10 @@ function renderDirTree(
                 <TreeActions
                   canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
                   canEdit={canEdit}
+                  canPrioritize={canPrioritize}
                   onDownload={() => onDownload([], [unit])}
                   onRename={() => onRenameUnit(unit)}
+                  onPrioritize={onPrioritize ? () => onPrioritize([unit]) : undefined}
                   onDelete={() => onDelete([], [unit])}
                 />
               }
@@ -774,8 +809,10 @@ function renderDirTree(
               <TreeActions
                 canDownload={!!canDownload || unitOwnedBy(unit, currentUserId)}
                 canEdit={canEdit}
+                canPrioritize={canPrioritize}
                 onDownload={() => onDownload([], [unit])}
                 onRename={() => onRenameUnit(unit)}
+                onPrioritize={onPrioritize ? () => onPrioritize([unit]) : undefined}
                 onDelete={() => onDelete([], [unit])}
               />
             }
@@ -799,20 +836,26 @@ function UnitTree({
   onRenameUnit,
   onDelete,
   onDownload,
+  onPrioritize,
+  canPrioritize,
   onSelectionChange,
+  ready = true,
 }: {
   data: StorageOverview;
+  ready?: boolean;
   selectedUnit: string | null;
   selectedNodeKey: string | null;
   onSelectUnit: (unit: StorageUnit) => void;
   onSelectNode: (key: string) => void;
   canEdit?: boolean;
   canDownload?: boolean;
+  canPrioritize?: boolean;
   currentUserId?: number;
   onRenameBatch: (batch: StorageBatch) => void;
   onRenameUnit: (unit: StorageUnit) => void;
   onDelete: (batches: StorageBatch[], units: StorageUnit[]) => void;
   onDownload: (batches: StorageBatch[], units: StorageUnit[]) => void;
+  onPrioritize?: (units: StorageUnit[]) => void;
   onSelectionChange?: (units: StorageUnit[]) => void;
 }) {
   const { user } = useAuth();
@@ -881,6 +924,27 @@ function UnitTree({
                   }}
                 >
                   重命名
+                </button>
+              )}
+              {canPrioritize && onPrioritize && (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={!selectedCount && !selectedNodeKey}
+                  onClick={() => {
+                    if (selectedUnits.length) {
+                      onPrioritize(selectedUnits);
+                      return;
+                    }
+                    if (!selectedNodeKey) return;
+                    const splitAt = selectedNodeKey.indexOf("::");
+                    const batchName = splitAt >= 0 ? selectedNodeKey.slice(0, splitAt) : selectedNodeKey;
+                    const dirPath = splitAt >= 0 ? selectedNodeKey.slice(splitAt + 2) : "";
+                    const batch = data.batches.find((item) => item.name === batchName);
+                    if (batch) onPrioritize(unitsUnderPath(batch.units, dirPath));
+                  }}
+                >
+                  重定向
                 </button>
               )}
               {canEdit && (
@@ -959,6 +1023,8 @@ function UnitTree({
                 canEdit={canEdit}
                 onDownload={() => onDownload([batch], [])}
                 onRename={() => onRenameBatch(batch)}
+                canPrioritize={canPrioritize}
+                onPrioritize={onPrioritize ? () => onPrioritize(batch.units) : undefined}
                 onDelete={() => onDelete([batch], [])}
               />
             }
@@ -984,7 +1050,9 @@ function UnitTree({
                     setCheckedUnits,
                     onRenameUnit,
                     onDelete,
-                    onDownload
+                    onDownload,
+                    canPrioritize,
+                    onPrioritize
                   )
                 ) : (
                   <div className="muted storage-tree-empty">暂无数据单元</div>
@@ -996,7 +1064,9 @@ function UnitTree({
       })}
       {!data.batches.length && (
         <div className="muted">
-          {scopedEmpty
+          {!ready
+            ? "正在加载数据…"
+            : scopedEmpty
             ? "当前账号没有配置浏览范围，也没有自己上传的数据，所以列表为空。这和从哪台电脑打开无关。请用超级管理者登录查看全部数据，或在「用户管理」里为该账号配置范围。"
             : "没有匹配的数据批次"}
         </div>
@@ -1461,13 +1531,16 @@ function TaxonomyTreePanel({
   const topLevelParentId: number | null =
     rootNodes.length === 1 ? rootNodes[0].id : null;
   const unitsUnder = (node: TaxonomyNode) =>
-    units.filter((unit) => {
-      const taggedId = unit.taxonomy_tag_ids?.[scheme];
-      const tagged = nodes.find((item) => item.id === taggedId);
-      return !!tagged && tagged.path.startsWith(node.path);
-    });
+    units.filter((unit) =>
+      specificTagIds(tagIdList(unit.taxonomy_tag_ids?.[scheme]), nodes).some((taggedId) => {
+        const tagged = nodes.find((item) => item.id === taggedId);
+        return !!tagged && tagged.path.startsWith(node.path);
+      })
+    );
   const unspecifiedUnitsOf = (node: TaxonomyNode) =>
-    units.filter((unit) => unit.taxonomy_tag_ids?.[scheme] === node.id);
+    units.filter((unit) =>
+      specificTagIds(tagIdList(unit.taxonomy_tag_ids?.[scheme]), nodes).includes(node.id)
+    );
   const displayedKeys = units.map((unit) => unit.key);
   const selectedUnits = units.filter((unit) => checkedUnits[unit.key]);
   const selectedCount = selectedUnits.length;
@@ -2086,20 +2159,14 @@ function DetailRow({
 
 type DetailKind = "batch" | "unit" | "file" | "upload_session" | "node" | "selection";
 
-function unitSchemeTagId(
-  unit: StorageUnit,
-  scheme: string,
-  batch: StorageBatch | undefined
-): number | null {
-  const own = unit.taxonomy_tag_ids?.[scheme];
-  if (own) return own;
-  const inherited = batch?.taxonomy_tag_ids?.[scheme];
-  if (inherited) return inherited;
+function unitSchemeTagIds(unit: StorageUnit, scheme: string): number[] {
+  const own = tagIdList(unit.taxonomy_tag_ids?.[scheme]);
+  if (own.length) return own;
   for (const file of unit.files || []) {
-    const tagged = file.taxonomy_tag_ids?.[scheme];
-    if (tagged) return tagged;
+    const tagged = tagIdList(file.taxonomy_tag_ids?.[scheme]);
+    if (tagged.length) return tagged;
   }
-  return null;
+  return [];
 }
 
 function useReportSelection(
@@ -2131,6 +2198,36 @@ type StorageNodeFocus = {
 
 function schemesForKind(_kind: DetailKind, schemes: TaxonomySchemeDef[]) {
   return schemes;
+}
+
+function fillTagBriefs(
+  tags: Record<string, { path?: string } | { path?: string }[] | undefined>,
+  ids: Record<string, number | number[]> | undefined,
+  nodes: TaxonomyNode[]
+) {
+  const next: Record<string, { id: number; scheme: string; code?: string; name: string; path: string }[]> = {};
+  for (const [scheme, brief] of Object.entries(tags)) {
+    const schemeNodes = nodes.filter((node) => node.scheme === scheme);
+    const list = tagBriefList(brief as never).filter((item) => item.path);
+    const keep = new Set(specificTagIds(list.map((item) => item.id), schemeNodes));
+    const specific = list.filter((item) => keep.has(item.id));
+    if (specific.length) next[scheme] = specific;
+  }
+  for (const [scheme, id] of Object.entries(ids || {})) {
+    if (next[scheme]?.length) continue;
+    const found = specificTagIds(tagIdList(id), nodes)
+      .map((item) => nodes.find((node) => node.id === item))
+      .filter((node): node is TaxonomyNode => !!node)
+      .map((node) => ({
+        id: node.id,
+        scheme: node.scheme,
+        code: node.code,
+        name: node.name,
+        path: node.path,
+      }));
+    if (found.length) next[scheme] = found;
+  }
+  return next;
 }
 
 function EntityDetailPanel({
@@ -2184,7 +2281,11 @@ function EntityDetailPanel({
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
-  const [selectionDrafts, setSelectionDrafts] = useState<Record<string, number | "">>({});
+  const [selectionDrafts, setSelectionDrafts] = useState<Record<string, number[]>>({});
+  const [tagOverrides, setTagOverrides] = useState<{
+    key: string;
+    ids: Record<string, number[]>;
+  }>({ key: "", ids: {} });
   const selectionKey = selectedUnits.map((item) => item.key).join("\0");
   useEffect(() => {
     setSelectionDrafts({});
@@ -2202,18 +2303,18 @@ function EntityDetailPanel({
     return null;
   };
 
-  const nodeShare: Record<string, { id: number | ""; mixed: boolean }> = {};
+  const nodeShare: Record<string, { ids: number[]; mixed: boolean }> = {};
   if (kind === "node" && nodeInfo) {
     for (const scheme of schemes) {
-      nodeShare[scheme.key] = sharedUnitTag(nodeInfo.units, scheme.key);
+      nodeShare[scheme.key] = sharedUnitTag(nodeInfo.units, scheme.key, nodes);
     }
   }
   const ownTagIds =
     kind === "node"
       ? Object.fromEntries(
           Object.entries(nodeShare)
-            .filter(([, value]) => value.id !== "")
-            .map(([key, value]) => [key, value.id])
+            .filter(([, value]) => value.ids.length && !value.mixed)
+            .map(([key, value]) => [key, value.ids])
         )
       : kind === "file"
         ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
@@ -2263,15 +2364,11 @@ function EntityDetailPanel({
       ? ownTagIds
       : kind === "file"
       ? {
-          ...(detail?.batch_taxonomy_tag_ids || batch?.taxonomy_tag_ids || {}),
           ...(detail?.unit_taxonomy_tag_ids || unit?.taxonomy_tag_ids || {}),
           ...(detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}),
         }
       : kind === "unit"
-        ? {
-            ...(batch?.taxonomy_tag_ids || {}),
-            ...(unit?.taxonomy_tag_ids || {}),
-          }
+        ? unit?.taxonomy_tag_ids || {}
         : kind === "upload_session"
           ? session?.taxonomy_tag_ids || {}
           : batch?.taxonomy_tag_ids || {};
@@ -2280,25 +2377,68 @@ function EntityDetailPanel({
       ? {}
       : kind === "file"
       ? {
-          ...(detail?.batch_taxonomy_tags || batch?.taxonomy_tags || {}),
           ...(detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {}),
           ...(detail?.taxonomy_tags || file?.taxonomy_tags || {}),
         }
       : kind === "unit"
-        ? {
-            ...(batch?.taxonomy_tags || {}),
-            ...(unit?.taxonomy_tags || {}),
-          }
+        ? unit?.taxonomy_tags || {}
         : kind === "upload_session"
           ? session?.taxonomy_tags || {}
           : batch?.taxonomy_tags || {};
   const parentTags =
     kind === "file"
-      ? { ...(detail?.batch_taxonomy_tags || batch?.taxonomy_tags || {}), ...(detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {}) }
-      : kind === "unit"
-        ? batch?.taxonomy_tags || {}
-        : {};
+      ? fillTagBriefs(
+          detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {},
+          detail?.unit_taxonomy_tag_ids || unit?.taxonomy_tag_ids,
+          nodes
+        )
+      : {};
+  const resolvedTags = fillTagBriefs(tags, tagIds, nodes);
   const visibleSchemes = kind ? schemesForKind(kind, schemes) : [];
+  const tagEntityKey = [
+    kind || "",
+    batch?.name || "",
+    unit?.key || "",
+    file?.path || "",
+    session?.id || "",
+    nodeInfo ? `${nodeInfo.batchName}/${nodeInfo.dirPath}` : "",
+  ].join("\n");
+  const tagEdits = tagOverrides.key === tagEntityKey ? tagOverrides.ids : {};
+  const shownTagIds = (scheme: string) => {
+    const schemeNodes = nodes.filter((node) => node.scheme === scheme);
+    if (scheme in tagEdits) return specificTagIds(tagEdits[scheme], schemeNodes);
+    if (kind === "node") {
+      const share = nodeShare[scheme];
+      return share?.mixed ? [] : share?.ids || [];
+    }
+    return specificTagIds(tagIdList(ownTagIds[scheme]), schemeNodes);
+  };
+  const rememberTags = (scheme: string, ids: number[]) => {
+    setTagOverrides({
+      key: tagEntityKey,
+      ids: { ...tagEdits, [scheme]: ids },
+    });
+    setSaved(false);
+  };
+  const changedTagPayload = () => {
+    const stored = (ids: number[]) => (ids.length ? ids : null);
+    const out: Record<string, number[] | null> = {};
+    for (const [scheme, ids] of Object.entries(tagEdits)) {
+      if (kind === "node" && nodeShare[scheme]?.mixed) {
+        out[scheme] = stored(ids);
+        continue;
+      }
+      const prev =
+        kind === "node"
+          ? nodeShare[scheme]?.ids || []
+          : specificTagIds(
+              tagIdList(ownTagIds[scheme]),
+              nodes.filter((node) => node.scheme === scheme)
+            );
+      if (!sameTagIds(ids, prev)) out[scheme] = stored(ids);
+    }
+    return out;
+  };
 
   useEffect(() => {
     setNote(String(annotation.note || ""));
@@ -2414,8 +2554,48 @@ function EntityDetailPanel({
 
   const saveAnnotation = async () => {
     if (!kind) return;
+    const tagChanges = changedTagPayload();
     setSaving(true);
     try {
+      if (kind === "node" && nodeInfo) {
+        if (!Object.keys(tagChanges).length) {
+          setSaved(true);
+          return;
+        }
+        const stored = (ids: number[]) => (ids.length ? ids : null);
+        const previous = nodeInfo.units.map((item) => ({
+          name: item.name,
+          taxonomy_tag_ids: Object.fromEntries(
+            Object.keys(tagChanges).map((scheme) => [
+              scheme,
+              stored(tagIdList(item.taxonomy_tag_ids?.[scheme])),
+            ])
+          ),
+        }));
+        await execute({
+          label: "保存分类标签",
+          do: async () => {
+            await api.storageUpdateNodeTaxonomy({
+              batch: nodeInfo.batchName,
+              units: nodeInfo.units.map((item) => ({
+                name: item.name,
+                taxonomy_tag_ids: tagChanges,
+              })),
+            });
+            setSaved(true);
+            onMessage(`已保存，并应用到 ${nodeInfo.units.length} 个数据单元`);
+            await onReload();
+          },
+          undo: async () => {
+            await api.storageUpdateNodeTaxonomy({
+              batch: nodeInfo.batchName,
+              units: previous,
+            });
+            setTagOverrides({ key: "", ids: {} });
+          },
+        });
+        return;
+      }
       const csvFps = needsManualCsvFps(paramOntology, viewFile?.format || session?.format)
         ? { fps: parseCsvFps(fps) }
         : {};
@@ -2453,13 +2633,24 @@ function EntityDetailPanel({
                 ...csvFps,
               }
             : { quality, note, ...motionAnnotation, ...csvFps };
+      const annotationBody =
+        kind === "file" || kind === "upload_session" ? fileAnnotation : { note };
+      const prevTags = Object.fromEntries(
+        Object.keys(tagChanges).map((scheme) => [
+          scheme,
+          tagIdList(ownTagIds[scheme]).length ? tagIdList(ownTagIds[scheme]) : null,
+        ])
+      );
       const body = {
-        annotation:
-          kind === "file" || kind === "upload_session" ? fileAnnotation : { note },
+        annotation: annotationBody,
+        ...(Object.keys(tagChanges).length ? { taxonomy_tag_ids: tagChanges } : {}),
       };
       const target = metaTarget();
       if (!target) return;
-      const prevBody = { annotation: { ...annotation } };
+      const prevBody = {
+        annotation: { ...annotation },
+        ...(Object.keys(tagChanges).length ? { taxonomy_tag_ids: prevTags } : {}),
+      };
       await execute({
         label: kind === "upload_session" ? "保存上传参数" : "保存标注",
         do: async () => {
@@ -2478,6 +2669,7 @@ function EntityDetailPanel({
         },
         undo: async () => {
           await patchStorageMeta(target, prevBody);
+          setTagOverrides({ key: "", ids: {} });
         },
       });
     } catch (e) {
@@ -2487,18 +2679,17 @@ function EntityDetailPanel({
     }
   };
 
-  const saveTaxonomy = async (scheme: string, raw: number | "") => {
+  const saveTaxonomy = async (scheme: string, raw: number[]) => {
+    const stored = (ids: number[]) => (ids.length ? ids : null);
     try {
       if (kind === "node" && nodeInfo) {
-        const nextId = raw === "" ? null : raw;
         const shared = nodeShare[scheme];
-        const currentId = shared?.mixed || shared?.id === "" ? null : shared?.id ?? null;
-        if (!shared?.mixed && currentId === nextId) return;
+        if (!shared?.mixed && sameTagIds(shared?.ids || [], raw)) return;
         const schemeName = taxonomySchemeLabel(scheme, schemes);
         const previous = nodeInfo.units.map((item) => ({
           name: item.name,
           taxonomy_tag_ids: {
-            [scheme]: item.taxonomy_tag_ids?.[scheme] ?? null,
+            [scheme]: stored(tagIdList(item.taxonomy_tag_ids?.[scheme])),
           },
         }));
         await execute({
@@ -2508,12 +2699,10 @@ function EntityDetailPanel({
               batch: nodeInfo.batchName,
               units: nodeInfo.units.map((item) => ({
                 name: item.name,
-                taxonomy_tag_ids: { [scheme]: nextId },
+                taxonomy_tag_ids: { [scheme]: stored(raw) },
               })),
             });
-            onMessage(
-              `已批量修改 ${nodeInfo.units.length} 个单元的${schemeName}`
-            );
+            onMessage(`已批量修改 ${nodeInfo.units.length} 个单元的${schemeName}`);
             await onReload();
           },
           undo: async () => {
@@ -2526,38 +2715,47 @@ function EntityDetailPanel({
         return;
       }
       if (kind === "selection") {
-        const nextId = raw === "" ? null : raw;
-        if (nextId == null) return;
+        if (!raw.length) return;
         const schemeName = taxonomySchemeLabel(scheme, schemes);
-        const batchOf = (item: StorageUnit) =>
-          selectionBatches.find((entry) => entry.name === item.batch);
-        const missing = selectedUnits.filter(
-          (item) => !unitSchemeTagId(item, scheme, batchOf(item))
-        );
+        const missing = selectedUnits.filter((item) => {
+          const have = unitSchemeTagIds(item, scheme);
+          return raw.some((id) => !have.includes(id));
+        });
         const skipped = selectedUnits.length - missing.length;
         if (!missing.length) {
-          onMessage("所选单元都已经有该标签，未做修改");
+          onMessage("所选单元都已经有这些标签，未做修改");
           return;
         }
-        const byBatch = new Map<string, StorageUnit[]>();
-        for (const item of missing) {
-          const list = byBatch.get(item.batch) || [];
-          list.push(item);
-          byBatch.set(item.batch, list);
-        }
-        const writeSelection = async (nodeId: number | null) => {
-          const limit = 20000;
+        const planned = missing.map((item) => {
+          const have = unitSchemeTagIds(item, scheme);
+          const next = [...have];
+          raw.forEach((id) => {
+            if (!next.includes(id)) next.push(id);
+          });
+          return {
+            batch: item.batch,
+            name: item.name,
+            previous: stored(tagIdList(item.taxonomy_tag_ids?.[scheme])),
+            next,
+          };
+        });
+        const writeSelection = async (mode: "next" | "previous") => {
+          const byBatch = new Map<string, typeof planned>();
+          for (const item of planned) {
+            const list = byBatch.get(item.batch) || [];
+            list.push(item);
+            byBatch.set(item.batch, list);
+          }
           for (const [batchName, items] of byBatch) {
-            for (let offset = 0; offset < items.length; offset += limit) {
-              const slice = items.slice(offset, offset + limit);
-              await api.storageUpdateNodeTaxonomy({
-                batch: batchName,
-                units: slice.map((item) => ({
-                  name: item.name,
-                  taxonomy_tag_ids: { [scheme]: nodeId },
-                })),
-              });
-            }
+            await api.storageUpdateNodeTaxonomy({
+              batch: batchName,
+              units: items.map((item) => ({
+                name: item.name,
+                taxonomy_tag_ids: {
+                  [scheme]: mode === "next" ? item.next : item.previous,
+                },
+              })),
+            });
           }
         };
         setSaving(true);
@@ -2565,17 +2763,17 @@ function EntityDetailPanel({
           await execute({
             label: `补标注${schemeName}`,
             do: async () => {
-              await writeSelection(nextId);
+              await writeSelection("next");
               onMessage(
                 skipped
-                  ? `已为 ${missing.length} 个单元补上${schemeName}，${skipped} 个已有标签的单元未修改`
+                  ? `已为 ${missing.length} 个单元补上${schemeName}，${skipped} 个已有这些标签的单元未修改`
                   : `已为 ${missing.length} 个单元补上${schemeName}`
               );
               await onReload();
-              setSelectionDrafts((current) => ({ ...current, [scheme]: "" }));
+              setSelectionDrafts((current) => ({ ...current, [scheme]: [] }));
             },
             undo: async () => {
-              await writeSelection(null);
+              await writeSelection("previous");
             },
           });
         } finally {
@@ -2585,14 +2783,13 @@ function EntityDetailPanel({
       }
       const target = metaTarget();
       if (!target) return;
-      const nextId = raw === "" ? null : raw;
-      const prevId = ownTagIds[scheme] ?? null;
-      if (nextId === prevId) return;
+      const prevIds = tagIdList(ownTagIds[scheme]);
+      if (sameTagIds(raw, prevIds)) return;
       const schemeName = taxonomySchemeLabel(scheme, schemes);
       await execute({
         label: `更新${schemeName}分类`,
         do: async () => {
-          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: nextId } });
+          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: stored(raw) } });
           onMessage(
             kind === "batch"
               ? "分类标签已更新，已同步到该批次下的数据单元和文件"
@@ -2605,7 +2802,7 @@ function EntityDetailPanel({
           await onReload();
         },
         undo: async () => {
-          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: prevId } });
+          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: stored(prevIds) } });
         },
       });
     } catch (e) {
@@ -2732,128 +2929,102 @@ function EntityDetailPanel({
           <h4>标签</h4>
           {kind === "node" && nodeInfo && canEdit && (
             <p className="muted">
-              修改后应用到该节点下所有 {nodeInfo.units.length} 个数据单元
+              这里的标签会写到该节点下 {nodeInfo.units.length} 个数据单元上，每个单元各自保存
+            </p>
+          )}
+          {kind === "batch" && batch && canEdit && (
+            <p className="muted">
+              这里的标签会写到该批次下 {batch.unit_count} 个数据单元上，每个单元各自保存
             </p>
           )}
           {kind === "selection" && canEdit && (
-            <p className="muted">
-              只给还没有该标签的单元补上，已经有标签的不会修改
-            </p>
+            <p className="muted">勾选后补到还没有这些标签的单元上，已有的标签会保留</p>
           )}
-          {visibleSchemes.map((scheme) => {
-            if (kind === "selection") {
-              const batchOf = (item: StorageUnit) =>
-                selectionBatches.find((entry) => entry.name === item.batch);
-              const filled = selectedUnits.filter((item) =>
-                unitSchemeTagId(item, scheme.key, batchOf(item))
-              ).length;
-              const empty = selectedUnits.length - filled;
-              if (!canEdit) {
-                return (
-                  <DetailRow
-                    key={scheme.key}
-                    label={taxonomySchemeLabel(scheme.key, schemes)}
-                    value={
-                      empty
-                        ? `${filled} 个已标注，${empty} 个未标注`
-                        : `${filled} 个已标注`
-                    }
-                  />
-                );
-              }
-              const draft = selectionDrafts[scheme.key] ?? "";
-              return (
-                <div key={scheme.key} className="storage-selection-scheme">
-                  <label>
-                    {taxonomySchemeLabel(scheme.key, schemes)}
-                    <TaxonomySelect
-                      scheme={scheme.key}
-                      nodes={nodes.filter((item) => item.scheme === scheme.key)}
-                      value={draft}
-                      disabled={saving}
-                      canCreate={canCreate}
-                      onNodesReload={onNodesReload}
-                      onChange={(id) =>
-                        setSelectionDrafts((current) => ({ ...current, [scheme.key]: id }))
-                      }
-                    />
-                  </label>
-                  <span className="muted">
-                    {empty
-                      ? `已有标签 ${filled} 个，确认后只标注其余 ${empty} 个`
-                      : `所选 ${filled} 个单元都已有该标签`}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={saving || draft === "" || empty === 0}
-                    onClick={() => void saveTaxonomy(scheme.key, draft)}
-                  >
-                    {saving ? "保存中…" : "补上标签"}
-                  </button>
-                </div>
-              );
-            }
-            if (kind === "node") {
-              const share = nodeShare[scheme.key];
-              const found = share?.id
-                ? nodes.find((item) => item.id === share.id)
-                : null;
-              if (!canEdit) {
-                return (
-                  <DetailRow
-                    key={scheme.key}
-                    label={taxonomySchemeLabel(scheme.key, schemes)}
-                    value={share?.mixed ? "多个取值" : found?.path || "未分类"}
-                  />
-                );
-              }
-              return (
-                <label key={scheme.key}>
-                  {taxonomySchemeLabel(scheme.key, schemes)}
-                  <TaxonomySelect
-                    scheme={scheme.key}
-                    nodes={nodes.filter((item) => item.scheme === scheme.key)}
-                    value={share?.id ?? ""}
-                    canCreate={canCreate}
-                    onNodesReload={onNodesReload}
-                    onChange={(id) => void saveTaxonomy(scheme.key, id)}
-                  />
-                  {share?.mixed ? (
-                    <small className="muted">节点内取值不一致，选择后将统一设置</small>
-                  ) : null}
-                </label>
-              );
-            }
-            const inherited = parentTags[scheme.key]?.path;
-            if (canEdit) {
-              return (
-                <label key={scheme.key}>
-                  {taxonomySchemeLabel(scheme.key, schemes)}
-                  <TaxonomySelect
-                    scheme={scheme.key}
-                    nodes={nodes.filter((node) => node.scheme === scheme.key)}
-                    value={tagIds[scheme.key] ?? ""}
-                    canCreate={canCreate}
-                    onNodesReload={onNodesReload}
-                    onChange={(id) => void saveTaxonomy(scheme.key, id)}
-                  />
-                  {!tagIds[scheme.key] && inherited ? (
-                    <small className="muted">上级：{inherited}</small>
-                  ) : null}
-                </label>
-              );
-            }
-            return (
-              <DetailRow
-                key={scheme.key}
-                label={taxonomySchemeLabel(scheme.key, schemes)}
-                value={
-                  tags[scheme.key]?.path ||
-                  (inherited ? `上级：${inherited}` : "未分类")
+          {kind === "selection" && canEdit ? (
+            <>
+              <TaxonomyTagPicker
+                schemes={visibleSchemes}
+                nodes={nodes}
+                value={selectionDrafts}
+                disabled={saving}
+                canCreate={canCreate}
+                onNodesReload={onNodesReload}
+                onChange={(scheme, ids) =>
+                  setSelectionDrafts((current) => ({ ...current, [scheme]: ids }))
                 }
               />
-            );
-          })}
+              <button
+                type="button"
+                disabled={
+                  saving || !Object.values(selectionDrafts).some((ids) => ids.length)
+                }
+                onClick={() => {
+                  void (async () => {
+                    for (const [scheme, ids] of Object.entries(selectionDrafts)) {
+                      if (ids.length) await saveTaxonomy(scheme, ids);
+                    }
+                  })();
+                }}
+              >
+                {saving ? "保存中…" : "补上标签"}
+              </button>
+            </>
+          ) : kind === "node" && canEdit ? (
+            <>
+              <TaxonomyTagPicker
+                schemes={visibleSchemes}
+                nodes={nodes}
+                value={Object.fromEntries(
+                  visibleSchemes.map((scheme) => [scheme.key, shownTagIds(scheme.key)])
+                )}
+                canCreate={canCreate}
+                onNodesReload={onNodesReload}
+                onChange={rememberTags}
+              />
+              {visibleSchemes.some((scheme) => nodeShare[scheme.key]?.mixed) && (
+                <p className="muted">取值不一致的分类，勾选后会统一成同一组标签</p>
+              )}
+            </>
+          ) : canEdit ? (
+            <>
+              <TaxonomyTagPicker
+                schemes={visibleSchemes}
+                nodes={nodes}
+                value={Object.fromEntries(
+                  visibleSchemes.map((scheme) => [scheme.key, shownTagIds(scheme.key)])
+                )}
+                canCreate={canCreate}
+                onNodesReload={onNodesReload}
+                inherited={Object.fromEntries(
+                  visibleSchemes
+                    .filter((scheme) => !shownTagIds(scheme.key).length)
+                    .map((scheme) => [
+                      scheme.key,
+                      (parentTags[scheme.key] || []).map((item) => item.name).join("、"),
+                    ])
+                    .filter(([, text]) => text)
+                )}
+                onChange={rememberTags}
+              />
+            </>
+          ) : (
+            visibleSchemes.map((scheme) => {
+              const own = (resolvedTags[scheme.key] || []).map((item) => item.path).join("、");
+              const inherited = (parentTags[scheme.key] || []).map((item) => item.path).join("、");
+              const share = nodeShare[scheme.key];
+              return (
+                <DetailRow
+                  key={scheme.key}
+                  label={taxonomySchemeLabel(scheme.key, schemes)}
+                  value={
+                    kind === "node" && share?.mixed
+                      ? "多个取值"
+                      : own || (inherited ? `上级：${inherited}` : "未分类")
+                  }
+                />
+              );
+            })
+          )}
           {(kind === "file" || kind === "upload_session") &&
             isMotionModality(
               kind === "upload_session" ? session?.modality : viewFile?.modality
@@ -3051,19 +3222,21 @@ function EntityDetailPanel({
               value={qualityLabel(String(annotation.quality || ""))}
             />
           )}
-          {kind !== "node" && kind !== "selection" && canEdit ? (
+          {kind !== "selection" && canEdit ? (
             <>
-              <label>
-                备注
-                <textarea
-                  value={note}
-                  onChange={(e) => {
-                    setNote(e.target.value);
-                    setSaved(false);
-                  }}
-                  placeholder="记录采集说明、数据问题或补充信息"
-                />
-              </label>
+              {kind !== "node" && (
+                <label>
+                  备注
+                  <textarea
+                    value={note}
+                    onChange={(e) => {
+                      setNote(e.target.value);
+                      setSaved(false);
+                    }}
+                    placeholder="记录采集说明、数据问题或补充信息"
+                  />
+                </label>
+              )}
               <button type="button" disabled={saving} onClick={() => void saveAnnotation()}>
                 {saving ? "保存中…" : saved ? "已保存" : "保存标签"}
               </button>
@@ -3367,6 +3540,7 @@ function UnitMatrix({
   }) => void;
   showEmpty?: boolean;
 }) {
+  const preview = usePreview();
   const robotFiles = unit.files.filter((f) => f.ontology === "robot");
   const robotStyles = [
     ...new Set(
@@ -3420,11 +3594,14 @@ function UnitMatrix({
               <div className="storage-modality-row" key={key}>
                 <div
                   className={`storage-modality-name ${files.length ? "" : "missing"}`}
-                  title={files.length ? `查看${label}文件信息` : undefined}
+                  title={
+                    files.length && !preview.contrastMode ? `查看${label}文件信息` : undefined
+                  }
                   onClick={() => {
+                    if (preview.contrastMode) return;
                     if (files.length) onFile(files[files.length - 1]);
                   }}
-                  style={files.length ? { cursor: "pointer" } : undefined}
+                  style={files.length && !preview.contrastMode ? { cursor: "pointer" } : undefined}
                 >
                   {label}
                 </div>
@@ -3457,7 +3634,7 @@ function UnitMatrix({
                     }
                     onClick={() => {
                       const last = files[files.length - 1];
-                      if (last && selectedFile?.id !== last.id) {
+                      if (!preview.contrastMode && last && selectedFile?.id !== last.id) {
                         onFile(last);
                         return;
                       }
@@ -3582,16 +3759,20 @@ function nodeCovers(ancestor: TaxonomyNode, tag: TaxonomyNode) {
 
 function unitMatchesSchemeFilters(
   unit: StorageUnit,
-  batch: { taxonomy_tag_ids?: Record<string, number> } | undefined,
+  batch: { taxonomy_tag_ids?: Record<string, number | number[]> } | undefined,
   filters: Record<string, number[]>,
   nodes: TaxonomyNode[]
 ) {
   for (const [scheme, ids] of Object.entries(filters)) {
     if (!ids.length) continue;
-    const tagId = unit.taxonomy_tag_ids?.[scheme] ?? batch?.taxonomy_tag_ids?.[scheme];
-    const tag = nodes.find((node) => node.id === tagId);
-    const selected = nodes.filter((node) => ids.includes(node.id));
-    if (!tag || !selected.some((node) => nodeCovers(node, tag))) return false;
+    const schemeNodes = nodes.filter((node) => node.scheme === scheme);
+    const tagIds = specificTagIds(tagIdList(unit.taxonomy_tag_ids?.[scheme]), schemeNodes);
+    const tags = schemeNodes.filter((node) => tagIds.includes(node.id));
+    const selectedIds = specificTagIds(ids, schemeNodes);
+    const selected = schemeNodes.filter((node) => selectedIds.includes(node.id));
+    if (!tags.length || !tags.some((tag) => selected.some((node) => nodeCovers(node, tag)))) {
+      return false;
+    }
   }
   return true;
 }
@@ -3669,6 +3850,18 @@ function subjectFacetNodes(instances: ModelInstance[]): FacetNode[] {
   return [branch("human", "人体"), branch("robot", "机器人")];
 }
 
+function facetLinks(
+  nodes: FacetNode[],
+  parent: string | null = null
+): { id: string; parent_id: string | null }[] {
+  const out: { id: string; parent_id: string | null }[] = [];
+  nodes.forEach((node) => {
+    out.push({ id: node.id, parent_id: parent });
+    if (node.children?.length) out.push(...facetLinks(node.children, node.id));
+  });
+  return out;
+}
+
 function StringCheckTree({
   nodes,
   checked,
@@ -3679,6 +3872,9 @@ function StringCheckTree({
   onToggle: (id: string) => void;
 }) {
   const [open, setOpen] = useState<Record<string, boolean>>({});
+  const links = facetLinks(nodes);
+  const children = childrenByParent(links);
+  const picked = new Set(specificSelection(checked, links));
   const renderNode = (node: FacetNode, depth: number) => {
     const kids = node.children || [];
     const expanded = open[node.id] === true;
@@ -3700,7 +3896,11 @@ function StringCheckTree({
           ) : (
             <span className="facet-twist" />
           )}
-          <input type="checkbox" checked={checked.includes(node.id)} onChange={() => onToggle(node.id)} />
+          <input
+            type="checkbox"
+            checked={selectionCovers(node.id, picked, children)}
+            onChange={() => onToggle(node.id)}
+          />
           <span>{node.name}</span>
         </label>
         {kids.length > 0 && expanded && kids.map((child) => renderNode(child, depth + 1))}
@@ -3712,21 +3912,26 @@ function StringCheckTree({
 }
 
 function facetNameSummary(ids: string[], nodes: FacetNode[]) {
-  const names: string[] = [];
-  const walk = (list: FacetNode[]) => {
-    list.forEach((node) => {
-      if (ids.includes(node.id)) names.push(node.name);
-      if (node.children) walk(node.children);
-    });
-  };
-  walk(nodes);
+  const names = specificSelection(ids, facetLinks(nodes))
+    .map((id) => {
+      const walk = (list: FacetNode[]): string | undefined => {
+        for (const node of list) {
+          if (node.id === id) return node.name;
+          const nested = node.children ? walk(node.children) : undefined;
+          if (nested) return nested;
+        }
+        return undefined;
+      };
+      return walk(nodes);
+    })
+    .filter((name): name is string => !!name);
   if (!names.length) return "";
   if (names.length === 1) return names[0];
   return `${names[0]} +${names.length - 1}`;
 }
 
 function filterSummary(ids: number[], nodes: TaxonomyNode[]) {
-  const names = ids
+  const names = specificTagIds(ids, nodes)
     .map((id) => nodes.find((node) => node.id === id)?.name)
     .filter((name): name is string => !!name);
   if (!names.length) return "";
@@ -3744,12 +3949,8 @@ function FilterCheckTree({
   onToggle: (id: number) => void;
 }) {
   const [open, setOpen] = useState<Record<number, boolean>>({});
-  const children = new Map<number | null, TaxonomyNode[]>();
-  nodes.forEach((node) => {
-    const list = children.get(node.parent_id) || [];
-    list.push(node);
-    children.set(node.parent_id, list);
-  });
+  const children = childrenByParent(nodes);
+  const picked = new Set(specificTagIds(checked, nodes));
   children.forEach((list) =>
     list.sort((a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name, "zh"))
   );
@@ -3779,7 +3980,7 @@ function FilterCheckTree({
           )}
           <input
             type="checkbox"
-            checked={checked.includes(node.id)}
+            checked={selectionCovers(node.id, picked, children)}
             onChange={() => onToggle(node.id)}
           />
           <span>{node.name}</span>
@@ -3855,12 +4056,61 @@ function compareByStorageSort<T>(
   return primary || nameCmp;
 }
 
+function omitStorageRecords(
+  overview: StorageOverview,
+  removedPaths: Set<string>,
+  removedBatches: Set<string>
+): StorageOverview {
+  const trimUnit = (unit: StorageUnit): StorageUnit | null => {
+    if (removedBatches.has(unit.batch)) return null;
+    const files = unit.files.filter((file) => !removedPaths.has(file.path));
+    if (!files.length) return null;
+    if (files.length === unit.files.length) return unit;
+    return { ...unit, files, file_count: files.length };
+  };
+  const units = overview.units.flatMap((unit) => {
+    const next = trimUnit(unit);
+    return next ? [next] : [];
+  });
+  const batches = overview.batches.flatMap((batch) => {
+    if (removedBatches.has(batch.name)) return [];
+    const nextUnits = batch.units.flatMap((unit) => {
+      const next = trimUnit(unit);
+      return next ? [next] : [];
+    });
+    if (!nextUnits.length) return [];
+    return [
+      {
+        ...batch,
+        units: nextUnits,
+        unit_count: nextUnits.length,
+        file_count: nextUnits.reduce((sum, unit) => sum + unit.file_count, 0),
+      },
+    ];
+  });
+  const sessions = (overview.upload_sessions || []).flatMap((session) => {
+    const paths = session.paths.filter((path) => !removedPaths.has(path));
+    if (paths.length === session.paths.length) return [session];
+    if (!paths.length) return [];
+    return [{ ...session, paths, file_count: paths.length }];
+  });
+  return {
+    ...overview,
+    batches,
+    units,
+    files: overview.files.filter(
+      (file) => !removedPaths.has(file.path) && !removedBatches.has(file.batch)
+    ),
+    upload_sessions: sessions,
+  };
+}
+
 export function StorageWorkspace({
   variant = "browse",
 }: {
   variant?: WorkspaceVariant;
 }) {
-  const { user, hasPerm } = useAuth();
+  const { user, hasPerm, isAdmin } = useAuth();
   const { execute } = useUndo();
   const [data, setData] = useState<StorageOverview | null>(null);
   const [classificationUnits, setClassificationUnits] = useState<StorageUnit[]>([]);
@@ -3906,6 +4156,12 @@ export function StorageWorkspace({
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [focus, setFocus] = useState<{ kind: DetailKind; key: string } | null>(null);
   const preview = usePreview();
+  const selectedKeyRef = useRef(selectedKey);
+  const focusRef = useRef(focus);
+  const playingRef = useRef(preview.activeFile);
+  selectedKeyRef.current = selectedKey;
+  focusRef.current = focus;
+  playingRef.current = preview.activeFile;
   const [quickPreset, setQuickPreset] = useState<{
     ontology: string;
     modality: string;
@@ -3923,7 +4179,7 @@ export function StorageWorkspace({
   const pendingSelectBatch = useRef<string | null>(null);
   const pendingSelectSession = useRef<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [uploadTagIds, setUploadTagIds] = useState<Record<string, number | "">>({});
+  const [uploadTagIds, setUploadTagIds] = useState<Record<string, number[]>>({});
 
   const hasAnnotationPermission = hasPerm("annotate");
   const canUpload =
@@ -3953,7 +4209,7 @@ export function StorageWorkspace({
         tag_exact:
           mode === "folder" || mode === "uploader" || !tagExact ? undefined : 1,
         uploader_id: variant === "upload" ? user?.id : undefined,
-        include_empty: variant === "manage" ? 1 : undefined,
+        include_empty: variant === "manage" || hasPerm("manage_data") ? 1 : undefined,
       }, force);
       if (requestId !== loadSequence.current) return;
       setData(overview);
@@ -3984,10 +4240,41 @@ export function StorageWorkspace({
         setFocus({ kind: "unit", key: importedBatch.units[0].key });
       } else if (pendingBatchName) {
         setFocus({ kind: "batch", key: pendingBatchName });
-      } else if (!keepSelection || !overview.units.some((u) => u.key === selectedKey)) {
-        const first = overview.units[0];
-        setSelectedKey(first?.key || null);
-        setFocus(first ? { kind: "unit", key: first.key } : null);
+      } else {
+        const currentKey = selectedKeyRef.current;
+        const currentFocus = focusRef.current;
+        const playing = playingRef.current;
+        const unitStillThere = !!currentKey && overview.units.some((u) => u.key === currentKey);
+        const followPlaying = () => {
+          if (!playing) return false;
+          setSelectedKey(`${playing.batch}::${playing.unit_name}`);
+          setFocus({ kind: "file", key: playing.path });
+          return true;
+        };
+        const selectFirstUnit = () => {
+          const first = overview.units[0];
+          setSelectedKey(first?.key || null);
+          setFocus(first ? { kind: "unit", key: first.key } : null);
+        };
+        if (keepSelection && unitStillThere) {
+          // 索引刷新时保留当前详情。load 闭包里的 selectedKey 经常是过期的空值。
+        } else if (keepSelection && currentFocus && currentFocus.kind !== "unit") {
+          const focusAlive =
+            currentFocus.kind === "batch"
+              ? overview.batches.some((batch) => batch.name === currentFocus.key)
+              : currentFocus.kind === "upload_session"
+                ? (overview.upload_sessions || []).some((item) => item.id === currentFocus.key)
+                : currentFocus.kind === "file"
+                  ? overview.units.some((unit) => unit.files.some((file) => file.path === currentFocus.key)) ||
+                    overview.files.some((file) => file.path === currentFocus.key) ||
+                    playing?.path === currentFocus.key
+                  : true;
+          if (!focusAlive && !followPlaying()) selectFirstUnit();
+        } else if (keepSelection && followPlaying()) {
+          // 页面重新进入时，预览还在播上一个文件，详情跟播放内容走，而不是列表第一项。
+        } else if (!keepSelection || !unitStillThere) {
+          selectFirstUnit();
+        }
       }
     } catch (e) {
       if (requestId !== loadSequence.current) return;
@@ -4070,6 +4357,7 @@ export function StorageWorkspace({
         taxonomy_tags: {},
         annotation: {},
       }));
+    const storedUnitCount = new Map(data.batches.map((batch) => [batch.name, batch.unit_count]));
     const batches = [...data.batches, ...placeholderBatches]
       .map((batch) => {
         const units = batch.units
@@ -4086,7 +4374,12 @@ export function StorageWorkspace({
           file_count: units.reduce((sum, unit) => sum + unit.file_count, 0),
         };
       })
-      .filter((batch) => batch.units.length > 0 || extraBatches.includes(batch.name))
+      .filter(
+        (batch) =>
+          batch.units.length > 0 ||
+          extraBatches.includes(batch.name) ||
+          (storedUnitCount.get(batch.name) ?? 0) === 0
+      )
       .sort((a, b) =>
         compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes)
       );
@@ -4149,6 +4442,18 @@ export function StorageWorkspace({
     if (preview.activeFile) lastVisualizedRef.current = preview.activeFile;
   }, [preview.activeFile]);
 
+  const selectUnit = (unit: StorageUnit) => {
+    setSelectedKey(unit.key);
+    if (preview.contrastMode) {
+      setFocus({ kind: "unit", key: unit.key });
+      return;
+    }
+    previewUnitFile(unit, false);
+    if (!pickPreviewFile(unit.files, lastVisualizedRef.current)) {
+      setFocus({ kind: "unit", key: unit.key });
+    }
+  };
+
   const previewUnitFile = (unit: StorageUnit, keepFocus: boolean) => {
     const file = pickPreviewFile(unit.files, lastVisualizedRef.current);
     if (!file) return;
@@ -4172,12 +4477,16 @@ export function StorageWorkspace({
   const unitsForTaxonomyNode = (id: number, exact: boolean) => {
     const node = nodes.find((item) => item.id === id);
     if (!node) return [];
-    return classificationUnits.filter((unit) => {
-      const taggedId = unit.taxonomy_tag_ids?.[node.scheme];
-      if (exact) return taggedId === node.id;
-      const tagged = nodes.find((item) => item.id === taggedId);
-      return !!tagged && tagged.path.startsWith(node.path);
-    });
+    const schemeNodes = nodes.filter((item) => item.scheme === node.scheme);
+    return classificationUnits.filter((unit) =>
+      specificTagIds(tagIdList(unit.taxonomy_tag_ids?.[node.scheme]), schemeNodes).some(
+        (taggedId) => {
+          if (exact) return taggedId === node.id;
+          const tagged = nodes.find((item) => item.id === taggedId);
+          return !!tagged && tagged.path.startsWith(node.path);
+        }
+      )
+    );
   };
 
   const ownsSelected = !!(user && selected && unitOwnedBy(selected, user.id));
@@ -4322,6 +4631,38 @@ export function StorageWorkspace({
     }
   };
 
+  const handlePrioritize = async (units: StorageUnit[]) => {
+    const unique = uniqueUnits(units);
+    if (!unique.length) {
+      setError("没有可优先的数据单元");
+      return;
+    }
+    const byBatch = new Map<string, StorageUnit[]>();
+    for (const unit of unique) {
+      const list = byBatch.get(unit.batch) || [];
+      list.push(unit);
+      byBatch.set(unit.batch, list);
+    }
+    const items = [...byBatch.entries()].map(([batch, picked]) => {
+      const all = displayData?.batches.find((item) => item.name === batch);
+      if (all && picked.length >= all.units.length) return { batch, units: [] as string[] };
+      return { batch, units: picked.map((unit) => unit.name) };
+    });
+    try {
+      await api.pinRetarget(items);
+      const label =
+        items.length === 1 && items[0].units.length === 0
+          ? `批次「${items[0].batch}」`
+          : unique.length === 1
+            ? `「${unique[0].name}」`
+            : `${unique.length} 个数据单元`;
+      setMessage(`已把${label}设为重定向最高优先级。当前这一波结束后会先做。`);
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "设置优先级失败");
+    }
+  };
+
   const handleRenameFile = async (file: StorageFile) => {
     const next = promptName("新的文件名（扩展名会保留）", file.name);
     if (!next || next === file.name) return;
@@ -4361,25 +4702,41 @@ export function StorageWorkspace({
     ];
     if (!labels.length) return;
     if (!window.confirm(`确认删除以下 ${labels.length} 项？\n${labels.join("\n")}`)) return;
+    const removedPaths = new Set<string>([
+      ...batches.flatMap((item) =>
+        item.units.flatMap((unit) => unit.files.map((file) => file.path))
+      ),
+      ...leftover.flatMap((unit) => unit.files.map((file) => file.path)),
+    ]);
+    const removedBatches = new Set(batches.map((item) => item.name));
+    const removedUnitKeys = new Set(leftover.map((unit) => unit.key));
+    loadSequence.current += 1;
+    setData((current) =>
+      current ? omitStorageRecords(current, removedPaths, removedBatches) : current
+    );
+    setClassificationUnits((list) =>
+      list.flatMap((unit) => {
+        if (removedBatches.has(unit.batch) || removedUnitKeys.has(unit.key)) return [];
+        const files = unit.files.filter((file) => !removedPaths.has(file.path));
+        if (!files.length) return [];
+        return files.length === unit.files.length
+          ? [unit]
+          : [{ ...unit, files, file_count: files.length }];
+      })
+    );
+    setFocus(null);
+    setSelectedKey(null);
+    preview.removeByPaths([...removedPaths]);
     try {
       await api.storageBulkDelete({
         batches: batches.map((item) => item.name),
         units: leftover.map((unit) => ({ batch: unit.batch, name: unit.name })),
       });
       setMessage("已删除所选项目");
-      setFocus(null);
-      setSelectedKey(null);
-      preview.removeByPaths(
-        [
-          ...batches.flatMap((item) =>
-            item.units.flatMap((unit) => unit.files.map((file) => file.path))
-          ),
-          ...leftover.flatMap((unit) => unit.files.map((file) => file.path)),
-        ]
-      );
-      await load();
+      void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
+      void load();
     }
   };
 
@@ -4400,20 +4757,35 @@ export function StorageWorkspace({
         ? `确认删除这次上传的 ${session.file_count} 个文件？\n${formatSessionTime(session.created_at)} · ${session.batch || "未分批次"}\n不会删除同批次其它上传。`
         : `确认删除这次上传中的 ${targets.length} 个文件？\n不会删除同单元其它上传留下的文件。`);
     if (!window.confirm(text)) return;
+    const removedPaths = new Set(targets);
+    loadSequence.current += 1;
+    setData((current) =>
+      current ? omitStorageRecords(current, removedPaths, new Set()) : current
+    );
+    setClassificationUnits((list) =>
+      list.flatMap((unit) => {
+        const files = unit.files.filter((file) => !removedPaths.has(file.path));
+        if (!files.length) return [];
+        return files.length === unit.files.length
+          ? [unit]
+          : [{ ...unit, files, file_count: files.length }];
+      })
+    );
+    if (whole) {
+      if (activeSessionId === session.id) setActiveSessionId(null);
+      if (focus?.kind === "upload_session" && focus.key === session.id) {
+        setFocus(null);
+      }
+      setSelectedKey(null);
+    }
+    preview.removeByPaths(targets);
     try {
       await api.storageDeleteUploadSession(session.id, whole ? undefined : paths);
       setMessage(whole ? "已删除这次上传的文件" : `已删除 ${targets.length} 个文件`);
-      if (whole) {
-        if (activeSessionId === session.id) setActiveSessionId(null);
-        if (focus?.kind === "upload_session" && focus.key === session.id) {
-          setFocus(null);
-        }
-        setSelectedKey(null);
-      }
-      preview.removeByPaths(targets);
-      await load();
+      void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
+      void load();
     }
   };
 
@@ -4581,9 +4953,7 @@ export function StorageWorkspace({
                           onToggle={(id) =>
                             setExtraChecks((current) => {
                               const list = current[facet.key] || [];
-                              const next = list.includes(id)
-                                ? list.filter((item) => item !== id)
-                                : [...list, id];
+                              const next = selectionAfterCheck(id, facetLinks(facet.nodes), list);
                               return { ...current, [facet.key]: next };
                             })
                           }
@@ -4619,9 +4989,8 @@ export function StorageWorkspace({
                         onToggle={(id) =>
                           setFilterNodeIds((current) => {
                             const list = current[scheme.key] || [];
-                            const next = list.includes(id)
-                              ? list.filter((item) => item !== id)
-                              : [...list, id];
+                            const schemeNodes = nodes.filter((node) => node.scheme === scheme.key);
+                            const next = selectionAfterCheck(id, schemeNodes, list);
                             return { ...current, [scheme.key]: next };
                           })
                         }
@@ -4769,15 +5138,13 @@ export function StorageWorkspace({
                 selectedKey={selectedKey}
                 onSelect={(id, exact) => {
                   selectTag(id, exact);
-                  if (id != null) previewRandomUnit(unitsForTaxonomyNode(id, !!exact), false);
+                  if (!preview.contrastMode && id != null) {
+                    previewRandomUnit(unitsForTaxonomyNode(id, !!exact), false);
+                  }
                 }}
                 onUnitSelect={(unit) => {
-                  setSelectedKey(unit.key);
                   setActiveSessionId(null);
-                  previewUnitFile(unit, false);
-                  if (!pickPreviewFile(unit.files, lastVisualizedRef.current)) {
-                    setFocus({ kind: "unit", key: unit.key });
-                  }
+                  selectUnit(unit);
                 }}
                 canDownload={canDownloadItems}
                 currentUserId={user?.id}
@@ -4797,11 +5164,7 @@ export function StorageWorkspace({
                 selectedKey={selectedKey}
                 onSelect={setTagId}
                 onUnitSelect={(unit) => {
-                  setSelectedKey(unit.key);
-                  previewUnitFile(unit, false);
-                  if (!unit.files.some((file) => isVisualizableStorageFile(file))) {
-                    setFocus({ kind: "unit", key: unit.key });
-                  }
+                  selectUnit(unit);
                 }}
                 canDownload={canDownloadItems}
                 currentUserId={user?.id}
@@ -4854,11 +5217,7 @@ export function StorageWorkspace({
               }}
               onSelectUnit={(session, unit) => {
                 setActiveSessionId(session.id);
-                setSelectedKey(unit.key);
-                previewUnitFile(unit, false);
-                if (!unit.files.some((file) => isVisualizableStorageFile(file))) {
-                  setFocus({ kind: "unit", key: unit.key });
-                }
+                selectUnit(unit);
               }}
               onDeleteSession={(session) => void handleDeleteUploadSession(session)}
               onDeleteSessionUnit={(session, unit) => {
@@ -4874,21 +5233,19 @@ export function StorageWorkspace({
           )}
           {mode === "folder" && (
             <UnitTree
+              ready={!!displayData}
               data={displayData || { updated_at: "", modalities: [], ontologies: [], uploaders: [], batches: [], units: [], files: [] }}
               selectedUnit={focus?.kind === "unit" || focus?.kind === "file" ? selectedKey : null}
               selectedNodeKey={focus?.kind === "node" ? focus.key : null}
               onSelectUnit={(unit) => {
                 setActiveSessionId(null);
-                setSelectedKey(unit.key);
-                previewUnitFile(unit, false);
-                if (!unit.files.some((file) => isVisualizableStorageFile(file))) {
-                  setFocus({ kind: "unit", key: unit.key });
-                }
+                selectUnit(unit);
               }}
               onSelectNode={(key) => {
                 setActiveSessionId(null);
                 setSelectedKey(null);
                 setFocus({ kind: "node", key });
+                if (preview.contrastMode) return;
                 const splitAt = key.indexOf("::");
                 const batchName = splitAt >= 0 ? key.slice(0, splitAt) : key;
                 const dirPath = splitAt >= 0 ? key.slice(splitAt + 2) : "";
@@ -4897,11 +5254,13 @@ export function StorageWorkspace({
               }}
               canEdit={canManageItems}
               canDownload={canDownloadItems}
+              canPrioritize={variant === "manage" && isAdmin}
               currentUserId={user?.id}
               onRenameBatch={(batch) => void handleRenameBatch(batch)}
               onRenameUnit={(unit) => void handleRenameUnit(unit)}
               onDelete={(batches, units) => void handleDeleteItems(batches, units)}
               onDownload={(batches, units) => void handleDownloadItems(batches, units)}
+              onPrioritize={(units) => void handlePrioritize(units)}
               onSelectionChange={reportPickedUnits}
             />
           )}
@@ -5046,6 +5405,24 @@ export function StorageWorkspace({
                       className="danger"
                       onClick={async () => {
                         if (!confirm(`确认删除 ${selectedFile.name}？`)) return;
+                        const removedPaths = new Set([selectedFile.path]);
+                        loadSequence.current += 1;
+                        setData((current) =>
+                          current ? omitStorageRecords(current, removedPaths, new Set()) : current
+                        );
+                        setClassificationUnits((list) =>
+                          list.flatMap((unit) => {
+                            const files = unit.files.filter((file) => file.path !== selectedFile.path);
+                            if (!files.length) return [];
+                            return files.length === unit.files.length
+                              ? [unit]
+                              : [{ ...unit, files, file_count: files.length }];
+                          })
+                        );
+                        if (focus?.kind === "file" && focus.key === selectedFile.path) {
+                          setFocus(null);
+                        }
+                        preview.removeByPaths([selectedFile.path]);
                         try {
                           if (
                             focusedSession &&
@@ -5057,10 +5434,10 @@ export function StorageWorkspace({
                           } else {
                             await api.storageDeleteFile(selectedFile.path);
                           }
-                          preview.removeByPaths([selectedFile.path]);
-                          await load();
+                          void load();
                         } catch (e) {
                           setError(e instanceof Error ? e.message : "删除失败");
+                          void load();
                         }
                       }}
                     >

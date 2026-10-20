@@ -5,7 +5,7 @@ import * as THREE from "three";
 import URDFLoader from "urdf-loader";
 import { api, fetchJsonAuth } from "../api";
 import { BvhScene, FbxScene } from "./AnimationFormatPreview";
-import { useViewerLook, ViewerSceneChrome } from "./ViewerSceneChrome";
+import { FrameFigure, useViewerLook, ViewerSceneChrome } from "./ViewerSceneChrome";
 import {
   cycleUpAxisMode,
   detectUpAxisFromJointFrames,
@@ -196,6 +196,7 @@ function SceneContent({
   onMediaDuration,
   onDetectedUpAxis,
   onDetectedLengthUnit,
+  viewNonce,
 }: {
   humanFile: HumanFile | null;
   humanPreview: HumanPreview | null;
@@ -209,6 +210,7 @@ function SceneContent({
   onMediaDuration?: (sec: number) => void;
   onDetectedUpAxis?: (up: UpAxis) => void;
   onDetectedLengthUnit?: (unit: LengthUnit) => void;
+  viewNonce: number;
 }) {
   const fmt = (humanFile?.format || "").toLowerCase();
   const humanIsBvh = fmt === "bvh";
@@ -221,6 +223,7 @@ function SceneContent({
   // 仅人体时居中；人机同屏时左右分列
   const humanX = showHuman && showRobot ? -1.2 : 0;
   const robotX = showHuman && showRobot ? 1.2 : 0;
+  const sceneRef = useRef<THREE.Group>(null);
 
   useEffect(() => {
     if (humanIsBvh || humanIsFbx) return;
@@ -239,6 +242,7 @@ function SceneContent({
   return (
     <>
       <ViewerSceneChrome />
+      <group ref={sceneRef}>
       <group position={[humanX, 0, 0]}>
         {humanIsBvh && humanFile && (
           <BvhScene
@@ -302,6 +306,13 @@ function SceneContent({
           </group>
         )}
       </group>
+      </group>
+      <FrameFigure
+        objectRef={sceneRef}
+        ready={viewNonce > 0 && (showHuman || showRobot)}
+        resetKey={`motion:${viewNonce}`}
+        nonce={viewNonce}
+      />
       <OrbitControls makeDefault />
     </>
   );
@@ -347,6 +358,7 @@ export function MotionViewer({
   const [unitMode, setUnitMode] = useLengthUnitMode();
   const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
+  const [viewNonce, setViewNonce] = useState(0);
 
   const lockedHuman = humanFileId != null;
   const lockedRobotSelect = robotFileId != null;
@@ -558,6 +570,7 @@ export function MotionViewer({
             onMediaDuration={setMediaDuration}
             onDetectedUpAxis={setDetectedUp}
             onDetectedLengthUnit={setDetectedUnit}
+            viewNonce={viewNonce}
           />
         </Canvas>
       </div>
@@ -616,6 +629,14 @@ export function MotionViewer({
           <option value={1.5}>1.5×</option>
           <option value={2}>2×</option>
         </select>
+        <button
+          type="button"
+          className="follow-root-toggle secondary"
+          title="重新把角色对准到画面中央"
+          onClick={() => setViewNonce((n) => n + 1)}
+        >
+          复位视角
+        </button>
         <button
           type="button"
           className="follow-root-toggle secondary"

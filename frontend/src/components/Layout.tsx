@@ -22,12 +22,13 @@ const PAGES: Record<string, { title: string; subtitle: string }> = {
   "/?mode=annotate": { title: "标注", subtitle: "为范围内的数据补充标签与评价" },
   "/?mode=manage": { title: "数据管理", subtitle: "整理批次、单元，并处理过期文件" },
   "/taxonomies": { title: "分类管理", subtitle: "维护项目、地点等分类标准" },
+  "/retarget": { title: "重定向管理", subtitle: "查看自动重定向的进度和优先级" },
   "/robots": { title: "3D 模型", subtitle: "管理人体与机器人的描述和网格" },
   "/users": { title: "用户与权限", subtitle: "开账号、配范围，并进入对方视角验收" },
 };
 
 export function Layout() {
-  const { user, logout, hasPerm, impersonating, impersonate, stopImpersonate } = useAuth();
+  const { user, logout, hasPerm, isAdmin, impersonating, impersonate, stopImpersonate } = useAuth();
   const nav = useNavigate();
   const location = useLocation();
   const [targets, setTargets] = useState<User[]>([]);
@@ -68,7 +69,9 @@ export function Layout() {
             ? "管理数据"
             : page.title === "分类管理"
               ? "管理分类"
-              : page.title === "3D 模型"
+              : page.title === "重定向管理"
+                ? "查看重定向"
+                : page.title === "3D 模型"
                 ? "查看模型"
                 : page.title === "用户与权限"
                   ? "管理用户"
@@ -235,6 +238,11 @@ export function Layout() {
             {hasPerm("manage_data") && (
               <SideLink to="/taxonomies" icon={<IconTaxonomy />} onClick={() => setNavOpen(false)}>
                 分类管理
+              </SideLink>
+            )}
+            {isAdmin && (
+              <SideLink to="/retarget" icon={<IconRetarget />} onClick={() => setNavOpen(false)}>
+                重定向管理
               </SideLink>
             )}
             <SideLink to="/robots" icon={<IconRobot />} onClick={() => setNavOpen(false)}>
@@ -416,6 +424,17 @@ function IconTaxonomy() {
       <circle cx="6" cy="18" r="2.2" />
       <circle cx="18" cy="12" r="2.2" />
       <path d="M8.2 6H12v12H8.2M12 12h3.8" />
+    </svg>
+  );
+}
+
+function IconRetarget() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M7 7h9" />
+      <path d="M13 4l4 3-4 3" />
+      <path d="M17 17H8" />
+      <path d="M11 14l-4 3 4 3" />
     </svg>
   );
 }

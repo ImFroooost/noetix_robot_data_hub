@@ -268,11 +268,45 @@ def unique_scheme_key(db: Session, base: str) -> str:
 
 
 def sync_clip_tag_columns_from_rows(clip: MotionClip) -> None:
-    """Mirror join-table tags into legacy atomic/intent/style columns."""
-    by_scheme = {row.scheme: row.node_id for row in (clip.taxonomy_tag_rows or [])}
+    """Mirror the first join-table tag of each legacy scheme into the old columns."""
+    by_scheme: dict[str, int] = {}
+    for row in clip.taxonomy_tag_rows or []:
+        by_scheme.setdefault(row.scheme, row.node_id)
     clip.atomic_tag_id = by_scheme.get(TaxonomyScheme.atomic.value)
     clip.intent_tag_id = by_scheme.get(TaxonomyScheme.intent.value)
     clip.style_tag_id = by_scheme.get(TaxonomyScheme.style.value)
+
+
+def _replace_clip_scheme_tags(
+    db: Session,
+    clip: MotionClip,
+    scheme: str,
+    node_ids: list[int],
+) -> None:
+    wanted: list[int] = []
+    seen: set[int] = set()
+    for node_id in node_ids:
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        wanted.append(node_id)
+    rows = (
+        db.query(ClipTaxonomyTag)
+        .filter(ClipTaxonomyTag.clip_id == clip.id, ClipTaxonomyTag.scheme == scheme)
+        .all()
+    )
+    by_id = {row.node_id: row for row in rows}
+    for node_id, row in by_id.items():
+        if node_id not in seen:
+            db.delete(row)
+    for node_id in wanted:
+        if node_id not in by_id:
+            db.add(ClipTaxonomyTag(clip_id=clip.id, scheme=scheme, node_id=node_id))
+    db.flush()
+    clip.taxonomy_tag_rows = (
+        db.query(ClipTaxonomyTag).filter(ClipTaxonomyTag.clip_id == clip.id).all()
+    )
+    sync_clip_tag_columns_from_rows(clip)
 
 
 def set_clip_taxonomy_tag(
@@ -281,38 +315,22 @@ def set_clip_taxonomy_tag(
     scheme: str,
     node_id: int | None,
 ) -> None:
-    existing = (
-        db.query(ClipTaxonomyTag)
-        .filter(ClipTaxonomyTag.clip_id == clip.id, ClipTaxonomyTag.scheme == scheme)
-        .first()
-    )
-    if node_id is None:
-        if existing:
-            db.delete(existing)
-    else:
-        if existing:
-            existing.node_id = node_id
-        else:
-            db.add(
-                ClipTaxonomyTag(clip_id=clip.id, scheme=scheme, node_id=node_id)
-            )
-    db.flush()
-    rows = (
-        db.query(ClipTaxonomyTag).filter(ClipTaxonomyTag.clip_id == clip.id).all()
-    )
-    by_scheme = {row.scheme: row.node_id for row in rows}
-    clip.atomic_tag_id = by_scheme.get(TaxonomyScheme.atomic.value)
-    clip.intent_tag_id = by_scheme.get(TaxonomyScheme.intent.value)
-    clip.style_tag_id = by_scheme.get(TaxonomyScheme.style.value)
+    _replace_clip_scheme_tags(db, clip, scheme, [] if node_id is None else [node_id])
 
 
 def set_clip_taxonomy_tags(
     db: Session,
     clip: MotionClip,
-    tags: dict[str, int | None],
+    tags: dict[str, int | list[int] | None],
 ) -> None:
-    for scheme, node_id in tags.items():
-        set_clip_taxonomy_tag(db, clip, scheme, node_id)
+    for scheme, raw in tags.items():
+        if raw is None:
+            ids: list[int] = []
+        elif isinstance(raw, list):
+            ids = [int(item) for item in raw if item is not None]
+        else:
+            ids = [int(raw)]
+        _replace_clip_scheme_tags(db, clip, scheme, ids)
 
 
 def backfill_clip_taxonomy_tags(db: Session) -> None:
@@ -345,17 +363,17 @@ def backfill_clip_taxonomy_tags(db: Session) -> None:
     db.flush()
 
 
-def clip_taxonomy_tag_map(db: Session, clip_id: int) -> dict[str, TaxonomyNode]:
+def clip_taxonomy_tag_map(db: Session, clip_id: int) -> dict[str, list[TaxonomyNode]]:
     rows = (
         db.query(ClipTaxonomyTag)
         .filter(ClipTaxonomyTag.clip_id == clip_id)
         .all()
     )
-    out: dict[str, TaxonomyNode] = {}
+    out: dict[str, list[TaxonomyNode]] = {}
     for row in rows:
         node = db.get(TaxonomyNode, row.node_id)
         if node:
-            out[row.scheme] = node
+            out.setdefault(row.scheme, []).append(node)
     return out
 
 

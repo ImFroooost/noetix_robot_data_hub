@@ -14,26 +14,40 @@ def scheme_str(scheme: Any) -> str:
     return scheme.value if hasattr(scheme, "value") else str(scheme)
 
 
-def repo_file_tag_id(rf: RepoFile, scheme: str) -> int | None:
-    """Read taxonomy node id for a scheme from file meta or action_def."""
+def _ids_from_value(raw: Any) -> list[int]:
+    items = raw if isinstance(raw, list) else [raw]
+    out: list[int] = []
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("id")
+        if item in (None, ""):
+            continue
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in out:
+            out.append(number)
+    return out
+
+
+def repo_file_tag_ids(rf: RepoFile, scheme: str) -> list[int]:
+    """Read taxonomy node ids for a scheme from file meta or action_def."""
     meta = rf.meta or {}
     ids = meta.get("taxonomy_tag_ids") or {}
-    raw = ids.get(scheme)
-    if raw is not None and raw != "":
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            pass
+    found = _ids_from_value(ids.get(scheme))
+    if found:
+        return found
     unit = rf.action_unit
     adef = (unit.action_def if unit else {}) or {}
     tax = adef.get("taxonomy") or {}
-    brief = tax.get(scheme)
-    if isinstance(brief, dict) and brief.get("id") is not None:
-        try:
-            return int(brief["id"])
-        except (TypeError, ValueError):
-            pass
-    return None
+    return _ids_from_value(tax.get(scheme))
+
+
+def repo_file_tag_id(rf: RepoFile, scheme: str) -> int | None:
+    """Read the first taxonomy node id for a scheme from file meta or action_def."""
+    found = repo_file_tag_ids(rf, scheme)
+    return found[0] if found else None
 
 
 def pack_exact_sets(db: Session, scheme: str) -> dict[int, set[tuple[str, str, str]]]:
@@ -45,8 +59,7 @@ def pack_exact_sets(db: Session, scheme: str) -> dict[int, set[tuple[str, str, s
     )
     out: dict[int, set[tuple[str, str, str]]] = defaultdict(set)
     for rf in rows:
-        tid = repo_file_tag_id(rf, scheme)
-        if tid is not None:
+        for tid in repo_file_tag_ids(rf, scheme):
             out[tid].add((rf.modality, rf.ontology, rf.source_name or ""))
     return out
 

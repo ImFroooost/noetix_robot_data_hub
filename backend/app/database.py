@@ -257,6 +257,18 @@ def _migrate_schema(conn):
             "UNIQUE (user_id, capability, scheme, path_prefix)",
         )
 
+    if _constraint_exists(conn, "clip_taxonomy_tags", "uq_clip_taxonomy_scheme"):
+        _exec_optional(
+            conn,
+            "ALTER TABLE clip_taxonomy_tags DROP CONSTRAINT IF EXISTS uq_clip_taxonomy_scheme",
+        )
+    if not _constraint_exists(conn, "clip_taxonomy_tags", "uq_clip_taxonomy_node"):
+        _exec_optional(
+            conn,
+            "ALTER TABLE clip_taxonomy_tags "
+            "ADD CONSTRAINT uq_clip_taxonomy_node UNIQUE (clip_id, scheme, node_id)",
+        )
+
 
 def _migrate_data(db):
     from .models import Capability, Folder, MotionClip, User, UserPermission, UserRole

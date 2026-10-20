@@ -49,8 +49,10 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
   const [contrastMode, setContrastModeState] = useState(false);
   const slotsRef = useRef(slots);
   const activeRef = useRef(activeIndex);
+  const contrastRef = useRef(contrastMode);
   slotsRef.current = slots;
   activeRef.current = activeIndex;
+  contrastRef.current = contrastMode;
 
   const restore = useCallback((nextSlots: PreviewSlot[], nextActive: number) => {
     setSlots(nextSlots);
@@ -64,42 +66,39 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
   const add = useCallback((file: StorageFile) => {
     const prevSlots = slotsRef.current;
     const prevActive = activeRef.current;
+    if (contrastRef.current) {
+      if (prevSlots[prevActive]?.id === file.id) {
+        setActiveIndex(prevActive);
+        return;
+      }
+      const nextSlots = prevSlots.map((item, index) => (index === prevActive ? file : item));
+      slotsRef.current = nextSlots;
+      activeRef.current = prevActive;
+      setSlots(nextSlots);
+      setActiveIndex(prevActive);
+      void history?.execute({
+        label: `预览 ${file.name}`,
+        refresh: false,
+        do: () => restore(nextSlots, prevActive),
+        undo: () => restore(prevSlots, prevActive),
+      });
+      return;
+    }
     const existing = prevSlots.findIndex((item) => item?.id === file.id);
     if (existing >= 0) {
       setActiveIndex(existing);
       return;
     }
-    if (!contrastMode) {
-      const nextSlots = Array.from({ length: MIN_SLOTS }, () => null);
-      nextSlots[0] = file;
-      slotsRef.current = nextSlots;
-      activeRef.current = 0;
-      setSlots(nextSlots);
-      setActiveIndex(0);
-      void history?.execute({
-        label: `预览 ${file.name}`,
-        refresh: false,
-        do: () => restore(nextSlots, 0),
-        undo: () => restore(prevSlots, prevActive),
-      });
-      return;
-    }
-    const emptyActive = prevSlots[prevActive] == null ? prevActive : -1;
-    const empty = prevSlots.findIndex((item) => item == null);
-    const target = emptyActive >= 0 ? emptyActive : empty;
-    const nextSlots =
-      target >= 0
-        ? prevSlots.map((item, index) => (index === target ? file : item))
-        : [...prevSlots, file];
-    const nextActive = target >= 0 ? target : prevSlots.length;
+    const nextSlots = Array.from({ length: MIN_SLOTS }, () => null);
+    nextSlots[0] = file;
     slotsRef.current = nextSlots;
-    activeRef.current = nextActive;
+    activeRef.current = 0;
     setSlots(nextSlots);
-    setActiveIndex(nextActive);
+    setActiveIndex(0);
     void history?.execute({
       label: `预览 ${file.name}`,
       refresh: false,
-      do: () => restore(nextSlots, nextActive),
+      do: () => restore(nextSlots, 0),
       undo: () => restore(prevSlots, prevActive),
     });
   }, [history, restore]);

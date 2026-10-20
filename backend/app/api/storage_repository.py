@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,7 @@ from ..core.deps import get_current_user
 from ..database import get_db
 from ..models import Capability, TaxonomyNode, User, UserPermission
 from ..services.audit import write_audit
+from ..services.disk_repository import tag_id_list
 from ..services.disk_repository import (
     FPV_CHANNELS,
     MODEL_KINDS,
@@ -38,7 +39,7 @@ from ..services.disk_repository import (
     probe_data_file,
     read_metadata,
     catalog_rebuild_status,
-    rebuild_catalog,
+    refresh_catalog_paths,
     start_catalog_rebuild,
     record_upload_session,
     resolve_import_zip,
@@ -63,10 +64,11 @@ from ..services.disk_repository import (
 )
 from ..models.enums import is_super_role
 from ..services.human_zip import (
-    extract_and_group_zip,
+    extract_zip_files,
     folder_name_from_zip_filename,
     human_format_from_filename,
 )
+from ..services.motion_units import plan_clip_units, plan_followed_paths
 from ..services.permissions import (
     FACET_SCHEMES,
     capability_query_values,
@@ -83,11 +85,11 @@ router = APIRouter(prefix="/storage", tags=["storage-repository"])
 
 class BatchCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=256)
-    taxonomy_tag_ids: dict[str, int | None] | None = None
+    taxonomy_tag_ids: dict[str, int | list[int] | None] | None = None
 
 
 class UnitMetadataIn(BaseModel):
-    taxonomy_tag_ids: dict[str, int | None] | None = None
+    taxonomy_tag_ids: dict[str, int | list[int] | None] | None = None
     annotation: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
 
@@ -107,7 +109,7 @@ class RenameIn(BaseModel):
 
 class UploadSessionIn(BaseModel):
     annotation: dict[str, Any] | None = None
-    taxonomy_tag_ids: dict[str, int | None] | None = None
+    taxonomy_tag_ids: dict[str, int | list[int] | None] | None = None
     paths: list[str] | None = None
 
 
@@ -117,7 +119,7 @@ class UploadSessionDeleteIn(BaseModel):
 
 class UnitTaxonomyPatch(BaseModel):
     name: str = Field(min_length=1, max_length=1024)
-    taxonomy_tag_ids: dict[str, int | None]
+    taxonomy_tag_ids: dict[str, int | list[int] | None]
 
 
 class NodeTaxonomyIn(BaseModel):
@@ -160,7 +162,7 @@ def _parse_annotation_form(raw: str) -> dict[str, Any]:
     }
 
 
-def _parse_taxonomy_form(raw: str) -> dict[str, int | None] | None:
+def _parse_taxonomy_form(raw: str) -> dict[str, list[int] | None] | None:
     text = (raw or "").strip()
     if not text:
         return None
@@ -170,16 +172,16 @@ def _parse_taxonomy_form(raw: str) -> dict[str, int | None] | None:
         raise HTTPException(status_code=400, detail="分类标签无效") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="分类标签须为对象")
-    parsed: dict[str, int | None] = {}
+    parsed: dict[str, list[int] | None] = {}
     for scheme, value in payload.items():
-        if value in (None, ""):
+        if value is None:
+            parsed[str(scheme)] = None
             continue
-        try:
-            parsed[str(scheme)] = int(value)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=400, detail=f"分类标签 {scheme} 无效"
-            ) from exc
+        ids = tag_id_list(value)
+        if not ids and value not in ("", []):
+            raise HTTPException(status_code=400, detail=f"分类标签 {scheme} 无效")
+        if ids:
+            parsed[str(scheme)] = ids
     return parsed or None
 
 
@@ -269,11 +271,10 @@ def _unit_allowed_scoped(
                 return True
             continue
         raw_id = (unit.get("taxonomy_tag_ids") or {}).get(scheme)
-        if raw_id is None:
-            continue
-        node = db.get(TaxonomyNode, int(raw_id))
-        if node and path_matches(node.path, permission.path_prefix, permission.recursive):
-            return True
+        for item in tag_id_list(raw_id):
+            node = db.get(TaxonomyNode, item)
+            if node and path_matches(node.path, permission.path_prefix, permission.recursive):
+                return True
     return False
 
 
@@ -438,10 +439,7 @@ def _taxonomy_brief_loader(db: Session, id_maps: list[dict[str, Any] | None]):
     wanted: set[int] = set()
     for ids in id_maps:
         for raw_id in (ids or {}).values():
-            try:
-                wanted.add(int(raw_id))
-            except (TypeError, ValueError):
-                continue
+            wanted.update(tag_id_list(raw_id))
     nodes = (
         {
             node.id: node
@@ -451,35 +449,39 @@ def _taxonomy_brief_loader(db: Session, id_maps: list[dict[str, Any] | None]):
         else {}
     )
 
-    def briefs(ids: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
-        out: dict[str, dict[str, Any]] = {}
+    def briefs(ids: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+        out: dict[str, list[dict[str, Any]]] = {}
         for scheme, raw_id in (ids or {}).items():
-            try:
-                node = nodes.get(int(raw_id))
-            except (TypeError, ValueError):
-                continue
-            if node and str(node.scheme) == scheme:
-                out[scheme] = {
-                    "id": node.id,
-                    "scheme": scheme,
-                    "code": node.code or "",
-                    "name": node.name,
-                    "path": node.path,
-                }
+            rows: list[dict[str, Any]] = []
+            for item in tag_id_list(raw_id):
+                node = nodes.get(item)
+                if node and str(node.scheme) == scheme:
+                    rows.append(
+                        {
+                            "id": node.id,
+                            "scheme": scheme,
+                            "code": node.code or "",
+                            "name": node.name,
+                            "path": node.path,
+                        }
+                    )
+            if rows:
+                out[scheme] = rows
         return out
 
     return briefs
 
 
-def _validate_taxonomy_ids(db: Session, ids: dict[str, int | None] | None) -> None:
+def _validate_taxonomy_ids(db: Session, ids: dict[str, Any] | None) -> None:
     for scheme, node_id in (ids or {}).items():
         if node_id is None:
             continue
-        node = db.get(TaxonomyNode, node_id)
-        if not node:
-            raise HTTPException(status_code=404, detail=f"分类节点不存在：{node_id}")
-        if str(node.scheme) != scheme:
-            raise HTTPException(status_code=400, detail=f"节点 {node_id} 不属于 {scheme}")
+        for item in tag_id_list(node_id):
+            node = db.get(TaxonomyNode, item)
+            if not node:
+                raise HTTPException(status_code=404, detail=f"分类节点不存在：{item}")
+            if str(node.scheme) != scheme:
+                raise HTTPException(status_code=400, detail=f"节点 {item} 不属于 {scheme}")
 
 
 def _decorate_and_filter(
@@ -583,12 +585,12 @@ def _decorate_and_filter(
         if q_norm and q_norm not in unit["batch"].lower() and q_norm not in unit["name"].lower():
             continue
         if taxonomy_scheme and tag_id is not None:
-            raw = (unit.get("taxonomy_tag_ids") or {}).get(taxonomy_scheme)
-            try:
-                selected_id = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if wanted_tag_ids is not None and selected_id not in wanted_tag_ids:
+            selected_ids = tag_id_list(
+                (unit.get("taxonomy_tag_ids") or {}).get(taxonomy_scheme)
+            )
+            if wanted_tag_ids is not None and not any(
+                item in wanted_tag_ids for item in selected_ids
+            ):
                 continue
         units.append(unit)
 
@@ -693,6 +695,93 @@ def _attach_session_taxonomy(
     return out
 
 
+_OVERVIEW_ANN = (
+    "motion_kind",
+    "human_model",
+    "human_model_file",
+    "robot_style",
+    "robot_version",
+    "quality",
+    "note",
+    "fps",
+    "person_name",
+    "gender",
+    "height",
+    "status",
+)
+_overview_body: dict[tuple, bytes] = {}
+
+
+def _slim_file(file: dict[str, Any]) -> dict[str, Any]:
+    item: dict[str, Any] = {}
+    for key in ("path", "name", "unit_name", "size", "ontology", "modality", "format", "batch", "id"):
+        value = file.get(key)
+        if value not in (None, ""):
+            item[key] = value
+    for key in ("sub_path", "robot_style", "modified_at", "uploaded_at", "fps"):
+        value = file.get(key)
+        if value not in (None, "", 0):
+            item[key] = value
+    uploader = file.get("uploader")
+    if isinstance(uploader, dict) and uploader.get("id") is not None:
+        item["uploader"] = {"id": uploader.get("id"), "username": uploader.get("username")}
+    tags = file.get("taxonomy_tag_ids") or {}
+    if tags:
+        item["taxonomy_tag_ids"] = tags
+    ann = file.get("annotation") or {}
+    kept = {
+        key: ann[key]
+        for key in _OVERVIEW_ANN
+        if ann.get(key) not in (None, "")
+    }
+    if kept:
+        item["annotation"] = kept
+    return item
+
+
+def _slim_unit(unit: dict[str, Any]) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "key": unit.get("key"),
+        "batch": unit.get("batch"),
+        "name": unit.get("name"),
+        "file_count": unit.get("file_count") or 0,
+        "files": [_slim_file(file) for file in unit.get("files") or []],
+        "taxonomy_tag_ids": unit.get("taxonomy_tag_ids") or {},
+        "uploaders": unit.get("uploaders") or [],
+    }
+    for key in ("created_at", "uploaded_at", "modified_at"):
+        if unit.get(key):
+            item[key] = unit[key]
+    if unit.get("annotation"):
+        item["annotation"] = unit["annotation"]
+    if unit.get("meta"):
+        item["meta"] = unit["meta"]
+    return item
+
+
+def _compact_overview(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop empty file fields and repeated tag paths. The page resolves names from the taxonomy list."""
+    batches = []
+    for batch in payload.get("batches") or []:
+        row: dict[str, Any] = {
+            "name": batch.get("name"),
+            "unit_count": batch.get("unit_count") or 0,
+            "file_count": batch.get("file_count") or 0,
+            "units": [_slim_unit(unit) for unit in batch.get("units") or []],
+            "uploaders": batch.get("uploaders") or [],
+            "taxonomy_tag_ids": batch.get("taxonomy_tag_ids") or {},
+        }
+        for key in ("created_at", "uploaded_at", "modified_at"):
+            if batch.get(key):
+                row[key] = batch[key]
+        if batch.get("annotation"):
+            row["annotation"] = batch["annotation"]
+        if batch.get("meta"):
+            row["meta"] = batch["meta"]
+        batches.append(row)
+    return {**payload, "batches": batches}
+
+
 @router.get("/overview")
 def overview(
     batch: str | None = None,
@@ -707,17 +796,38 @@ def overview(
 ):
     if include_empty and not user_has_any_capability(db, user, Capability.manage_data):
         raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以查看空目录")
-    return _decorate_and_filter(
-        scan_data(include_empty=include_empty),
-        db,
-        user,
-        batch=batch,
-        q=q,
-        taxonomy_scheme=taxonomy_scheme,
-        tag_id=tag_id,
-        tag_exact=tag_exact,
-        uploader_id=uploader_id,
+    snapshot = scan_data(include_empty=include_empty)
+    cache_key = (
+        id(snapshot),
+        user.id,
+        batch or "",
+        (q or "").strip().lower(),
+        taxonomy_scheme or "",
+        tag_id or 0,
+        bool(tag_exact),
+        uploader_id if uploader_id is not None else "",
+        bool(include_empty),
     )
+    body = _overview_body.get(cache_key)
+    if body is None:
+        payload = _compact_overview(
+            _decorate_and_filter(
+                snapshot,
+                db,
+                user,
+                batch=batch,
+                q=q,
+                taxonomy_scheme=taxonomy_scheme,
+                tag_id=tag_id,
+                tag_exact=tag_exact,
+                uploader_id=uploader_id,
+            )
+        )
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(_overview_body) > 6:
+            _overview_body.clear()
+        _overview_body[cache_key] = body
+    return Response(content=body, media_type="application/json")
 
 
 @router.post("/rescan")
@@ -1342,7 +1452,7 @@ async def upload_data(
             unit_names=[unit_name],
             uploaded=1,
         )
-        rebuild_catalog()
+        refresh_catalog_paths([result["path"]])
         result["uploader"] = uploader
         result["upload_session_id"] = session["id"]
     except ValueError as exc:
@@ -1401,6 +1511,28 @@ async def upload_data_folder(
         raw_sub_paths = []
     while len(raw_sub_paths) < len(files):
         raw_sub_paths.append("")
+    folder_rels = [
+        "/".join(
+            part
+            for part in (
+                str(sub_path or "").replace("\\", "/").strip("/"),
+                Path(getattr(file, "filename", "") or "").name,
+            )
+            if part
+        )
+        for file, sub_path in zip(files, raw_sub_paths)
+    ]
+    follow_paths = str(form.get("follow_paths", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    clip_plan = (
+        plan_followed_paths(folder_rels, strip_common_root=True)
+        if follow_paths
+        else plan_clip_units(folder_rels)
+    )
 
     ontology = ontology.strip().lower()
     modality = modality.strip().lower()
@@ -1417,13 +1549,30 @@ async def upload_data_folder(
     saved_paths: list[str] = []
     formats: list[str] = []
 
-    for file, action, sub_path in zip(files, raw_actions, raw_sub_paths):
+    for file, action, sub_path, rel in zip(files, raw_actions, raw_sub_paths, folder_rels):
         original_name = Path(file.filename or "").name
-        file_stem = Path(original_name).stem
-        if sub_path:
-            raw_unit_name = normalize_unit_stem((sub_path + "/" + file_stem).replace("/", "_")) or (sub_path + "_" + file_stem).replace("/", "_")
+        planned = clip_plan.get(rel) or {}
+        if planned.get("skip"):
+            results.append(
+                {
+                    "name": original_name,
+                    "unit_name": "",
+                    "status": "skip",
+                    "detail": planned["skip"],
+                }
+            )
+            continue
+        if planned:
+            raw_unit_name = planned["unit_name"]
+            stored_name = planned["stored_name"] or original_name
+            sub_path = planned.get("sub_path") or ""
         else:
-            raw_unit_name = normalize_unit_stem(file_stem) or file_stem
+            file_stem = Path(original_name).stem
+            if sub_path:
+                raw_unit_name = normalize_unit_stem((sub_path + "/" + file_stem).replace("/", "_")) or (sub_path + "_" + file_stem).replace("/", "_")
+            else:
+                raw_unit_name = normalize_unit_stem(file_stem) or file_stem
+            stored_name = original_name
         row: dict[str, Any] = {
             "name": original_name,
             "unit_name": raw_unit_name,
@@ -1461,7 +1610,8 @@ async def upload_data_folder(
                         and item["modality"] == modality
                         and item["channel"] == channel
                         and item["format"] == file_fmt
-                        and item["name"] == original_name
+                        and item["name"] == stored_name
+                        and (item.get("sub_path") or "") == (sub_path or "")
                     ),
                     None,
                 )
@@ -1475,11 +1625,12 @@ async def upload_data_folder(
                 fmt=file_fmt,
                 batch=batch,
                 unit_name=raw_unit_name,
-                original_name=original_name or f"{raw_unit_name}.{file_fmt}",
+                original_name=stored_name or f"{raw_unit_name}.{file_fmt}",
                 replace=action == "replace",
                 update_index=False,
                 robot_style=robot_style,
                 sub_path=sub_path,
+                preserve_tree=True,
             )
             result["uploader"] = {
                 "id": user.id,
@@ -1529,7 +1680,7 @@ async def upload_data_folder(
             uploaded=sum(item["status"] == "uploaded" for item in results),
             replaced=sum(item["status"] == "replaced" for item in results),
         )
-        rebuild_catalog()
+        refresh_catalog_paths(saved_paths)
     summary = {
         "batch": batch,
         "total": len(files),
@@ -1562,6 +1713,7 @@ async def upload_data_zip(
     channel: str = Form(""),
     batch: str = Form(""),
     replace: bool = Form(False),
+    follow_paths: bool = Form(False),
     manage_override: bool = Form(False),
     annotation: str = Form(""),
     taxonomy_tag_ids: str = Form(""),
@@ -1608,14 +1760,30 @@ async def upload_data_zip(
             raise HTTPException(status_code=400, detail="请选择 zip 或填写服务器路径")
 
         try:
-            groups, warnings = extract_and_group_zip(zip_path, work_dir)
+            extracted, warnings = extract_zip_files(zip_path, work_dir)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"无法解压 ZIP：{exc}") from exc
-        if not groups:
+        if not extracted:
             raise HTTPException(
                 status_code=400,
                 detail="ZIP 中未找到可导入文件（按后缀识别格式，未知后缀会作为新格式入库）",
             )
+
+        zip_rels: list[str] = []
+        zip_files: list[tuple[Path, str]] = []
+        for path in extracted:
+            rel = ""
+            try:
+                rel = path.relative_to(work_dir).as_posix()
+            except Exception:
+                rel = path.name
+            zip_files.append((path, rel))
+            zip_rels.append(rel)
+        clip_plan = (
+            plan_followed_paths(zip_rels, strip_common_root=False)
+            if follow_paths
+            else plan_clip_units(zip_rels)
+        )
 
         snapshot = scan_data()
         current_units = {
@@ -1624,107 +1792,105 @@ async def upload_data_zip(
         results: list[dict[str, Any]] = []
         saved_paths: list[str] = []
         formats: list[str] = []
+        new_robot_style = str(parsed_annotation.get("robot_style") or "").strip()
 
-        for group in groups:
-            raw_unit_name = normalize_unit_stem(group.display_stem) or group.display_stem
-            current = current_units.get((batch, raw_unit_name))
+        for path, rel in zip_files:
+            original_name = path.name
+            planned = clip_plan.get(rel) or {}
+            if planned.get("skip"):
+                results.append(
+                    {
+                        "name": original_name,
+                        "unit_name": "",
+                        "status": "skip",
+                        "detail": planned["skip"],
+                    }
+                )
+                continue
+            file_sub_path = planned.get("sub_path") or ""
+            effective_unit = planned.get("unit_name") or (normalize_unit_stem(Path(original_name).stem) or Path(original_name).stem)
+            stored_name = planned.get("stored_name") or original_name
+            fmt = human_format_from_filename(original_name).lstrip(".")
+            row: dict[str, Any] = {
+                "name": original_name,
+                "unit_name": effective_unit,
+                "status": "upload",
+            }
+            current = current_units.get((batch, effective_unit))
             if not current:
                 current = next(
                     (
                         item
                         for item in snapshot.get("units", [])
                         if item["batch"] == batch
-                        and stems_same_unit(item["name"], raw_unit_name)
+                        and stems_same_unit(item["name"], effective_unit)
                     ),
                     None,
                 )
             if current:
                 _require_unit(db, user, Capability.upload, current)
             else:
-                ensure_capability(db, user, Capability.upload, f"/{batch}/{raw_unit_name}/")
-
-            new_robot_style = str(parsed_annotation.get("robot_style") or "").strip()
-
-            for fmt, path in sorted(group.files.items()):
-                original_name = path.name
-                file_sub_path = ""
+                ensure_capability(db, user, Capability.upload, f"/{batch}/{effective_unit}/")
+            existing = None
+            if current:
+                existing = next(
+                    (
+                        item
+                        for item in current.get("files", [])
+                        if item["ontology"] == ontology
+                        and item["modality"] == modality
+                        and item["channel"] == channel
+                        and item["format"] == fmt
+                        and item["name"] == stored_name
+                        and (item.get("sub_path") or "") == file_sub_path
+                        and (
+                            ontology != "robot"
+                            or not new_robot_style
+                            or str(item.get("robot_style") or "").strip() == new_robot_style
+                        )
+                    ),
+                    None,
+                )
+            if existing and not replace:
+                row["status"] = "skip"
+                results.append(row)
+                continue
+            if existing and not manage_override:
                 try:
-                    rel_to_work = path.relative_to(work_dir)
-                    if len(rel_to_work.parts) > 1:
-                        file_sub_path = "/".join(rel_to_work.parts[:-1])
-                except Exception:
-                    pass
-                file_stem = Path(original_name).stem
-                if file_sub_path:
-                    effective_unit = normalize_unit_stem((file_sub_path + "/" + file_stem).replace("/", "_")) or (file_sub_path + "_" + file_stem).replace("/", "_")
-                else:
-                    effective_unit = raw_unit_name
-                row: dict[str, Any] = {
-                    "name": original_name,
-                    "unit_name": effective_unit,
-                    "status": "upload",
-                }
-                existing = None
-                if current:
-                    existing = next(
-                        (
-                            item
-                            for item in current.get("files", [])
-                            if item["ontology"] == ontology
-                            and item["modality"] == modality
-                            and item["channel"] == channel
-                            and item["format"] == str(fmt).lstrip(".")
-                            and (
-                                item["name"] == original_name
-                                or Path(item["name"]).stem == raw_unit_name
-                            )
-                            and (
-                                ontology != "robot"
-                                or not new_robot_style
-                                or str(item.get("robot_style") or "").strip() == new_robot_style
-                            )
-                        ),
-                        None,
-                    )
-                if existing and not replace:
-                    row["status"] = "skip"
+                    _require_file_owner(user, existing)
+                except HTTPException as exc:
+                    row.update({"status": "failed", "detail": exc.detail})
                     results.append(row)
                     continue
-                if existing and not manage_override:
-                    try:
-                        _require_file_owner(user, existing)
-                    except HTTPException as exc:
-                        row.update({"status": "failed", "detail": exc.detail})
-                        results.append(row)
-                        continue
-                try:
-                    with path.open("rb") as handle:
-                        result = save_data_file(
-                            handle,
-                            ontology=ontology,
-                            modality=modality,
-                            channel=channel,
-                            fmt=str(fmt).lstrip("."),
-                            batch=batch,
-                            unit_name=row["unit_name"],
-                            original_name=original_name,
-                            replace=bool(existing and replace),
-                            update_index=False,
-                            robot_style=str(parsed_annotation.get("robot_style") or ""),
-                            sub_path=file_sub_path,
-                        )
-                    result["uploader"] = {"id": user.id, "username": user.username}
-                    row.update(
-                        {
-                            "status": "replaced" if existing and replace else "uploaded",
-                            "file": result,
-                        }
+            try:
+                with path.open("rb") as handle:
+                    result = save_data_file(
+                        handle,
+                        ontology=ontology,
+                        modality=modality,
+                        channel=channel,
+                        fmt=fmt,
+                        batch=batch,
+                        unit_name=row["unit_name"],
+                        original_name=stored_name,
+                        replace=bool(existing and replace),
+                        update_index=False,
+                        robot_style=str(parsed_annotation.get("robot_style") or ""),
+                        sub_path=file_sub_path,
+                        preserve_tree=True,
                     )
-                    saved_paths.append(result["path"])
-                    formats.append(str(fmt).lstrip("."))
-                except (ValueError, OSError) as exc:
-                    row.update({"status": "failed", "detail": str(exc)})
-                results.append(row)
+                result["uploader"] = {"id": user.id, "username": user.username}
+                row.update(
+                    {
+                        "status": "replaced" if existing and replace else "uploaded",
+                        "file": result,
+                    }
+                )
+                saved_paths.append(result["path"])
+                formats.append(str(fmt).lstrip("."))
+            except (ValueError, OSError) as exc:
+                row.update({"status": "failed", "detail": str(exc)})
+            results.append(row)
 
         session = None
         if saved_paths:
@@ -1764,7 +1930,7 @@ async def upload_data_zip(
                 uploaded=sum(item["status"] == "uploaded" for item in results),
                 replaced=sum(item["status"] == "replaced" for item in results),
             )
-            rebuild_catalog()
+            refresh_catalog_paths(saved_paths)
 
         summary = {
             "batch": batch,

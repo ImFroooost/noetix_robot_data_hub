@@ -18,6 +18,7 @@ interface AuthState {
   logout: () => void;
   impersonate: (userId: number) => Promise<void>;
   stopImpersonate: () => Promise<void>;
+  refresh: () => Promise<void>;
   impersonating: boolean;
   canEdit: boolean;
   isAdmin: boolean;
@@ -123,12 +124,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       impersonate,
       stopImpersonate,
+      refresh,
       impersonating,
       canEdit: hasPerm("upload"),
       isAdmin,
       hasPerm,
     }),
-    [user, loading, impersonating]
+    [user, loading, impersonating, refresh]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
