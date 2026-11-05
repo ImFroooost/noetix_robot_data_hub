@@ -90,6 +90,8 @@ async def lifespan(_: FastAPI):
         try:
             from .services.disk_repository import load_data_index
 
+            # Admins open the page with empty batches shown; warm both views.
+            load_data_index(include_empty=True)
             load_data_index(include_empty=False)
         except Exception:
             pass

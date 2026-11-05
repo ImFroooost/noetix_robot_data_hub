@@ -294,6 +294,7 @@ export interface StorageFile {
   format: string;
   batch: string;
   robot_style?: string;
+  robot_acquire_method?: string;
   uploader: StorageUploader | null;
   fps?: number | null;
   frame_count?: number | null;

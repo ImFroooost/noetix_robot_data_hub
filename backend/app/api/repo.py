@@ -1162,23 +1162,67 @@ def get_retarget_status(
     """超级管理者查看自动重定向进度和优先级。进度由宿主机循环写入。"""
     path = Path(settings.hub_repo_root) / "index" / "auto_retarget_status.json"
     if not path.is_file():
-        return _empty_retarget_status()
+        return _with_retarget_control(_empty_retarget_status())
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         payload = _empty_retarget_status()
         payload["message"] = "进度文件暂时无法读取"
-        return payload
+        return _with_retarget_control(payload)
     if not isinstance(data, dict):
-        return _empty_retarget_status()
+        return _with_retarget_control(_empty_retarget_status())
     age = time.time() - path.stat().st_mtime
     if age > _RETARGET_STALE_SEC:
         data["running"] = False
-        data["phase"] = "stopped"
         data["round_running"] = 0
         data["current"] = []
-        data["message"] = "自动重定向进程没有心跳"
+        data = _with_retarget_control(data)
+        if data["desired"] == "stopped":
+            data["phase"] = "stopped"
+            data["message"] = "已停止"
+        else:
+            data["phase"] = "stopped"
+            data["message"] = "自动重定向进程没有心跳，正在尝试重新启动"
+        return data
+    return _with_retarget_control(data)
+
+
+def _with_retarget_control(data: dict) -> dict:
+    from ..services.retarget_control import load_control
+
+    ctrl = load_control(Path(settings.hub_repo_root))
+    data["desired"] = ctrl["desired"]
+    data["performance"] = ctrl["performance"]
     return data
+
+
+class RetargetControlBody(BaseModel):
+    desired: str = "running"
+    performance: str = "heavy"
+
+
+@router.post("/retarget/control")
+def post_retarget_control(
+    body: RetargetControlBody,
+    user: User = Depends(require_admin),
+):
+    """启动、停止，或调整自动重定向的占用强度。正在跑的这一波会做完。"""
+    from ..services.retarget_control import save_control
+
+    hub = Path(settings.hub_repo_root)
+    try:
+        save_control(hub, desired=body.desired, performance=body.performance)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    status = get_retarget_status(user)
+    if body.desired == "stopped" and status.get("running"):
+        status["phase"] = "stopping"
+        status["message"] = "正在停止，当前这一波结束后停下"
+    elif body.desired == "running" and not status.get("running"):
+        status["phase"] = "scanning"
+        status["running"] = True
+        status["message"] = "正在启动"
+    return status
 
 
 class RetargetPriorityBody(BaseModel):
@@ -1226,14 +1270,13 @@ def post_retarget_pin(
     _: User = Depends(require_admin),
 ):
     """把指定批次或数据单元插到自动重定向队列最前面。"""
-    from ..services.retarget_priority import add_pins
+    from ..services.retarget_priority import promote_targets
 
     hub = Path(settings.hub_repo_root)
     try:
-        items = add_pins(hub, body.items)
+        return promote_targets(hub, body.items)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "count": len(items)}
 
 
 @router.post("/retarget/priority/presets")
@@ -1241,7 +1284,7 @@ def post_retarget_preset(
     body: RetargetPresetBody,
     _: User = Depends(require_admin),
 ):
-    """把当前编辑中的规则存成一套可切换的默认规则。"""
+    """把当前编辑中的优先级新增为一套预设，不改正在执行的规则。"""
     from ..services.retarget_priority import public_config, save_preset
 
     hub = Path(settings.hub_repo_root)

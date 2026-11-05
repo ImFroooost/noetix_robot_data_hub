@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import gc
+import gzip
 import json
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +26,10 @@ from ..services.disk_repository import (
     MODEL_KINDS,
     MODALITIES,
     ONTOLOGIES,
+    add_index_listener,
+    browse_snapshot_serial,
     collect_archive_entries,
+    local_write_generation,
     apply_upload_taxonomy,
     assemble_upload_sessions,
     create_batch,
@@ -495,6 +501,7 @@ def _decorate_and_filter(
     tag_id: int | None,
     uploader_id: int | None,
     tag_exact: bool = False,
+    with_briefs: bool = True,
 ) -> dict[str, Any]:
     q_norm = (q or "").strip().lower()
     wanted_tag_ids: set[int] | None = None
@@ -515,20 +522,24 @@ def _decorate_and_filter(
                 .all()
             }
 
-    brief_ids = [
-        unit.get("taxonomy_tag_ids") or {}
-        for unit in snapshot.get("units") or []
-    ]
-    brief_ids.extend(
-        item.get("taxonomy_tag_ids") or {}
-        for item in snapshot.get("batches") or []
-    )
-    brief_ids.extend(
-        file.get("taxonomy_tag_ids") or {}
-        for unit in snapshot.get("units") or []
-        for file in unit.get("files") or []
-    )
-    briefs = _taxonomy_brief_loader(db, brief_ids)
+    if with_briefs:
+        brief_ids = [
+            unit.get("taxonomy_tag_ids") or {}
+            for unit in snapshot.get("units") or []
+        ]
+        brief_ids.extend(
+            item.get("taxonomy_tag_ids") or {}
+            for item in snapshot.get("batches") or []
+        )
+        brief_ids.extend(
+            file.get("taxonomy_tag_ids") or {}
+            for unit in snapshot.get("units") or []
+            for file in unit.get("files") or []
+        )
+        briefs = _taxonomy_brief_loader(db, brief_ids)
+    else:
+        def briefs(_ids: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+            return {}
 
     units = []
     uploader_options: dict[int, dict[str, Any]] = {}
@@ -595,11 +606,14 @@ def _decorate_and_filter(
         units.append(unit)
 
     visible_keys = {u["key"] for u in units}
+    units_by_batch: dict[str, list[dict[str, Any]]] = {}
+    for unit in units:
+        units_by_batch.setdefault(unit["batch"], []).append(unit)
     batches = []
     for item in snapshot["batches"]:
         if batch and item["name"] != batch:
             continue
-        visible_units = [u for u in units if u["batch"] == item["name"]]
+        visible_units = units_by_batch.get(item["name"], [])
         if not visible_units:
             if (
                 q_norm
@@ -709,16 +723,23 @@ _OVERVIEW_ANN = (
     "height",
     "status",
 )
-_overview_body: dict[tuple, bytes] = {}
 
 
-def _slim_file(file: dict[str, Any]) -> dict[str, Any]:
-    item: dict[str, Any] = {}
-    for key in ("path", "name", "unit_name", "size", "ontology", "modality", "format", "batch", "id"):
+def _slim_file(file: dict[str, Any], unit: dict[str, Any]) -> dict[str, Any]:
+    """One file row. Fields equal to the parent unit are left out; the page fills them back in."""
+    path = file.get("path") or ""
+    item: dict[str, Any] = {"path": path}
+    name = file.get("name")
+    if name and name != path.rsplit("/", 1)[-1]:
+        item["name"] = name
+    unit_name = file.get("unit_name")
+    if unit_name and unit_name != unit.get("name"):
+        item["unit_name"] = unit_name
+    for key in ("size", "ontology", "modality", "format", "id"):
         value = file.get(key)
         if value not in (None, ""):
             item[key] = value
-    for key in ("sub_path", "robot_style", "modified_at", "uploaded_at", "fps"):
+    for key in ("sub_path", "robot_style", "robot_acquire_method", "modified_at", "uploaded_at", "fps"):
         value = file.get(key)
         if value not in (None, "", 0):
             item[key] = value
@@ -726,16 +747,17 @@ def _slim_file(file: dict[str, Any]) -> dict[str, Any]:
     if isinstance(uploader, dict) and uploader.get("id") is not None:
         item["uploader"] = {"id": uploader.get("id"), "username": uploader.get("username")}
     tags = file.get("taxonomy_tag_ids") or {}
-    if tags:
+    if tags != (unit.get("taxonomy_tag_ids") or {}):
         item["taxonomy_tag_ids"] = tags
-    ann = file.get("annotation") or {}
-    kept = {
-        key: ann[key]
-        for key in _OVERVIEW_ANN
-        if ann.get(key) not in (None, "")
-    }
-    if kept:
-        item["annotation"] = kept
+    ann = file.get("annotation")
+    if ann:
+        kept = {}
+        for key in _OVERVIEW_ANN:
+            value = ann.get(key)
+            if value is not None and value != "":
+                kept[key] = value
+        if kept:
+            item["annotation"] = kept
     return item
 
 
@@ -745,7 +767,7 @@ def _slim_unit(unit: dict[str, Any]) -> dict[str, Any]:
         "batch": unit.get("batch"),
         "name": unit.get("name"),
         "file_count": unit.get("file_count") or 0,
-        "files": [_slim_file(file) for file in unit.get("files") or []],
+        "files": [_slim_file(file, unit) for file in unit.get("files") or []],
         "taxonomy_tag_ids": unit.get("taxonomy_tag_ids") or {},
         "uploaders": unit.get("uploaders") or [],
     }
@@ -791,43 +813,146 @@ def overview(
     tag_exact: bool = False,
     uploader_id: int | None = None,
     include_empty: bool = False,
+    *,
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     if include_empty and not user_has_any_capability(db, user, Capability.manage_data):
         raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以查看空目录")
+    params = {
+        "batch": batch or "",
+        "q": (q or "").strip(),
+        "taxonomy_scheme": taxonomy_scheme or "",
+        "tag_id": tag_id,
+        "tag_exact": bool(tag_exact),
+        "uploader_id": uploader_id,
+        "include_empty": bool(include_empty),
+    }
+    key = (user.id, *(params[name] for name in sorted(params)))
+    gen = local_write_generation()
+    serial = browse_snapshot_serial(include_empty)
+    # Cheap when nothing changed; starts a background index refresh when the
+    # files on disk moved on.
     snapshot = scan_data(include_empty=include_empty)
-    cache_key = (
-        id(snapshot),
-        user.id,
-        batch or "",
-        (q or "").strip().lower(),
-        taxonomy_scheme or "",
-        tag_id or 0,
-        bool(tag_exact),
-        uploader_id if uploader_id is not None else "",
-        bool(include_empty),
-    )
-    body = _overview_body.get(cache_key)
-    if body is None:
+    with _overview_lock:
+        entry = _overview_entries.get(key)
+        if entry is not None:
+            _overview_recent[key] = (user.id, params)
+    if entry is None or entry["gen"] != gen:
+        entry = _build_overview_entry(snapshot, serial, gen, db, user, params)
+        _store_overview_entry(key, user.id, params, entry)
+    elif entry["serial"] != browse_snapshot_serial(include_empty):
+        # A host-side change (auto retarget) swapped in a newer index. Serve the
+        # page already built and rebuild it off the request path.
+        _schedule_overview_build(key, user.id, params)
+    accepts_gzip = "gzip" in (request.headers.get("accept-encoding") or "").lower()
+    headers = {"Vary": "Accept-Encoding"}
+    if accepts_gzip:
+        headers["Content-Encoding"] = "gzip"
+        return Response(content=entry["gzip"], media_type="application/json", headers=headers)
+    return Response(content=entry["raw"], media_type="application/json", headers=headers)
+
+
+_overview_entries: dict[tuple, dict[str, Any]] = {}
+_overview_recent: dict[tuple, tuple[int, dict[str, Any]]] = {}
+_overview_building: set[tuple] = set()
+_overview_lock = threading.Lock()
+_OVERVIEW_MAX_ENTRIES = 8
+
+
+def _build_overview_entry(
+    snapshot: dict[str, Any],
+    serial: int,
+    gen: int,
+    db: Session,
+    user: User,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    gc_was_on = gc.isenabled()
+    gc.disable()
+    try:
         payload = _compact_overview(
             _decorate_and_filter(
                 snapshot,
                 db,
                 user,
-                batch=batch,
-                q=q,
-                taxonomy_scheme=taxonomy_scheme,
-                tag_id=tag_id,
-                tag_exact=tag_exact,
-                uploader_id=uploader_id,
+                batch=params["batch"] or None,
+                q=params["q"] or None,
+                taxonomy_scheme=params["taxonomy_scheme"] or None,
+                tag_id=params["tag_id"],
+                tag_exact=params["tag_exact"],
+                uploader_id=params["uploader_id"],
+                with_briefs=False,
             )
         )
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(_overview_body) > 6:
-            _overview_body.clear()
-        _overview_body[cache_key] = body
-    return Response(content=body, media_type="application/json")
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    finally:
+        if gc_was_on:
+            gc.enable()
+    return {
+        "serial": serial,
+        "gen": gen,
+        "raw": raw,
+        "gzip": gzip.compress(raw, compresslevel=5),
+    }
+
+
+def _store_overview_entry(key: tuple, user_id: int, params: dict[str, Any], entry: dict[str, Any]) -> None:
+    with _overview_lock:
+        _overview_entries[key] = entry
+        _overview_recent[key] = (user_id, params)
+        while len(_overview_entries) > _OVERVIEW_MAX_ENTRIES:
+            oldest = next(iter(_overview_entries))
+            _overview_entries.pop(oldest, None)
+            _overview_recent.pop(oldest, None)
+
+
+def _schedule_overview_build(key: tuple, user_id: int, params: dict[str, Any]) -> None:
+    with _overview_lock:
+        if key in _overview_building:
+            return
+        _overview_building.add(key)
+
+    def run() -> None:
+        from ..database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if user is None:
+                return
+            gen = local_write_generation()
+            serial = browse_snapshot_serial(params["include_empty"])
+            snapshot = scan_data(include_empty=params["include_empty"])
+            entry = _build_overview_entry(snapshot, serial, gen, db, user, params)
+            with _overview_lock:
+                current = _overview_entries.get(key)
+            if current is None or current["gen"] <= gen:
+                _store_overview_entry(key, user_id, params, entry)
+        except Exception:
+            pass
+        finally:
+            db.close()
+            with _overview_lock:
+                _overview_building.discard(key)
+
+    threading.Thread(target=run, name="overview-build", daemon=True).start()
+
+
+def _rebuild_recent_overviews(include_empty: bool) -> None:
+    """After a background index refresh, refresh the pages people opened recently."""
+    with _overview_lock:
+        recent = [
+            (key, user_id, params)
+            for key, (user_id, params) in _overview_recent.items()
+            if params["include_empty"] == include_empty
+        ]
+    for key, user_id, params in recent[-4:]:
+        _schedule_overview_build(key, user_id, params)
+
+
+add_index_listener(_rebuild_recent_overviews)
 
 
 @router.post("/rescan")
@@ -1378,6 +1503,7 @@ async def upload_data(
     manage_override: bool = Form(False),
     annotation: str = Form(""),
     taxonomy_tag_ids: str = Form(""),
+    robot_acquire_method: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1403,6 +1529,12 @@ async def upload_data(
                 and item["channel"] == channel.strip().lower()
                 and item["format"] == resolved_fmt
                 and item["name"] == target_name
+                and (
+                    ontology.strip().lower() != "robot"
+                    or modality.strip().lower() != "motion"
+                    or (item.get("robot_acquire_method") or "omniretarget")
+                    == (robot_acquire_method.strip().lower() or "omniretarget")
+                )
             ),
             None,
         )
@@ -1421,6 +1553,7 @@ async def upload_data(
             replace=replace,
             update_index=False,
             robot_style=str(parsed_annotation.get("robot_style") or ""),
+            robot_acquire_method=robot_acquire_method,
         )
         uploader = {
             "id": user.id,
@@ -1540,6 +1673,7 @@ async def upload_data_folder(
     fallback_fmt = format.strip().lower().lstrip(".")
     parsed_annotation = _parse_annotation_form(annotation)
     robot_style = str(parsed_annotation.get("robot_style") or "")
+    robot_acquire_method = str(form.get("robot_acquire_method") or "")
     snapshot = scan_data()
     current_units = {
         (item["batch"], item["name"]): item for item in snapshot.get("units", [])
@@ -1629,6 +1763,7 @@ async def upload_data_folder(
                 replace=action == "replace",
                 update_index=False,
                 robot_style=robot_style,
+                robot_acquire_method=robot_acquire_method,
                 sub_path=sub_path,
                 preserve_tree=True,
             )
@@ -1717,6 +1852,7 @@ async def upload_data_zip(
     manage_override: bool = Form(False),
     annotation: str = Form(""),
     taxonomy_tag_ids: str = Form(""),
+    robot_acquire_method: str = Form(""),
     local_path: str = Form(""),
     file: UploadFile | None = File(None),
     db: Session = Depends(get_db),
@@ -1876,6 +2012,7 @@ async def upload_data_zip(
                         replace=bool(existing and replace),
                         update_index=False,
                         robot_style=str(parsed_annotation.get("robot_style") or ""),
+                        robot_acquire_method=robot_acquire_method,
                         sub_path=file_sub_path,
                         preserve_tree=True,
                     )

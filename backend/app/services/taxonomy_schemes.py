@@ -18,10 +18,11 @@ BUILTIN_KEYS = {k for k, *_ in BUILTIN_TAXONOMY_SCHEMES}
 # 图表方案的自定义分类维度（builtin=False，分类管理显示「·自定」）
 DEFAULT_CUSTOM_SCHEMES: tuple[tuple[str, str, str, int], ...] = (
     ("custom", "所属项目", "D", 3),
-    ("custom_3", "获取方式", "E", 4),
+    ("custom_3", "人体数据获取方式", "E", 4),
     ("custom_2", "获取地点", "F", 5),
     ("custom_4", "获取设备", "G", 6),
     ("custom_5", "所处阶段", "H", 7),
+    ("custom_8", "机器人数据获取方式", "K", 10),
 )
 
 DEFAULT_CUSTOM_TREES: dict[str, dict] = {
@@ -51,6 +52,11 @@ DEFAULT_CUSTOM_TREES: dict[str, dict] = {
         "待精修": ("H4", None),
         "待训练": ("H5", None),
         "待真机测试": ("H6", None),
+    },
+    "custom_8": {
+        "omniretarget": ("K1", None),
+        "umr": ("K2", None),
+        "gmr": ("K3", None),
     },
 }
 
@@ -124,7 +130,7 @@ def _rename_node_with_subtree(db: Session, node: TaxonomyNode, new_name: str) ->
 
 
 def ensure_default_custom_schemes(db: Session) -> None:
-    """补齐图表方案的自定义维度：所属项目/获取方式/获取地点/获取设备/所处阶段。"""
+    """补齐图表方案的自定义维度，含人体与机器人的数据获取方式。"""
     from .permissions import join_folder_path, normalize_path
 
     for key, name, prefix, sort_order in DEFAULT_CUSTOM_SCHEMES:

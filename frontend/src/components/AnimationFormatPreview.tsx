@@ -19,7 +19,9 @@ import {
   resolveUpAxis,
   upAxisModeLabel,
   upAxisToRotationX,
+  uprightGroundOffset,
   useUpAxisMode,
+  type LayoutPoint,
   type UpAxis,
 } from "../viewerUpAxis";
 import {
@@ -112,7 +114,8 @@ export function BvhScene({
   onDetectedRef.current = onDetectedUpAxis;
   const onDetectedUnitRef = useRef(onDetectedLengthUnit);
   onDetectedUnitRef.current = onDetectedLengthUnit;
-  const layoutRef = useRef({ x: 0, minY: 0, z: 0 });
+  const samplesRef = useRef<{ points: LayoutPoint[]; roots: LayoutPoint[] }>({ points: [], roots: [] });
+  const [layoutNonce, setLayoutNonce] = useState(0);
   const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const [boneRoot, setBoneRoot] = useState<THREE.Bone | null>(null);
   const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
@@ -147,6 +150,7 @@ export function BvhScene({
     action.current = null;
     offsetReady.current = false;
     fixedOffset.current.set(0, 0, 0);
+    samplesRef.current = { points: [], roots: [] };
     if (helperRef.current) {
       helperRef.current.geometry.dispose();
       (helperRef.current.material as THREE.Material).dispose();
@@ -173,51 +177,43 @@ export function BvhScene({
         probeAction.paused = true;
 
         const clipDur = result.clip.duration || 1;
-        let sumX = 0;
-        let sumZ = 0;
-        let samples = 0;
-        let minY = Infinity;
         let spanY = 0;
         let spanZ = 0;
-        const poseFrames: { y: number; z: number }[][] = [];
+        const poseFrames: LayoutPoint[][] = [];
+        const roots: LayoutPoint[] = [];
+        const points: LayoutPoint[] = [];
         const n = 24;
         for (let i = 0; i < n; i++) {
           probeAction.time = (i / Math.max(n - 1, 1)) * clipDur;
           probeMixer.update(0);
           bone0.updateMatrixWorld(true);
           bone0.getWorldPosition(_bvhHips);
-          sumX += _bvhHips.x;
-          sumZ += _bvhHips.z;
-          samples++;
+          roots.push({ x: _bvhHips.x, y: _bvhHips.y, z: _bvhHips.z });
           const pose = collectPoseSamples(bone0);
-          if (pose.length) poseFrames.push(pose);
-          _bvhBox.makeEmpty();
-          for (const point of pose) {
-            _bvhPt.set(0, point.y, point.z);
-            _bvhBox.expandByPoint(_bvhPt);
-          }
-          if (!_bvhBox.isEmpty()) {
-            minY = Math.min(minY, _bvhBox.min.y);
-            spanY = Math.max(spanY, _bvhBox.max.y - _bvhBox.min.y);
-            spanZ = Math.max(spanZ, _bvhBox.max.z - _bvhBox.min.z);
+          if (pose.length) {
+            poseFrames.push(pose);
+            points.push(...pose);
+            let minY = Infinity;
+            let maxY = -Infinity;
+            let minZ = Infinity;
+            let maxZ = -Infinity;
+            for (const point of pose) {
+              minY = Math.min(minY, point.y);
+              maxY = Math.max(maxY, point.y);
+              minZ = Math.min(minZ, point.z);
+              maxZ = Math.max(maxZ, point.z);
+            }
+            spanY = Math.max(spanY, maxY - minY);
+            spanZ = Math.max(spanZ, maxZ - minZ);
           }
         }
-        const meanX = samples ? sumX / samples : 0;
-        const meanZ = samples ? sumZ / samples : 0;
-        if (!Number.isFinite(minY)) minY = 0;
         const maxHeight = Math.max(spanY, spanZ);
         onDetectedRef.current?.(detectUpAxisFromPointFrames(poseFrames));
         const unit = detectLengthUnit(maxHeight);
         setDetectedUnit(unit);
         onDetectedUnitRef.current?.(unit);
-        const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, unit));
-        layoutRef.current = { x: meanX, minY, z: meanZ };
-        fixedOffset.current.set(
-          -meanX * nextScale,
-          -minY * nextScale,
-          -meanZ * nextScale
-        );
-        offsetReady.current = true;
+        samplesRef.current = { points, roots };
+        setLayoutNonce((value) => value + 1);
 
         const jointRadius = Math.max((maxHeight || 1) * 0.016, 1e-4);
         const jointGeo = new THREE.SphereGeometry(jointRadius, 10, 10);
@@ -238,12 +234,6 @@ export function BvhScene({
         mixer.current = probeMixer;
         action.current = probeAction;
         if (clipDur > 0) onDurationRef.current?.(clipDur);
-        setScale(nextScale);
-        setOffset([
-          fixedOffset.current.x,
-          fixedOffset.current.y,
-          fixedOffset.current.z,
-        ]);
         setBoneRoot(bone0);
         setHelper(nextHelper);
         setStatus("ready");
@@ -285,11 +275,17 @@ export function BvhScene({
 
   useEffect(() => {
     const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, detectedUnit));
-    const { x, minY, z } = layoutRef.current;
-    fixedOffset.current.set(-x * nextScale, -minY * nextScale, -z * nextScale);
+    const next = uprightGroundOffset(
+      samplesRef.current.points,
+      samplesRef.current.roots,
+      rotationX,
+      nextScale,
+    );
+    fixedOffset.current.set(next[0], next[1], next[2]);
+    offsetReady.current = samplesRef.current.points.length > 0;
     setScale(nextScale);
-    setOffset([fixedOffset.current.x, fixedOffset.current.y, fixedOffset.current.z]);
-  }, [unitMode, detectedUnit]);
+    setOffset(next);
+  }, [unitMode, detectedUnit, rotationX, layoutNonce]);
 
   useEffect(() => {
     applyViewerFigureColors(helperRef.current, boneRootRef.current, look);
@@ -322,8 +318,8 @@ export function BvhScene({
     <>
       {helper && <primitive object={helper} />}
       <SkeletonLines root={boneRoot} color={look.bone} />
-      <group rotation={[rotationX, 0, 0]}>
-        <group ref={centerRef} position={offset}>
+      <group ref={centerRef} position={offset}>
+        <group rotation={[rotationX, 0, 0]}>
           {boneRoot && (
             <group scale={scale}>
               <primitive object={boneRoot} />
@@ -352,15 +348,15 @@ export function BvhScene({
 }
 
 /** 骨架关节，以及刚体 / marker 网格的包围盒角点。 */
-function collectPoseSamples(root: THREE.Object3D): { y: number; z: number }[] {
-  const points: { y: number; z: number }[] = [];
+function collectPoseSamples(root: THREE.Object3D): LayoutPoint[] {
+  const points: LayoutPoint[] = [];
   root.updateMatrixWorld(true);
   root.traverse((obj) => {
     const bone = obj as THREE.Bone;
     const mesh = obj as THREE.Mesh;
     if (bone.isBone) {
       obj.getWorldPosition(_bvhPt);
-      points.push({ y: _bvhPt.y, z: _bvhPt.z });
+      points.push({ x: _bvhPt.x, y: _bvhPt.y, z: _bvhPt.z });
       return;
     }
     if (
@@ -381,7 +377,7 @@ function collectPoseSamples(root: THREE.Object3D): { y: number; z: number }[] {
       for (const y of ys) {
         for (const z of zs) {
           _bvhPt.set(x, y, z).applyMatrix4(mesh.matrixWorld);
-          points.push({ y: _bvhPt.y, z: _bvhPt.z });
+          points.push({ x: _bvhPt.x, y: _bvhPt.y, z: _bvhPt.z });
         }
       }
     }
@@ -585,7 +581,8 @@ export function FbxScene({
   onDetectedRef.current = onDetectedUpAxis;
   const onDetectedUnitRef = useRef(onDetectedLengthUnit);
   onDetectedUnitRef.current = onDetectedLengthUnit;
-  const layoutRef = useRef({ x: 0, minY: 0, z: 0 });
+  const samplesRef = useRef<{ points: LayoutPoint[]; roots: LayoutPoint[] }>({ points: [], roots: [] });
+  const [layoutNonce, setLayoutNonce] = useState(0);
   const [detectedUnit, setDetectedUnit] = useState<LengthUnit>("m");
   const [object, setObject] = useState<THREE.Group | null>(null);
   const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
@@ -622,6 +619,7 @@ export function FbxScene({
     action.current = null;
     offsetReady.current = false;
     fixedOffset.current.set(0, 0, 0);
+    samplesRef.current = { points: [], roots: [] };
     if (helperRef.current) {
       helperRef.current.geometry.dispose();
       (helperRef.current.material as THREE.Material).dispose();
@@ -655,13 +653,11 @@ export function FbxScene({
         }
 
         const clipDur = clip?.duration || 1;
-        let sumX = 0;
-        let sumZ = 0;
-        let samples = 0;
-        let minY = Infinity;
         let spanY = 0;
         let spanZ = 0;
-        const poseFrames: { y: number; z: number }[][] = [];
+        const poseFrames: LayoutPoint[][] = [];
+        const roots: LayoutPoint[] = [];
+        const points: LayoutPoint[] = [];
         const measureRoot = primaryBoneRoot(obj) ?? obj;
         const n = probeAction && probeMixer ? 24 : 1;
         for (let i = 0; i < n; i++) {
@@ -671,21 +667,26 @@ export function FbxScene({
           }
           const pose = collectPoseSamples(obj);
           if (pose.length >= 3) poseFrames.push(pose);
+          points.push(...pose);
           expandSkeletonBox(measureRoot, _bvhBox);
           if (_bvhBox.isEmpty()) continue;
           const mid = _bvhBox.getCenter(_bvhHips);
-          sumX += mid.x;
-          sumZ += mid.z;
-          samples += 1;
-          minY = Math.min(minY, _bvhBox.min.y);
+          roots.push({ x: mid.x, y: mid.y, z: mid.z });
           spanY = Math.max(spanY, _bvhBox.max.y - _bvhBox.min.y);
           spanZ = Math.max(spanZ, _bvhBox.max.z - _bvhBox.min.z);
         }
-        const meanX = samples ? sumX / samples : 0;
-        const meanZ = samples ? sumZ / samples : 0;
-        if (!Number.isFinite(minY)) minY = 0;
         const skelHeight = Math.max(spanY, spanZ);
         expandMeshBox(obj, _meshBox);
+        if (!_meshBox.isEmpty()) {
+          const xs = [_meshBox.min.x, _meshBox.max.x];
+          const ys = [_meshBox.min.y, _meshBox.max.y];
+          const zs = [_meshBox.min.z, _meshBox.max.z];
+          for (const x of xs) {
+            for (const y of ys) {
+              for (const z of zs) points.push({ x, y, z });
+            }
+          }
+        }
         const meshHeight = _meshBox.isEmpty()
           ? 0
           : Math.max(
@@ -697,24 +698,10 @@ export function FbxScene({
         const unit = detectLengthUnitFromExtents(skelHeight, meshHeight);
         setDetectedUnit(unit);
         onDetectedUnitRef.current?.(unit);
-        const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, unit));
         const charHeight = skelHeight > 1e-6 ? skelHeight : meshHeight;
-        layoutRef.current = { x: meanX, minY, z: meanZ };
-        if (_meshBox.isEmpty() && Number.isFinite(minY)) {
-          /* keep bone-based floor */
-        } else if (!_meshBox.isEmpty()) {
-          minY = Math.min(minY, _meshBox.min.y);
-          layoutRef.current.minY = minY;
-        }
-        fixedOffset.current.set(
-          -meanX * nextScale,
-          -minY * nextScale,
-          -meanZ * nextScale
-        );
-        offsetReady.current = true;
+        samplesRef.current = { points, roots };
+        setLayoutNonce((value) => value + 1);
 
-        const skelMeters = skelHeight * nextScale;
-        const meshMeters = meshHeight * nextScale;
         if (meshCount) {
           applyFbxMeshMaterials(obj, look);
         }
@@ -732,12 +719,6 @@ export function FbxScene({
         mixer.current = probeMixer;
         action.current = probeAction;
         if (clip && clip.duration > 0) onDurationRef.current?.(clip.duration);
-        setScale(nextScale);
-        setOffset([
-          fixedOffset.current.x,
-          fixedOffset.current.y,
-          fixedOffset.current.z,
-        ]);
         setObject(obj);
         setHelper(nextHelper);
         setStatus("ready");
@@ -764,11 +745,17 @@ export function FbxScene({
 
   useEffect(() => {
     const nextScale = lengthUnitToScale(resolveLengthUnit(unitMode, detectedUnit));
-    const { x, minY, z } = layoutRef.current;
-    fixedOffset.current.set(-x * nextScale, -minY * nextScale, -z * nextScale);
+    const next = uprightGroundOffset(
+      samplesRef.current.points,
+      samplesRef.current.roots,
+      rotationX,
+      nextScale,
+    );
+    fixedOffset.current.set(next[0], next[1], next[2]);
+    offsetReady.current = samplesRef.current.points.length > 0;
     setScale(nextScale);
-    setOffset([fixedOffset.current.x, fixedOffset.current.y, fixedOffset.current.z]);
-  }, [unitMode, detectedUnit]);
+    setOffset(next);
+  }, [unitMode, detectedUnit, rotationX, layoutNonce]);
 
   useEffect(() => {
     applyViewerFigureColors(helperRef.current, objectRef.current, look);
@@ -801,8 +788,8 @@ export function FbxScene({
     <>
       {helper && <primitive object={helper} />}
       <SkeletonLines root={object} color={look.bone} />
-      <group rotation={[rotationX, 0, 0]}>
-        <group ref={centerRef} position={offset}>
+      <group ref={centerRef} position={offset}>
+        <group rotation={[rotationX, 0, 0]}>
           {object && (
             <group scale={scale}>
               <primitive object={object} />

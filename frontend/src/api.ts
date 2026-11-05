@@ -309,6 +309,17 @@ export const api = {
     return request<import("./types").StorageOverview>(
       `/api/storage/overview${q.size ? `?${q}` : ""}`
     ).then((data) => {
+      // The server leaves out file fields that equal the parent unit.
+      for (const batch of data.batches || []) {
+        for (const unit of batch.units || []) {
+          for (const file of unit.files || []) {
+            if (!file.batch) file.batch = unit.batch;
+            if (!file.unit_name) file.unit_name = unit.name;
+            if (!file.name) file.name = file.path.slice(file.path.lastIndexOf("/") + 1);
+            if (file.taxonomy_tag_ids === undefined) file.taxonomy_tag_ids = unit.taxonomy_tag_ids;
+          }
+        }
+      }
       const units =
         data.units?.length
           ? data.units
@@ -549,6 +560,11 @@ export const api = {
       `/api/repo/retarget/priority/presets/${encodeURIComponent(presetId)}/apply`,
       { method: "POST" },
     ),
+  setRetargetControl: (body: { desired: "running" | "stopped"; performance: "auto" | "light" | "balanced" | "heavy" }) =>
+    request<import("./pages/RetargetManagePage").RetargetStatus>("/api/repo/retarget/control", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   previewUrl: (kind: "human" | "robot", id: number) => `/api/previews/${kind}/${id}`,
   smplMotionUrl: (id: number) => `/api/previews/human/${id}/smpl`,

@@ -62,6 +62,7 @@ LEGACY_SCHEME_NAMES: dict[str, str] = {
     "意图功能": "动作意图",
     "风格化模式": "动作风格",
     "录制地点": "获取地点",
+    "获取方式": "人体数据获取方式",
 }
 
 _B = Capability.browse

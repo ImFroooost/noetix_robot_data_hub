@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROBOTS = ("noetix_e2v2_1015", "unitree_g1", "noetix_e2")
-DATA_MODES = ("taxonomy", "rest")
+DATA_MODES = ("taxonomy", "rest", "targets")
 UNLISTED = "unlisted"
 _SCHEME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -82,8 +82,26 @@ def default_rules() -> list[dict]:
     ]
 
 
+def describe_targets(rule: dict) -> str:
+    parts: list[str] = []
+    for item in rule.get("targets") or []:
+        batch = str(item.get("batch") or "")
+        units = [str(name) for name in (item.get("units") or []) if str(name).strip()]
+        if not batch:
+            continue
+        if not units:
+            parts.append(f"{batch}（整批）")
+        elif len(units) == 1:
+            parts.append(f"{batch} / {units[0]}")
+        else:
+            parts.append(f"{batch}（{len(units)} 个单元）")
+    return "、".join(parts) or "未选数据"
+
+
 def describe_rule(rule: dict, earlier_robots: set[str] | None = None) -> str:
     robots = " → ".join(rule.get("robots") or []) or "未选机器人"
+    if rule.get("data_mode") == "targets":
+        return f"{describe_targets(rule)} · {robots}"
     if rule.get("data_mode") == "rest":
         covered = set(rule.get("robots") or [])
         if earlier_robots is not None and covered and covered.isdisjoint(earlier_robots):
@@ -118,10 +136,23 @@ def describe_rule(rule: dict, earlier_robots: set[str] | None = None) -> str:
     return text
 
 
+def targets_match(rule: dict, batch: str, unit: str) -> bool:
+    for item in rule.get("targets") or []:
+        if str(item.get("batch") or "") != batch:
+            continue
+        names = [str(name) for name in (item.get("units") or []) if str(name).strip()]
+        if not names or unit in names:
+            return True
+    return False
+
+
 def job_queue(
     style: str,
     tag_ids: set[int],
     compiled: list[tuple],
+    *,
+    batch: str = "",
+    unit: str = "",
 ) -> str:
     """First matching rule id, or UNLISTED when no rule covers this job.
 
@@ -134,6 +165,10 @@ def job_queue(
         exclude_ids = item[2] if len(item) > 2 else set()
         scopes = item[4] if len(item) > 4 else None
         if style not in (rule.get("robots") or []):
+            continue
+        if rule.get("data_mode") == "targets":
+            if targets_match(rule, batch, unit):
+                return str(rule["id"])
             continue
         if rule.get("data_mode") == "rest":
             return str(rule["id"])
@@ -171,6 +206,35 @@ def _clean_picks(value: object, scheme: str, names: list[str]) -> list[dict]:
     return picks
 
 
+def _clean_targets(value: object, *, strict: bool) -> list[dict]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        if strict:
+            raise ValueError("指定数据格式不正确")
+        return []
+    items: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        batch = str(item.get("batch") or "").strip()
+        if not batch or "/" in batch or "\\" in batch or len(batch) > 200:
+            if strict:
+                raise ValueError("批次名无效")
+            continue
+        units: list[str] = []
+        for name in item.get("units") or []:
+            text = str(name or "").strip()
+            if not text or "/" in text or "\\" in text or len(text) > 300:
+                if strict:
+                    raise ValueError("数据单元名无效")
+                continue
+            if text not in units:
+                units.append(text)
+        items.append({"batch": batch, "units": units})
+    return items
+
+
 def _clean_rule(raw: object, *, strict: bool, index: int) -> dict | None:
     if not isinstance(raw, dict):
         if strict:
@@ -200,8 +264,13 @@ def _clean_rule(raw: object, *, strict: bool, index: int) -> dict | None:
     mode = str(raw.get("data_mode") or "taxonomy")
     if mode not in DATA_MODES:
         if strict:
-            raise ValueError("数据范围只能是指定分类或其余数据")
+            raise ValueError("数据范围只能是指定分类、指定数据或其余数据")
         mode = "rest"
+    targets = _clean_targets(raw.get("targets"), strict=strict) if mode == "targets" else []
+    if mode == "targets" and not targets:
+        if strict:
+            raise ValueError("请指定批次或数据单元")
+        return None
     scheme = str(raw.get("scheme") or "").strip()
     if scheme and not _SCHEME_RE.match(scheme):
         if strict and mode == "taxonomy" and not isinstance(raw.get("include_picks"), list):
@@ -217,17 +286,16 @@ def _clean_rule(raw: object, *, strict: bool, index: int) -> dict | None:
         name = str(item or "").strip()
         if name and name not in legacy_exclude:
             legacy_exclude.append(name)
-    include_picks = _clean_picks(raw.get("include_picks"), scheme, legacy_include)
-    exclude_picks = _clean_picks(raw.get("exclude_picks"), scheme, legacy_exclude)
+    include_picks = [] if mode != "taxonomy" else _clean_picks(raw.get("include_picks"), scheme, legacy_include)
+    exclude_picks = [] if mode != "taxonomy" else _clean_picks(raw.get("exclude_picks"), scheme, legacy_exclude)
     if mode == "taxonomy" and not include_picks:
         if strict:
             raise ValueError("指定分类时至少选一个分类")
         return None
-    if mode == "rest":
-        include_picks = []
-        exclude_picks = []
     if include_picks:
         scheme = include_picks[0]["scheme"]
+    elif mode != "taxonomy":
+        scheme = ""
     return {
         "id": rule_id,
         "enabled": bool(raw.get("enabled", True)),
@@ -238,6 +306,7 @@ def _clean_rule(raw: object, *, strict: bool, index: int) -> dict | None:
         "exclude_names": [item["name"] for item in exclude_picks],
         "include_picks": include_picks,
         "exclude_picks": exclude_picks,
+        "targets": targets,
     }
 
 
@@ -259,6 +328,12 @@ def _reject_shadowed(rules: list[dict]) -> None:
                 name = "、".join(sorted(overlap))
                 raise ValueError(f"{name} 的其余数据重复了，后面那条不会排到任务")
             seen_rest |= robots
+            continue
+        if rule["data_mode"] == "targets":
+            overlap = robots & seen_rest
+            if overlap:
+                name = "、".join(sorted(overlap))
+                raise ValueError(f"{name} 的其余数据已经排在更前面，这条指定数据不会生效。请把它移到其余数据之前。")
             continue
         overlap = robots & seen_rest
         if overlap:
@@ -377,11 +452,11 @@ def load_presets(hub: Path) -> list[dict]:
 def _preset_name(name: str) -> str:
     cleaned = str(name or "").strip().replace("\n", " ")
     if not cleaned:
-        raise ValueError("请填写规则名称")
+        raise ValueError("请填写预设名称")
     if len(cleaned) > 24:
-        raise ValueError("规则名称最多 24 个字")
-    if cleaned == "内置默认":
-        raise ValueError("这个名称留给内置默认规则")
+        raise ValueError("预设名称最多 24 个字")
+    if cleaned in {"内置默认", "内置预设"}:
+        raise ValueError("这个名称留给内置预设")
     return cleaned
 
 
@@ -473,28 +548,86 @@ def add_pins(hub: Path, items: list[dict]) -> list[dict]:
     return result
 
 
+def _target_rule(items: list[dict]) -> dict:
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "enabled": True,
+        "robots": list(ROBOTS),
+        "data_mode": "targets",
+        "scheme": "",
+        "include_names": [],
+        "exclude_names": [],
+        "include_picks": [],
+        "exclude_picks": [],
+        "targets": items,
+    }
+
+
+def _target_key(item: dict) -> tuple[str, tuple[str, ...]]:
+    return (str(item.get("batch") or ""), tuple(str(name) for name in (item.get("units") or [])))
+
+
+def migrate_pins_into_rules(hub: Path) -> bool:
+    """Turn the old pin list into editable priority tiers, highest pin first."""
+    pins = load_pins(hub)
+    if not pins:
+        return False
+    current = load_config(hub)
+    existing = {
+        _target_key(item)
+        for rule in current["rules"]
+        if rule.get("data_mode") == "targets"
+        for item in rule.get("targets") or []
+    }
+    fresh = [_target_rule([pin]) for pin in pins if _target_key(pin) not in existing]
+    if fresh:
+        save_config(hub, {"rules": fresh + current["rules"]})
+    path = pins_path(hub)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    return bool(fresh)
+
+
+def promote_targets(hub: Path, items: list[dict]) -> dict:
+    """Insert one new top tier for the chosen batches or units."""
+    migrate_pins_into_rules(hub)
+    targets = _clean_targets(items, strict=True)
+    if not targets:
+        raise ValueError("没有可优先的数据")
+    current = load_config(hub)
+    rules = [_target_rule(targets)] + current["rules"]
+    if len(rules) > _MAX_RULES:
+        raise ValueError(f"最多 {_MAX_RULES} 档优先级")
+    save_config(hub, {"rules": rules})
+    return public_config(hub)
+
+
 def save_preset(hub: Path, name: str, rules: list) -> dict:
+    """Store the given rules as a new named preset. The running priority is unchanged."""
     title = _preset_name(name)
     cleaned_rules = normalize({"rules": rules}, strict=True)["rules"]
     presets = load_presets(hub)
-    current = next((item for item in presets if item["name"] == title), None)
-    if current is None:
-        if len(presets) >= _MAX_PRESETS:
-            raise ValueError(f"最多保存 {_MAX_PRESETS} 套默认规则")
-        current = {"id": uuid.uuid4().hex[:12], "name": title, "rules": cleaned_rules}
-        presets.append(current)
-    else:
-        current["rules"] = cleaned_rules
+    if any(item["name"] == title for item in presets):
+        raise ValueError(f"已经有名为「{title}」的预设，请换一个名称")
+    if len(presets) >= _MAX_PRESETS:
+        raise ValueError(f"最多保存 {_MAX_PRESETS} 套预设")
+    current = {"id": uuid.uuid4().hex[:12], "name": title, "rules": cleaned_rules}
+    presets.append(current)
     _write_presets_file(hub, presets)
     return current
 
 
 def delete_preset(hub: Path, preset_id: str) -> None:
     if preset_id == _BUILTIN_PRESET_ID:
-        raise ValueError("内置默认规则不能删除")
+        raise ValueError("内置预设不能删除")
     presets = [item for item in load_presets(hub) if item["id"] != preset_id]
     if len(presets) == len(load_presets(hub)):
-        raise ValueError("没有这套默认规则")
+        raise ValueError("没有这套预设")
     _write_presets_file(hub, presets)
 
 
@@ -503,14 +636,14 @@ def preset_rules(hub: Path, preset_id: str) -> list[dict]:
         return default_rules()
     found = next((item for item in load_presets(hub) if item["id"] == preset_id), None)
     if found is None:
-        raise ValueError("没有这套默认规则")
+        raise ValueError("没有这套预设")
     return found["rules"]
 
 
 def public_presets(hub: Path) -> list[dict]:
     builtin = {
         "id": _BUILTIN_PRESET_ID,
-        "name": "内置默认",
+        "name": "内置预设",
         "builtin": True,
         "rules": default_rules(),
     }
@@ -522,6 +655,7 @@ def public_presets(hub: Path) -> list[dict]:
 
 
 def public_config(hub: Path) -> dict:
+    migrate_pins_into_rules(hub)
     cfg = load_config(hub)
     cfg["robots"] = list(ROBOTS)
     cfg["defaults"] = default_rules()

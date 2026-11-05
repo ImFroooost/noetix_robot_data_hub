@@ -1840,7 +1840,7 @@ function QuickUpload({
   onUploaded,
 }: {
   unit: StorageUnit;
-  preset?: { ontology: string; modality: string; motionKind?: MotionKind };
+  preset?: { ontology: string; modality: string; motionKind?: MotionKind; robotAcquireMethod?: string };
   manageOverride: boolean;
   onClose: () => void;
   onUploaded: () => void;
@@ -1914,6 +1914,9 @@ function QuickUpload({
       form.set("format", resolvedFormat);
       form.set("batch", unit.batch);
       form.set("unit_name", unit.name);
+      if (ontology === "robot" && modality === "motion" && preset?.robotAcquireMethod) {
+        form.set("robot_acquire_method", preset.robotAcquireMethod);
+      }
       form.set("replace", String(replace));
       form.set("manage_override", String(manageOverride));
       form.set(
@@ -3289,6 +3292,18 @@ function fileRobotStyle(file: StorageFile, unit?: StorageUnit | null) {
   return String(file.robot_style || file.annotation?.robot_style || unit?.annotation?.robot_style || "").trim();
 }
 
+const ROBOT_ACQUIRE_METHODS = ["omniretarget", "umr", "gmr"] as const;
+
+function fileRobotAcquireMethod(file: StorageFile) {
+  const stored = String(file.robot_acquire_method || "").trim();
+  if ((ROBOT_ACQUIRE_METHODS as readonly string[]).includes(stored)) return stored;
+  const parts = file.path.split("/");
+  const motion = parts.indexOf("motion");
+  const next = motion >= 0 ? parts[motion + 1] : "";
+  if ((ROBOT_ACQUIRE_METHODS as readonly string[]).includes(next)) return next;
+  return "omniretarget";
+}
+
 type DownloadConfirm = {
   kinds: { ontology: string; modality: string; format: string }[];
   robotStyles?: string[];
@@ -3537,6 +3552,7 @@ function UnitMatrix({
     ontology: string;
     modality: string;
     motionKind?: MotionKind;
+    robotAcquireMethod?: string;
   }) => void;
   showEmpty?: boolean;
 }) {
@@ -3548,12 +3564,20 @@ function UnitMatrix({
     ),
   ].sort((a, b) => a.localeCompare(b, "zh"));
   const [robotStyle, setRobotStyle] = useState(robotStyles[0] || "");
+  const [robotMethod, setRobotMethod] = useState("omniretarget");
   const activeStyle = robotStyles.includes(robotStyle) ? robotStyle : robotStyles[0] || "";
+  const activeMethod = (ROBOT_ACQUIRE_METHODS as readonly string[]).includes(robotMethod)
+    ? robotMethod
+    : "omniretarget";
   const styleFilter = (file: StorageFile) => {
     if (file.ontology !== "robot") return true;
     if (!robotStyles.length) return true;
     const style = String(file.robot_style || file.annotation?.robot_style || "").trim();
     return style === activeStyle;
+  };
+  const methodFilter = (file: StorageFile) => {
+    if (file.ontology !== "robot") return true;
+    return fileRobotAcquireMethod(file) === activeMethod;
   };
 
   return (
@@ -3581,13 +3605,28 @@ function UnitMatrix({
           {ontology === "robot" && robotStyles.length === 1 && (
             <div className="storage-robot-style-label">款式：{robotStyles[0]}</div>
           )}
+          {ontology === "robot" && (
+            <div className="storage-robot-style-tabs">
+              {ROBOT_ACQUIRE_METHODS.map((method) => (
+                <button
+                  key={method}
+                  type="button"
+                  className={`storage-robot-style-tab ${method === activeMethod ? "active" : "secondary"}`}
+                  onClick={() => setRobotMethod(method)}
+                >
+                  {method}
+                </button>
+              ))}
+            </div>
+          )}
           {matrixRows().map(({ key, modality, motionKind, label }) => {
             const files = unit.files.filter(
               (f) =>
                 f.ontology === ontology &&
                 f.modality === modality &&
                 (!motionKind || resolveMotionKind(f.annotation?.motion_kind) === motionKind) &&
-                styleFilter(f)
+                styleFilter(f) &&
+                methodFilter(f)
             );
             if (!showEmpty && !files.length) return null;
             return (
@@ -3638,7 +3677,12 @@ function UnitMatrix({
                         onFile(last);
                         return;
                       }
-                      onQuickUpload({ ontology, modality, motionKind });
+                      onQuickUpload({
+                        ontology,
+                        modality,
+                        motionKind,
+                        robotAcquireMethod: ontology === "robot" ? activeMethod : undefined,
+                      });
                     }}
                   >
                     +
@@ -3673,20 +3717,29 @@ function parseSortTime(value?: string | null) {
   return Number.isFinite(stamp) ? stamp : 0;
 }
 
+const NAME_COLLATOR = new Intl.Collator("zh", { numeric: true, sensitivity: "base" });
+
 function compareNames(left: string, right: string) {
-  return left.localeCompare(right, "zh", { numeric: true, sensitivity: "base" });
+  return NAME_COLLATOR.compare(left, right);
 }
+
+type SortTimes = { created: number; uploaded: number; modified: number };
+const sortTimesCache = new WeakMap<object, SortTimes>();
 
 function entitySortTimes(item: {
   created_at?: string;
   uploaded_at?: string;
   modified_at?: string;
-}) {
-  return {
+}): SortTimes {
+  const cached = sortTimesCache.get(item);
+  if (cached) return cached;
+  const times = {
     created: parseSortTime(item.created_at),
     uploaded: parseSortTime(item.uploaded_at),
     modified: parseSortTime(item.modified_at),
   };
+  sortTimesCache.set(item, times);
+  return times;
 }
 
 function sortStorageUnits(units: StorageUnit[], sortMode: string) {
@@ -3696,54 +3749,19 @@ function sortStorageUnits(units: StorageUnit[], sortMode: string) {
 }
 
 function sortBatchNames(names: string[], units: StorageUnit[], sortMode: string) {
-  const groups = new Map<string, StorageUnit[]>();
+  const rows = new Map<string, { name: string; created_at: string; uploaded_at: string; modified_at: string }>();
+  for (const name of names) rows.set(name, { name, created_at: "", uploaded_at: "", modified_at: "" });
   for (const unit of units) {
-    const list = groups.get(unit.batch) || [];
-    list.push(unit);
-    groups.set(unit.batch, list);
+    const row = rows.get(unit.batch);
+    if (!row) continue;
+    if (unit.created_at && (!row.created_at || unit.created_at < row.created_at)) row.created_at = unit.created_at;
+    if (unit.uploaded_at && unit.uploaded_at > row.uploaded_at) row.uploaded_at = unit.uploaded_at;
+    if (unit.modified_at && unit.modified_at > row.modified_at) row.modified_at = unit.modified_at;
   }
   return [...names].sort((left, right) =>
     compareByStorageSort(
-      {
-        name: left,
-        created_at: groups.get(left)?.reduce(
-          (earliest, unit) =>
-            !earliest || (unit.created_at && unit.created_at < earliest)
-              ? unit.created_at || earliest
-              : earliest,
-          ""
-        ),
-        uploaded_at: groups.get(left)?.reduce(
-          (latest, unit) =>
-            unit.uploaded_at && unit.uploaded_at > latest ? unit.uploaded_at : latest,
-          ""
-        ),
-        modified_at: groups.get(left)?.reduce(
-          (latest, unit) =>
-            unit.modified_at && unit.modified_at > latest ? unit.modified_at : latest,
-          ""
-        ),
-      },
-      {
-        name: right,
-        created_at: groups.get(right)?.reduce(
-          (earliest, unit) =>
-            !earliest || (unit.created_at && unit.created_at < earliest)
-              ? unit.created_at || earliest
-              : earliest,
-          ""
-        ),
-        uploaded_at: groups.get(right)?.reduce(
-          (latest, unit) =>
-            unit.uploaded_at && unit.uploaded_at > latest ? unit.uploaded_at : latest,
-          ""
-        ),
-        modified_at: groups.get(right)?.reduce(
-          (latest, unit) =>
-            unit.modified_at && unit.modified_at > latest ? unit.modified_at : latest,
-          ""
-        ),
-      },
+      rows.get(left)!,
+      rows.get(right)!,
       sortMode,
       (item) => item.name,
       entitySortTimes
@@ -4041,19 +4059,22 @@ function compareByStorageSort<T>(
   nameOf: (item: T) => string,
   timesOf: (item: T) => { created: number; uploaded: number; modified: number }
 ) {
-  const nameCmp = compareNames(nameOf(left), nameOf(right));
-  const a = timesOf(left);
-  const b = timesOf(right);
-  let primary = 0;
-  if (sortMode === "created_desc") primary = b.created - a.created;
-  else if (sortMode === "created_asc") primary = a.created - b.created;
-  else if (sortMode === "uploaded_desc") primary = b.uploaded - a.uploaded;
-  else if (sortMode === "uploaded_asc") primary = a.uploaded - b.uploaded;
-  else if (sortMode === "modified_desc") primary = b.modified - a.modified;
-  else if (sortMode === "modified_asc") primary = a.modified - b.modified;
-  else if (sortMode === "name_desc") return -nameCmp;
-  else return nameCmp;
-  return primary || nameCmp;
+  const field =
+    sortMode === "created_desc" || sortMode === "created_asc"
+      ? "created"
+      : sortMode === "uploaded_desc" || sortMode === "uploaded_asc"
+        ? "uploaded"
+        : sortMode === "modified_desc" || sortMode === "modified_asc"
+          ? "modified"
+          : null;
+  if (!field) {
+    const nameCmp = compareNames(nameOf(left), nameOf(right));
+    return sortMode === "name_desc" ? -nameCmp : nameCmp;
+  }
+  const a = timesOf(left)[field];
+  const b = timesOf(right)[field];
+  const primary = sortMode.endsWith("_desc") ? b - a : a - b;
+  return primary || compareNames(nameOf(left), nameOf(right));
 }
 
 function omitStorageRecords(
@@ -4166,6 +4187,7 @@ export function StorageWorkspace({
     ontology: string;
     modality: string;
     motionKind?: MotionKind;
+    robotAcquireMethod?: string;
   } | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -4383,8 +4405,9 @@ export function StorageWorkspace({
       .sort((a, b) =>
         compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes)
       );
+    const batchByName = new Map(data.batches.map((item) => [item.name, item]));
     return { ...data, batches, units: data.units.filter((unit) => {
-      const batch = data.batches.find((item) => item.name === unit.batch);
+      const batch = batchByName.get(unit.batch);
       return (
         unitMatchesSchemeFilters(unit, batch, filterNodeIds, nodes) &&
         unitMatchesExtraFilters(unit, extraChecks)
@@ -4656,7 +4679,7 @@ export function StorageWorkspace({
           : unique.length === 1
             ? `「${unique[0].name}」`
             : `${unique.length} 个数据单元`;
-      setMessage(`已把${label}设为重定向最高优先级。当前这一波结束后会先做。`);
+      setMessage(`已把${label}加为最上面的一档优先级。可在重定向管理里用上移、下移调整。当前这一波结束后会按新顺序扫描。`);
       setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "设置优先级失败");

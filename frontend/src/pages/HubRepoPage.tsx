@@ -159,10 +159,11 @@ function dimsFromTaxonomy(
     if (key.includes("location") || key.includes("place") || name.includes("地点") || name.includes("录制")) {
       acquire_location = text;
     } else if (
-      key.includes("method") ||
-      key.includes("acquire") ||
-      name.includes("获取方式") ||
-      (name.includes("方式") && !name.includes("设备"))
+      !name.includes("机器人数据获取") &&
+      (key.includes("method") ||
+        key.includes("acquire") ||
+        name.includes("获取方式") ||
+        (name.includes("方式") && !name.includes("设备")))
     ) {
       acquire_method = text;
     } else if (key.includes("device") || key.includes("equipment") || name.includes("设备")) {

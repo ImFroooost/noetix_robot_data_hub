@@ -36,6 +36,8 @@ DEFAULT_CSV_FPS = 30.0
 ONTOLOGIES = ("human", "robot")
 MODALITIES = ("tpv_video", "fpv_video", "motion", "text", "audio", "log")
 FPV_CHANNELS = ("rgb", "depth")
+ROBOT_ACQUIRE_METHODS = ("omniretarget", "umr", "gmr")
+DEFAULT_ROBOT_ACQUIRE_METHOD = "omniretarget"
 MODEL_KINDS = {
     "human": ("fbx", "bvh", "smpl", "blend"),
     "robot": ("standard_description", "fbx", "blend"),
@@ -296,10 +298,11 @@ def update_metadata(mutator) -> dict[str, Any]:
         mutator(data)
         data["version"] = int(data.get("version") or 1) + 1
         _write_json(metadata_path(), data)
-        global _metadata_cache, _metadata_mtime, _browse_force_sync
+        global _metadata_cache, _metadata_mtime, _browse_force_sync, _local_write_gen
         _metadata_cache = None
         _metadata_mtime = None
         _browse_force_sync = True
+        _local_write_gen += 1
         _invalidate_overlay_cache()
         return data
 
@@ -690,6 +693,13 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
         idx = 2
     if modality not in MODALITIES:
         return None
+    robot_acquire_method = ""
+    if ontology == "robot" and modality == "motion":
+        if idx < len(parts) and parts[idx] in ROBOT_ACQUIRE_METHODS:
+            robot_acquire_method = parts[idx]
+            idx += 1
+        else:
+            robot_acquire_method = DEFAULT_ROBOT_ACQUIRE_METHOD
     if modality == "fpv_video":
         if len(parts) < idx + 3 or parts[idx] not in FPV_CHANNELS:
             return None
@@ -713,20 +723,19 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
         unit_name = normalize_unit_stem((sub_path + "/" + stem).replace("/", "_")) or (sub_path + "_" + stem).replace("/", "_")
     else:
         unit_name = normalize_unit_stem(stem) or stem
-    return _file_record(
-        path,
-        base,
-        {
-            "ontology": ontology,
-            "modality": modality,
-            "channel": channel,
-            "format": fmt,
-            "batch": batch,
-            "robot_style": robot_style,
-            "unit_name": unit_name,
-            "sub_path": sub_path,
-        },
-    )
+    parsed = {
+        "ontology": ontology,
+        "modality": modality,
+        "channel": channel,
+        "format": fmt,
+        "batch": batch,
+        "robot_style": robot_style,
+        "unit_name": unit_name,
+        "sub_path": sub_path,
+    }
+    if robot_acquire_method:
+        parsed["robot_acquire_method"] = robot_acquire_method
+    return _file_record(path, base, parsed)
 
 
 def _assemble_data_index(
@@ -1037,7 +1046,7 @@ def _merge_catalog_delta(
     removed_model_instances: list[str] | None = None,
 ) -> None:
     """Persist an incremental index change without rewriting catalog.json."""
-    global _browse_force_sync
+    global _browse_force_sync, _local_write_gen
     with _INDEX_LOCK:
         delta = _read_catalog_delta()
         removed_data = {str(path) for path in delta["removed_data_paths"] if path}
@@ -1094,6 +1103,7 @@ def _merge_catalog_delta(
         )
         _invalidate_catalog_view()
         _browse_force_sync = True
+        _local_write_gen += 1
 
 
 def _apply_model_delta(models: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
@@ -1615,6 +1625,34 @@ _browse_refresh_lock = threading.Lock()
 # Set when this process writes metadata. Retarget updates on the host must not
 # force the next page open to re-read the whole index.
 _browse_force_sync = False
+# Bumped on every write made by this process. A cached page body built before
+# the bump is stale for the user who just saved; one built after only an
+# outside (host retarget) change may still be served while a fresh one builds.
+_local_write_gen = 0
+_index_listeners: list[Callable[[bool], None]] = []
+
+
+_browse_serial: dict[bool, int] = {}
+# Re-reading the index holds the interpreter for several seconds and stalls
+# every other request. Outside writes (the host retarget loop finishes a wave
+# every few minutes) are picked up at most this often.
+_OUTSIDE_REFRESH_MIN_SEC = 90.0
+_browse_refreshed_at: dict[bool, float] = {}
+
+
+def local_write_generation() -> int:
+    return _local_write_gen
+
+
+def browse_snapshot_serial(include_empty: bool = False) -> int:
+    """Changes whenever a different browse snapshot is swapped in."""
+    return _browse_serial.get(include_empty, 0)
+
+
+def add_index_listener(listener: Callable[[bool], None]) -> None:
+    """Run after a background index refresh swaps in a newer snapshot."""
+    if listener not in _index_listeners:
+        _index_listeners.append(listener)
 
 
 def _index_stamp() -> tuple[float | None, ...]:
@@ -1646,6 +1684,12 @@ def _refresh_data_index(include_empty: bool, stamp: tuple[float | None, ...]) ->
             _browse_refreshing.discard(include_empty)
     _browse_ready[include_empty] = data
     _browse_key[include_empty] = stamp
+    _browse_serial[include_empty] = _browse_serial.get(include_empty, 0) + 1
+    for listener in list(_index_listeners):
+        try:
+            listener(include_empty)
+        except Exception:
+            pass
 
 
 def load_data_index(*, include_empty: bool = False) -> dict[str, Any]:
@@ -1662,8 +1706,11 @@ def load_data_index(*, include_empty: bool = False) -> dict[str, Any]:
     if ready is not None and not _browse_force_sync:
         if _browse_key.get(include_empty) != stamp:
             with _browse_refresh_lock:
-                if include_empty not in _browse_refreshing:
+                now = time.monotonic()
+                recent = now - _browse_refreshed_at.get(include_empty, 0.0) < _OUTSIDE_REFRESH_MIN_SEC
+                if include_empty not in _browse_refreshing and not recent:
                     _browse_refreshing.add(include_empty)
+                    _browse_refreshed_at[include_empty] = now
                     threading.Thread(
                         target=_refresh_data_index,
                         args=(include_empty, stamp),
@@ -1674,6 +1721,7 @@ def load_data_index(*, include_empty: bool = False) -> dict[str, Any]:
     data = _build_data_index(include_empty=include_empty)
     _browse_ready[include_empty] = data
     _browse_key[include_empty] = _index_stamp()
+    _browse_serial[include_empty] = _browse_serial.get(include_empty, 0) + 1
     _browse_force_sync = False
     return data
 
@@ -1796,11 +1844,14 @@ def rebuild_catalog() -> dict[str, Any]:
             "data": data,
             "models": models,
         }
+        global _browse_force_sync, _local_write_gen
         with _INDEX_LOCK:
             _write_json(catalog_path(), snapshot, compact=True)
             if _delta_mtime() == delta_stamp:
                 _clear_catalog_delta_unlocked()
             _invalidate_catalog_cache()
+            _browse_force_sync = True
+            _local_write_gen += 1
         stats = {
             "file_count": len(data.get("files") or []),
             "unit_count": len(data.get("units") or []),
@@ -2140,6 +2191,7 @@ def data_destination(
     batch: str,
     filename: str,
     robot_style: str = "",
+    robot_acquire_method: str = "",
     sub_path: str = "",
 ) -> Path:
     if ontology not in ONTOLOGIES:
@@ -2157,6 +2209,11 @@ def data_destination(
     parts.append(modality)
     if modality == "fpv_video":
         parts.append(channel)
+    if ontology == "robot" and modality == "motion":
+        method = (robot_acquire_method or DEFAULT_ROBOT_ACQUIRE_METHOD).strip().lower()
+        if method not in ROBOT_ACQUIRE_METHODS:
+            raise ValueError("机器人数据获取方式须为 omniretarget、umr 或 gmr")
+        parts.append(method)
     parts.append(fmt)
     parts.append(batch)
     if sub_path:
@@ -2485,6 +2542,7 @@ def save_data_file(
     replace: bool = False,
     update_index: bool = True,
     robot_style: str = "",
+    robot_acquire_method: str = "",
     sub_path: str = "",
     preserve_tree: bool = False,
 ) -> dict[str, Any]:
@@ -2510,6 +2568,7 @@ def save_data_file(
         batch=batch,
         filename=filename,
         robot_style=robot_style,
+        robot_acquire_method=robot_acquire_method,
         sub_path=sub_path,
     )
     dest.parent.mkdir(parents=True, exist_ok=True)

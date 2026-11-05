@@ -30,12 +30,13 @@ export type PriorityRule = {
   id: string;
   enabled: boolean;
   robots: string[];
-  data_mode: "taxonomy" | "rest";
+  data_mode: "taxonomy" | "rest" | "targets";
   scheme: string;
   include_names: string[];
   exclude_names: string[];
   include_picks?: TaxonomyPick[];
   exclude_picks?: TaxonomyPick[];
+  targets?: { batch: string; units: string[] }[];
 };
 
 export type PriorityPreset = {
@@ -90,6 +91,9 @@ export type RetargetStatus = {
   seconds_per_job?: number | null;
   pace_measured?: boolean;
   message?: string;
+  desired?: "running" | "stopped";
+  performance?: "auto" | "light" | "balanced" | "heavy";
+  performance_note?: string;
 };
 
 const PHASE_LABEL: Record<string, string> = {
@@ -98,8 +102,24 @@ const PHASE_LABEL: Record<string, string> = {
   waiting: "等待可用内存",
   idle: "没有待处理任务",
   stopped: "已停止",
+  stopping: "正在停止",
   error: "出错后重试",
 };
+
+const PERFORMANCE_MODES: { id: "auto" | "light" | "balanced" | "heavy"; label: string }[] = [
+  { id: "auto", label: "自动" },
+  { id: "light", label: "轻" },
+  { id: "balanced", label: "均衡" },
+  { id: "heavy", label: "高" },
+];
+
+function performanceHint(mode: string, note?: string) {
+  if (note && mode === "auto") return note;
+  if (mode === "light") return "最多 2 路，多留内存给桌面。当前这一波结束后生效。";
+  if (mode === "balanced") return "最多 4 路。当前这一波结束后生效。";
+  if (mode === "heavy") return "最多 8 路。内存不够时仍会少开几路。当前这一波结束后生效。";
+  return note || "按 CPU 负载和内存压力自动增减路数，空闲时最多 8 路。";
+}
 
 function formatTime(value?: string | null) {
   if (!value) return "—";
@@ -131,6 +151,10 @@ function rankLabel(rank: string) {
   return /^\d+$/.test(rank) ? `第 ${rank} 档` : rank;
 }
 
+function publishedRuleIds(queues: RetargetQueue[]) {
+  return queues.filter((queue) => queue.key !== "pinned" && queue.key !== "unlisted").map((queue) => queue.key);
+}
+
 function queueRemaining(queue: RetargetQueue) {
   if (typeof queue.remaining === "number") return queue.remaining;
   return Math.max(0, queue.total - queue.done - (queue.failed || 0));
@@ -159,6 +183,7 @@ function cloneRules(rules: PriorityRule[]): PriorityRule[] {
     exclude_names: [...(rule.exclude_names || [])],
     include_picks: (rule.include_picks || []).map((pick) => ({ ...pick })),
     exclude_picks: (rule.exclude_picks || []).map((pick) => ({ ...pick })),
+    targets: (rule.targets || []).map((item) => ({ batch: item.batch, units: [...item.units] })),
   }));
 }
 
@@ -185,6 +210,10 @@ function withPicks(rule: PriorityRule, kind: "include" | "exclude", picks: Taxon
 
 function ruleTitle(rule: PriorityRule, earlier: Set<string>) {
   const robots = rule.robots.join(" → ") || "未选机器人";
+  if (rule.data_mode === "targets") {
+    const data = (rule.targets || []).map((item) => pinLabel(item)).join("、") || "未选数据";
+    return `${data} · ${robots}`;
+  }
   if (rule.data_mode === "rest") {
     const untouched = rule.robots.length > 0 && rule.robots.every((robot) => !earlier.has(robot));
     return `${robots} · ${untouched ? "全部数据" : "其余数据"}`;
@@ -196,6 +225,94 @@ function ruleTitle(rule: PriorityRule, earlier: Set<string>) {
   if (exclude) text += `（不含 ${exclude}）`;
   if (rule.scheme && rule.scheme !== "custom_6") text += ` · ${rule.scheme}`;
   return text;
+}
+
+function sameRuleOrder(rules: PriorityRule[], queues: RetargetQueue[]) {
+  const enabled = rules.filter((rule) => rule.enabled).map((rule) => rule.id);
+  const published = publishedRuleIds(queues);
+  return enabled.length > 0 && enabled.length === published.length && enabled.every((id, index) => id === published[index]);
+}
+
+function QueueProgress({
+  queue,
+  title,
+  rank,
+}: {
+  queue: RetargetQueue;
+  title: string;
+  rank: string;
+}) {
+  const queueDone = queue.done + queue.failed;
+  const queuePercent = queue.total ? Math.min(100, (queueDone / queue.total) * 100) : 0;
+  return (
+    <li className={queue.active ? "is-active" : undefined}>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <strong>
+          {rank}
+          {queue.active ? " · 当前" : ""}
+        </strong>
+        <span>
+          {queue.done} / {queue.total}
+          {queue.failed ? `，失败 ${queue.failed}` : ""}
+        </span>
+      </div>
+      <div>{title}</div>
+      <div className="muted">{queueTimeText(queue)}</div>
+      <div className="retarget-bar">
+        <span className="retarget-bar-done" style={{ width: `${queuePercent}%` }} />
+        {queue.failed ? (
+          <span
+            className="retarget-bar-failed"
+            style={{ width: `${Math.min(100 - queuePercent, (queue.failed / queue.total) * 100)}%` }}
+          />
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function PriorityProgress({
+  rules,
+  queues,
+  countsReady,
+}: {
+  rules: PriorityRule[];
+  queues: RetargetQueue[];
+  countsReady: boolean;
+}) {
+  const byKey = new Map(queues.map((queue) => [queue.key, queue]));
+  const unlisted = byKey.get("unlisted");
+  return (
+    <>
+      {countsReady ? null : (
+        <p className="muted" style={{ margin: 0 }}>
+          各档和下面的规则是同一套。数量和预计时间会在当前这一波结束后按这个顺序重新统计。
+        </p>
+      )}
+      <ol className="retarget-queues">
+        {rules.map((rule, index) => {
+          const earlier = new Set(rules.slice(0, index).flatMap((item) => (item.enabled ? item.robots : [])));
+          const title = rule.enabled ? ruleTitle(rule, earlier) : "已停用，不会参与排序";
+          const queue = countsReady && rule.enabled ? byKey.get(rule.id) : undefined;
+          if (queue) {
+            return <QueueProgress key={rule.id} queue={queue} title={title} rank={`第 ${index + 1} 档`} />;
+          }
+          return (
+            <li key={rule.id}>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <strong>第 {index + 1} 档</strong>
+                <span className="muted">{rule.enabled ? "统计中" : "已停用"}</span>
+              </div>
+              <div>{title}</div>
+            </li>
+          );
+        })}
+        {countsReady && unlisted && unlisted.total > 0 ? (
+          <QueueProgress queue={unlisted} title={unlisted.title} rank={rankLabel(unlisted.rank)} />
+        ) : null}
+      </ol>
+    </>
+  );
 }
 
 function blankRule(robots: string[]): PriorityRule {
@@ -429,13 +546,14 @@ export function RetargetManagePage() {
   const [savedRules, setSavedRules] = useState<PriorityRule[]>([]);
   const [robots, setRobots] = useState<string[]>([]);
   const [presets, setPresets] = useState<PriorityPreset[]>([]);
-  const [pins, setPins] = useState<RetargetPin[]>([]);
+  const [, setPins] = useState<RetargetPin[]>([]);
   const [presetName, setPresetName] = useState("");
   const [schemes, setSchemes] = useState<TaxonomySchemeDef[]>([]);
   const [nodesByScheme, setNodesByScheme] = useState<Record<string, TaxonomyNode[]>>({});
   const [priorityError, setPriorityError] = useState("");
   const [priorityNote, setPriorityNote] = useState("");
   const [saving, setSaving] = useState(false);
+  const [controlBusy, setControlBusy] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const rulesRef = useRef(rules);
   const savedRef = useRef(savedRules);
@@ -584,7 +702,7 @@ export function RetargetManagePage() {
   const saveAsPreset = () => {
     const name = presetName.trim();
     if (!name) {
-      setPriorityError("请填写规则名称");
+        setPriorityError("请填写预设名称");
       return;
     }
     setSaving(true);
@@ -596,7 +714,11 @@ export function RetargetManagePage() {
         setPresets(cfg.presets || []);
         setPins(cfg.pins || []);
         setPresetName("");
-        setPriorityNote(`已把当前规则存为「${name}」。点这套规则的名称即可切换。`);
+        setPriorityNote(
+          dirty
+            ? `已新增预设「${name}」。点名称会换成这套。正在执行的还是上次保存的优先级，要让它马上按这套排队，请再点保存优先级。`
+            : `已新增预设「${name}」。点名称即可换成这套，当前这一波结束后重新扫描。`,
+        );
       })
       .catch((err: Error) => {
         setPriorityError(err.message || "保存失败");
@@ -614,7 +736,7 @@ export function RetargetManagePage() {
     api
       .applyRetargetPreset(preset.id)
       .then((cfg) => {
-        adoptConfig(cfg, `已切换到「${preset.name}」。当前这一波结束后会按这套规则重新扫描。`);
+        adoptConfig(cfg, `已换成预设「${preset.name}」。当前这一波结束后会按这套优先级重新扫描。`);
       })
       .catch((err: Error) => {
         setPriorityError(err.message || "切换失败");
@@ -634,7 +756,7 @@ export function RetargetManagePage() {
       .then((cfg) => {
         setPresets(cfg.presets || []);
         setPins(cfg.pins || []);
-        setPriorityNote(`已删除「${preset.name}」。正在执行的规则没有变。`);
+        setPriorityNote(`已删除预设「${preset.name}」。正在执行的优先级没有变。`);
       })
       .catch((err: Error) => {
         setPriorityError(err.message || "删除失败");
@@ -643,6 +765,19 @@ export function RetargetManagePage() {
         setSaving(false);
         savingRef.current = false;
       });
+  };
+
+  const updateControl = (
+    desired: "running" | "stopped",
+    performance: "auto" | "light" | "balanced" | "heavy",
+  ) => {
+    setControlBusy(true);
+    setError("");
+    api
+      .setRetargetControl({ desired, performance })
+      .then((next) => setData(next))
+      .catch((err: Error) => setError(err.message || "设置失败"))
+      .finally(() => setControlBusy(false));
   };
 
   if (!isAdmin) {
@@ -678,6 +813,39 @@ export function RetargetManagePage() {
             <span className="muted">{data?.message || ""}</span>
           </div>
           <span className="muted">更新于 {formatTime(data?.updated_at)}</span>
+        </div>
+        <div className="retarget-control">
+          <div className="row">
+            <button
+              type="button"
+              disabled={controlBusy || (data?.desired !== "stopped" && data?.running !== false)}
+              onClick={() => updateControl("running", data?.performance || "heavy")}
+            >
+              启动
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              disabled={controlBusy || data?.desired === "stopped" || data?.phase === "stopping"}
+              onClick={() => updateControl("stopped", data?.performance || "heavy")}
+            >
+              {data?.phase === "stopping" ? "正在停止" : "停止"}
+            </button>
+          </div>
+          <div className="retarget-modes" role="group" aria-label="占用强度">
+            {PERFORMANCE_MODES.map((mode) => (
+              <button
+                key={mode.id}
+                type="button"
+                className={(data?.performance || "heavy") === mode.id ? "is-on" : ""}
+                disabled={controlBusy}
+                onClick={() => updateControl(data?.desired === "stopped" ? "stopped" : "running", mode.id)}
+              >
+                {mode.label}
+              </button>
+            ))}
+          </div>
+          <span className="muted">{performanceHint(data?.performance || "heavy", data?.performance_note)}</span>
         </div>
         <p className="muted" style={{ margin: 0 }}>
           {data?.priority_note || "优先级会在扫描完成后显示。"}
@@ -734,58 +902,13 @@ export function RetargetManagePage() {
               ? "本轮还没有新的完成速度，每档时间先按以往的速度估计，这一波结束后会改成实测。"
               : "每档时间会在扫描完成、并有速度样本后显示。"}
         </p>
-        {pins.length || queues.length ? (
+        {rules.length ? (
+          <PriorityProgress rules={rules} queues={queues} countsReady={!dirty && sameRuleOrder(rules, queues)} />
+        ) : queues.length ? (
           <ol className="retarget-queues">
-            {pins.length ? (
-              <li className={queues.some((queue) => queue.key === "pinned" && queue.active) ? "is-active" : undefined}>
-                <div className="row" style={{ justifyContent: "space-between" }}>
-                  <strong>优先{queues.some((queue) => queue.key === "pinned" && queue.active) ? " · 当前" : ""}</strong>
-                  <span>
-                    {(() => {
-                      const live = queues.find((queue) => queue.key === "pinned");
-                      return live ? `${live.done} / ${live.total}${live.failed ? `，失败 ${live.failed}` : ""}` : "待开始";
-                    })()}
-                  </span>
-                </div>
-                {pins.map((pin) => (
-                  <div key={`${pin.batch}:${pin.units.join("|")}`}>{pinLabel(pin)}</div>
-                ))}
-                <div className="muted">
-                  {queues.some((queue) => queue.key === "pinned")
-                    ? queueTimeText(queues.find((queue) => queue.key === "pinned") as RetargetQueue)
-                    : "已指定。当前这一波结束后会排到所有规则前面。"}
-                </div>
-              </li>
-            ) : null}
-            {queues.filter((queue) => queue.key !== "pinned").map((queue) => {
-              const queueDone = queue.done + queue.failed;
-              const queuePercent = queue.total ? Math.min(100, (queueDone / queue.total) * 100) : 0;
-              return (
-                <li key={queue.key} className={queue.active ? "is-active" : undefined}>
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <strong>
-                      {rankLabel(queue.rank)}
-                      {queue.active ? " · 当前" : ""}
-                    </strong>
-                    <span>
-                      {queue.done} / {queue.total}
-                      {queue.failed ? `，失败 ${queue.failed}` : ""}
-                    </span>
-                  </div>
-                  <div>{queue.title}</div>
-                  <div className="muted">{queueTimeText(queue)}</div>
-                  <div className="retarget-bar">
-                    <span className="retarget-bar-done" style={{ width: `${queuePercent}%` }} />
-                    {queue.failed ? (
-                      <span
-                        className="retarget-bar-failed"
-                        style={{ width: `${Math.min(100 - queuePercent, (queue.failed / queue.total) * 100)}%` }}
-                      />
-                    ) : null}
-                  </div>
-                </li>
-              );
-            })}
+            {queues.filter((queue) => queue.key !== "pinned").map((queue) => (
+              <QueueProgress key={queue.key} queue={queue} title={queue.title} rank={rankLabel(queue.rank)} />
+            ))}
           </ol>
         ) : (
           <div className="muted">{data ? "扫描完成后显示各档数量和时间" : "正在读取进度…"}</div>
@@ -878,6 +1001,14 @@ export function RetargetManagePage() {
                     </label>
                   );
                 })}
+              </div>
+              {rule.data_mode === "targets" ? (
+                <div className="muted">
+                  这一档只包含上面这些数据。用上移、下移可以调整它和其他档的顺序。
+                </div>
+              ) : (
+                <>
+                <div className="retarget-inline">
                 <label className="retarget-check">
                   <input
                     type="radio"
@@ -896,7 +1027,7 @@ export function RetargetManagePage() {
                   />
                   其余数据
                 </label>
-              </div>
+                </div>
               {rule.data_mode === "taxonomy" ? (
                 <>
                   <div>
@@ -922,46 +1053,56 @@ export function RetargetManagePage() {
               ) : (
                 <div className="muted">这些机器人里，没有被更靠前的规则选中的动作会进到这一档。</div>
               )}
+                </>
+              )}
               </>
               ) : null}
             </div>
             );
           })}
         </div>
-        <div className="retarget-presets">
-          {presets.map((preset) => {
-            const active = JSON.stringify(savedRules) === JSON.stringify(preset.rules);
-            return (
-              <span key={preset.id} className={active ? "retarget-preset is-on" : "retarget-preset"}>
-                <button type="button" disabled={saving} onClick={() => applyPreset(preset)}>
-                  {preset.name}
-                </button>
-                {preset.builtin ? null : (
-                  <button
-                    type="button"
-                    className="retarget-preset-x"
-                    disabled={saving}
-                    aria-label={`删除 ${preset.name}`}
-                    onClick={() => removePreset(preset)}
-                  >
-                    ×
+        <div className="retarget-preset-box">
+          <strong>预设</strong>
+          <p className="muted" style={{ margin: 0 }}>
+            调好上面的档位后，填一个新名称，就能把当前优先级新增成一套预设。可以存多套。点预设名称会换成那一套，当前这一波结束后重新扫描。删除预设不会改正在执行的优先级。
+          </p>
+          <div className="retarget-presets">
+            {presets.map((preset) => {
+              const active = JSON.stringify(savedRules) === JSON.stringify(preset.rules);
+              return (
+                <span key={preset.id} className={active ? "retarget-preset is-on" : "retarget-preset"}>
+                  <button type="button" disabled={saving} onClick={() => applyPreset(preset)}>
+                    {preset.name}
                   </button>
-                )}
-              </span>
-            );
-          })}
+                  {preset.builtin ? null : (
+                    <button
+                      type="button"
+                      className="retarget-preset-x"
+                      disabled={saving}
+                      aria-label={`删除 ${preset.name}`}
+                      onClick={() => removePreset(preset)}
+                    >
+                      ×
+                    </button>
+                  )}
+                </span>
+              );
+            })}
+          </div>
+          <div className="row">
+            <input
+              className="retarget-preset-name"
+              value={presetName}
+              placeholder="预设名称"
+              maxLength={24}
+              onChange={(event) => setPresetName(event.target.value)}
+            />
+            <button type="button" className="secondary" disabled={saving || !presetName.trim()} onClick={saveAsPreset}>
+              把当前优先级新增为预设
+            </button>
+          </div>
         </div>
         <div className="row">
-          <input
-            className="retarget-preset-name"
-            value={presetName}
-            placeholder="规则名称"
-            maxLength={24}
-            onChange={(event) => setPresetName(event.target.value)}
-          />
-          <button type="button" className="secondary" disabled={saving} onClick={saveAsPreset}>
-            把当前规则存为默认
-          </button>
           <button
             type="button"
             className="secondary"

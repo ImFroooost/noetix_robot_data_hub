@@ -2899,6 +2899,34 @@ body.is-col-resize .app-sidebar {
   padding: 0.35rem 0.45rem;
 }
 
+.retarget-control {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.8rem;
+  align-items: center;
+}
+
+.retarget-page .retarget-modes {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.retarget-page .retarget-modes button {
+  min-height: 1.8rem;
+  width: auto;
+  background: transparent;
+  color: var(--text);
+  border-radius: 0;
+  padding: 0.15rem 0.75rem;
+}
+
+.retarget-page .retarget-modes button.is-on {
+  background: var(--accent, #5fb0ff);
+  color: #fff;
+}
+
 .retarget-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
@@ -3066,6 +3094,19 @@ body.is-col-resize .app-sidebar {
   width: 100%;
   min-height: 0;
   padding: 0.25rem 0.45rem;
+}
+
+.retarget-preset-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding-top: 0.2rem;
+}
+
+.retarget-page .retarget-preset-name {
+  width: 12rem;
+  max-width: 100%;
+  min-height: 2rem;
 }
 
 .retarget-presets {

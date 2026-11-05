@@ -4,7 +4,7 @@ For each data unit that has human motion and is missing one or more robot styles
 pick a source file (skeleton before merged, then fbx, bvh, smpl) and run
 holosoma_retargeting's data_utils/batch_retarget_to_csv.py in a fresh process
 (same flags as the official batch command). Outputs are headerless
-30 Hz CSVs under data/robot/<style>/motion/csv/<batch>/...
+30 Hz CSVs under data/robot/<style>/motion/omniretarget/csv/<batch>/...
 
 Run on the host with the holosoma virtualenv:
 
@@ -43,6 +43,7 @@ sys.path.insert(0, str(BACKEND))
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(PKG / "holosoma_retargeting" / "data_utils"))
 
+from app.services.retarget_control import load_control, wave_plan  # noqa: E402
 from app.services.retarget_priority import (  # noqa: E402
     ROBOTS,
     UNLISTED,
@@ -51,8 +52,10 @@ from app.services.retarget_priority import (  # noqa: E402
     job_queue,
     load_config,
     load_pins,
+    migrate_pins_into_rules,
     pin_index,
     pins_path,
+    targets_match,
 )
 from app.services.retarget_select import (  # noqa: E402
     choose_human_source,
@@ -85,11 +88,6 @@ LOW_PRIORITY_NAMES = ("开源数据", "其他数据集")
 # finishes a wave and replaces it with a measured pace.
 SEED_SECONDS_PER_JOB = 390 / 8
 _pace = {"seconds_per_job": SEED_SECONDS_PER_JOB, "measured": False}
-# Below this free RAM a new job is likely to be killed, so wait instead of starting one.
-MEM_FLOOR_MB = 16 * 1024
-# Keep this much RAM aside for the desktop, then one slot per 3 GB.
-MEM_RESERVE_MB = 32 * 1024
-MEM_PER_JOB_MB = 3 * 1024
 
 
 def _now() -> str:
@@ -117,11 +115,38 @@ def _status_heartbeat() -> None:
         with _status_lock:
             if not _status:
                 continue
+            try:
+                desired = load_control(HUB)["desired"]
+                phase = _status.get("phase")
+                if desired == "stopped" and phase != "stopped":
+                    if phase != "stopping":
+                        _status["resume_phase"] = phase
+                        _status["resume_message"] = _status.get("message")
+                    _status["phase"] = "stopping"
+                    _status["message"] = "正在停止，当前这一波结束后停下"
+                elif desired == "running" and phase == "stopping":
+                    _status["phase"] = _status.pop("resume_phase", None) or "running"
+                    _status["message"] = _status.pop("resume_message", None) or "正在重定向"
+            except Exception:
+                pass
             _status["updated_at"] = _now()
             try:
                 _dump_status_locked()
             except OSError:
                 pass
+
+
+def _performance_fields(plan: dict | None = None) -> dict:
+    if plan is None:
+        stored = _pace.get("plan")
+        plan = stored if isinstance(stored, dict) else wave_plan(HUB, last_wave=int(_pace.get("last_wave") or 0))
+    return {
+        "workers": int(plan["cap"] or plan["size"] or 0),
+        "mem_reserve_gb": int(plan["reserve_gb"]),
+        "performance": plan["performance"],
+        "performance_note": plan["detail"],
+        "desired": "stopped" if plan["stop"] else "running",
+    }
 
 
 def _fill_eta(queues: list[dict]) -> None:
@@ -485,6 +510,7 @@ def _priority_picks(rule: dict, pick_key: str, name_key: str) -> list[dict]:
 
 def prepare_rules() -> tuple[list[tuple], list[dict], float]:
     """Enabled rules plus the tag sets a taxonomy rule matches."""
+    migrate_pins_into_rules(HUB)
     config = load_config(HUB)
     compiled: list[tuple[dict, set[int], set[int], list[set[int]]]] = []
     enabled: list[dict] = []
@@ -572,7 +598,13 @@ def sort_jobs(
         if pin_index(pins, job["batch"], job["unit"]) is not None:
             job["queue"] = "pinned"
         else:
-            job["queue"] = job_queue(job["style"], set(job.get("tag_ids") or ()), compiled)
+            job["queue"] = job_queue(
+                job["style"],
+                set(job.get("tag_ids") or ()),
+                compiled,
+                batch=job["batch"],
+                unit=job["unit"],
+            )
 
     def selection_rank(job: dict) -> tuple[int, int]:
         found = grouped_rules.get(job["queue"])
@@ -609,27 +641,28 @@ def sort_jobs(
     return jobs
 
 
-def mem_available_mb() -> int:
-    avail = 0
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        if line.startswith("MemAvailable:"):
-            avail = int(line.split()[1]) // 1024
-            break
-    return avail
-
-
 def choose_wave_size() -> tuple[int, str]:
-    """Start as many jobs as memory allows, up to the reserved-CPU ceiling.
+    """Follow the web performance setting, and pause when the page says stop."""
+    plan = wave_plan(HUB, last_wave=int(_pace.get("last_wave") or 0))
+    _pace["plan"] = plan
+    if plan["size"] > 0:
+        _pace["last_wave"] = plan["size"]
+    return int(plan["size"]), str(plan["detail"])
 
-    CPU, disk and GPU load no longer shrink the wave. The ceiling itself leaves
-    cores free, and a low memory pool waits instead of starting another job.
-    """
-    free = mem_available_mb()
-    if free < MEM_FLOOR_MB:
-        return 0, f"可用内存仅 {free} MB，暂缓新任务"
-    mem_slots = max(1, (free - MEM_RESERVE_MB) // MEM_PER_JOB_MB)
-    size = max(1, min(WORKERS, mem_slots))
-    return size, f"可用内存 {free // 1024} GB · 保留 {RESERVED_CPUS} 核和 {MEM_RESERVE_MB // 1024} GB"
+
+def _stop_if_requested() -> bool:
+    if load_control(HUB)["desired"] != "stopped":
+        return False
+    log("已按页面操作停止")
+    publish_status(
+        phase="stopped",
+        running=False,
+        current=[],
+        round_running=0,
+        message="已停止",
+        **_performance_fields(),
+    )
+    return True
 
 
 def _source_is_motion(source: dict) -> bool:
@@ -643,6 +676,11 @@ def _source_is_motion(source: dict) -> bool:
 def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> list[dict]:
     failures = state.get("failures") or {}
     pins = load_pins(HUB)
+    targeted = [
+        rule
+        for rule in load_config(HUB)["rules"]
+        if rule.get("enabled") and rule.get("data_mode") == "targets"
+    ]
     now = time.time()
     jobs = []
     for (batch, unit), files in grouped.items():
@@ -658,11 +696,13 @@ def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> lis
         for style in STYLES:
             key = f"{batch}::{unit}::{style}::{source['path']}"
             until = float(failures.get(key) or 0)
-            if until > now and pin_index(pins, batch, unit) is None:
+            if until > now and pin_index(pins, batch, unit) is None and not any(
+                targets_match(rule, batch, unit) for rule in targeted
+            ):
                 continue
             stem = output_stem(source["name"])
             sub = source.get("sub_path") or ""
-            dest = HUB / "data" / "robot" / style / "motion" / "csv" / batch
+            dest = HUB / "data" / "robot" / style / "motion" / "omniretarget" / "csv" / batch
             if sub:
                 dest = dest / sub
             dest = dest / f"{stem}.csv"
@@ -737,7 +777,9 @@ def _solver_reason(log_path: Path) -> str:
         stripped = line.strip()
         if not stripped or stripped.startswith("Traceback") or stripped.startswith("File "):
             continue
-        if stripped.startswith("- "):
+        if stripped.startswith("- ") or stripped.startswith("Command ["):
+            continue
+        if "CalledProcessError" in stripped:
             continue
         if "Error:" in stripped or stripped.startswith("Skipping skeleton"):
             exception = stripped
@@ -908,9 +950,7 @@ def main() -> None:
         started_at=started_at,
         priority_style="",
         styles=list(STYLES),
-        workers=WORKERS,
         reserved_cpus=RESERVED_CPUS,
-        mem_reserve_gb=MEM_RESERVE_MB // 1024,
         priority_note="优先级按页面上保存的规则执行：每条规则指定机器人和数据分类，排在上面的先做。",
         queues=[],
         current=[],
@@ -921,16 +961,17 @@ def main() -> None:
         round_running=0,
         round_started_at=None,
         message="正在扫描待重定向的数据",
+        **_performance_fields(),
         **_pace_fields(),
     )
-    log(
-        f"自动重定向已启动，最多 {WORKERS} 路，"
-        f"保留 {RESERVED_CPUS} 核和 {MEM_RESERVE_MB // 1024} GB 内存"
-    )
+    plan = _pace.get("plan") or {}
+    log(f"自动重定向已启动，{plan.get('detail') or '按页面上的占用强度运行'}")
     pending_paths: list[str] = []
     recent: list[dict] = []
     while True:
         try:
+            if _stop_if_requested():
+                return
             log("正在扫描待重定向的数据")
             publish_status(
                 phase="scanning",
@@ -938,6 +979,7 @@ def main() -> None:
                 current=[],
                 round_running=0,
                 message="正在扫描待重定向的数据",
+                **_performance_fields(),
                 **_pace_fields(),
             )
             compiled, rules, priority_mtime = prepare_rules()
@@ -945,6 +987,8 @@ def main() -> None:
             attach_annotations(records)
             grouped = group_units(records)
             jobs = sort_jobs(collect_jobs(grouped, load_state()), grouped, compiled)
+            if _stop_if_requested():
+                return
             if not jobs:
                 if pending_paths:
                     index_new_files(pending_paths)
@@ -961,6 +1005,7 @@ def main() -> None:
                     queues=fresh_queues([], rules),
                     message="没有待重定向的数据",
                     recent=recent,
+                    **_performance_fields(),
                     **_pace_fields(),
                 )
                 time.sleep(60)
@@ -986,6 +1031,7 @@ def main() -> None:
                     current=current,
                     recent=recent,
                     message=message,
+                    **_performance_fields(),
                     **_pace_fields(),
                 )
 
@@ -993,6 +1039,8 @@ def main() -> None:
             announced_size = -1
             snapshot("running", [], f"本轮 {len(jobs)} 条")
             while cursor < len(jobs):
+                if _stop_if_requested():
+                    return
                 if _priority_mtime() != priority_mtime:
                     log("优先级已调整，重新扫描")
                     snapshot("scanning", [], "优先级已调整，正在重新扫描")
@@ -1007,9 +1055,12 @@ def main() -> None:
                         log(f"本波 {size} 路 · {detail}")
                     announced_size = size
                 if size < 1:
+                    if _stop_if_requested():
+                        return
                     snapshot("waiting", [], detail)
                     time.sleep(15)
                     continue
+                _pace["last_wave"] = size
                 wave = jobs[cursor : cursor + size]
                 cursor += len(wave)
                 current = [
