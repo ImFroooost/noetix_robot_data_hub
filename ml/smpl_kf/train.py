@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from smpl_kf.checkpoint import atomic_save
-from smpl_kf.dataset import CATEGORY_WEIGHTS, MotionDataset, make_loader
+from smpl_kf.dataset import CATEGORY_WEIGHTS, MotionDataset, feature_stats, make_loader
 from smpl_kf.diffusion import Schedule, motion_loss
 from smpl_kf.evaluate import build_eval_set, format_report, log_line, run_eval
 from smpl_kf.geometry import DST_FPS
@@ -97,7 +97,21 @@ def main():
     parser.add_argument("--eval-every", type=int, default=10000)
     parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--reset-step", action="store_true", help="只加载平均权重，步数和学习率按本次 --steps 重新排")
+    parser.add_argument("--no-normalize", action="store_true", help="特征不做归一化，沿用原来的损失权重")
+    parser.add_argument("--key-mix", choices=("dense", "sparse"), default="dense", help="训练时关键帧疏密的比例")
+    parser.add_argument("--skip-glitches", action="store_true", help="避开 smpl_kf.clean 标出的动捕跳变段")
+    parser.add_argument("--keep-every", type=int, default=0, help="每隔多少步留一个 step_*.pt；0 表示每次评测都留")
+    parser.add_argument("--temporal-weight", type=float, default=0.3, help="相邻帧关节位移损失的权重，0 表示不用")
+    parser.add_argument(
+        "--temporal-by-noise",
+        action="store_true",
+        help="相邻帧损失乘上该步保留的信号比例：噪声小时压抖动，噪声大时不逼模型猜成静止",
+    )
+    parser.add_argument(
+        "--no-impute-loss",
+        action="store_true",
+        help="损失直接比模型原始输出；默认先像采样时一样把关键帧写回，再算损失",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -166,7 +180,15 @@ def _run(args, run_dir: Path):
     if args.batch % args.micro_batch != 0:
         raise RuntimeError("--batch 要是 --micro-batch 的整数倍")
     accum = args.batch // args.micro_batch
-    train_set = MotionDataset(cache, "train", args.micro_batch, args.min_len, args.max_len)
+    train_set = MotionDataset(
+        cache,
+        "train",
+        args.micro_batch,
+        args.min_len,
+        args.max_len,
+        key_mix=args.key_mix,
+        skip_glitches=args.skip_glitches,
+    )
     eval_set = build_eval_set(cache)
     pools = ", ".join(f"{name} {len(train_set.pools[name][0])}" for name in train_set.names)
     print(f"训练片段按类别：{pools}", flush=True)
@@ -190,27 +212,40 @@ def _run(args, run_dir: Path):
         "lr": args.lr,
         "steps": args.steps,
         "category_weights": CATEGORY_WEIGHTS,
+        "normalized": not args.no_normalize,
+        "temporal_weight": args.temporal_weight,
+        "temporal_by_noise": args.temporal_by_noise,
+        "impute_loss": not args.no_impute_loss,
+        "key_mix": args.key_mix,
+        "skip_glitches": args.skip_glitches,
     }
     (run_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     model = build_denoiser(config).to(device)
     schedule = Schedule(args.diffusion_steps).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     step = 0
-    ema_bias = 0
+    checkpoint = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        if args.reset_step and checkpoint.get("ema") is not None:
-            model.load_state_dict(checkpoint["ema"])
-            ema_bias = 10000
-            print(f"微调：从 {args.resume} 的平均权重开始，学习率按 {args.steps} 步重排", flush=True)
-        else:
-            model.load_state_dict(checkpoint["model"])
-            if "optim" in checkpoint:
-                optimizer.load_state_dict(checkpoint["optim"])
-            step = int(checkpoint["step"])
-            print(f"从 step {step} 继续", flush=True)
+        if bool(checkpoint["config"].get("normalized", False)) != config["normalized"]:
+            raise RuntimeError("接着训的权重和这次的归一化设置不一致")
+        model.load_state_dict(checkpoint["model"])
+        if "optim" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optim"])
+        step = int(checkpoint["step"])
+        feat_mean = np.asarray(checkpoint["mean"], np.float32)
+        feat_std = np.asarray(checkpoint["std"], np.float32)
+        print(f"从 step {step} 继续", flush=True)
+    elif config["normalized"]:
+        started_stats = time.time()
+        feat_mean, feat_std = feature_stats(train_set)
+        print(f"特征均值和标准差统计完成，用时 {time.time() - started_stats:.0f} 秒", flush=True)
+    else:
+        feat_mean = np.zeros(FEAT_DIM, np.float32)
+        feat_std = np.ones(FEAT_DIM, np.float32)
+    model.set_normalizer(feat_mean, feat_std)
     ema = EMA(model)
-    if args.resume and not args.reset_step:
+    if checkpoint is not None:
         ema.load_state_dict(checkpoint["ema"])
 
     count = sum(p.numel() for p in model.parameters())
@@ -233,8 +268,8 @@ def _run(args, run_dir: Path):
             "model": model.state_dict(),
             "ema": {name: value.detach().clone() for name, value in ema.state_dict().items()},
             "step": step,
-            "mean": np.zeros(FEAT_DIM, np.float32),
-            "std": np.ones(FEAT_DIM, np.float32),
+            "mean": feat_mean,
+            "std": feat_std,
             "config": config,
         }
         if include_optim:
@@ -253,7 +288,8 @@ def _run(args, run_dir: Path):
         print(format_report(report), flush=True)
         print(f"评测用时 {time.time() - started:.0f} 秒", flush=True)
         (run_dir / f"eval_{step:07d}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        _save(run_dir / f"step_{step:07d}.pt", False)
+        if not args.keep_every or step % args.keep_every == 0:
+            _save(run_dir / f"step_{step:07d}.pt", False)
 
     use_autocast = device.startswith("cuda")
     nan_skips = 0
@@ -272,16 +308,31 @@ def _run(args, run_dir: Path):
         finite = True
         for _ in range(accum):
             x, key_mask, valid = next(batches)
-            x = x.to(device, non_blocking=True)
             key_mask = key_mask.to(device, non_blocking=True)
             valid = valid.to(device, non_blocking=True)
+            x = model.normalize(x.to(device, non_blocking=True))
+            x = torch.where(valid > 0.5, x, torch.zeros_like(x))
             timesteps = torch.randint(0, schedule.steps, (x.shape[0],), device=device)
             x_t = schedule.q_sample(x, timesteps, torch.randn_like(x))
             x_in = key_mask * x + (1.0 - key_mask) * x_t
             x_in = torch.where(valid > 0.5, x_in, torch.zeros_like(x_in))
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
                 pred = model(x_in, key_mask, timesteps, valid)
-            loss = motion_loss(pred, x, valid, key_mask) / accum
+            if config["impute_loss"]:
+                # 采样时关键帧会被原样写回；这里同样写回，相邻帧和关键帧之间的接缝才会进损失。
+                pred = key_mask * x + (1.0 - key_mask) * pred.float()
+            temporal = args.temporal_weight
+            if args.temporal_by_noise:
+                temporal = args.temporal_weight * schedule.alpha_bar[timesteps]
+            loss = motion_loss(
+                pred,
+                x,
+                valid,
+                model.feat_mean,
+                model.feat_std,
+                normalized=config["normalized"],
+                temporal=temporal,
+            ) / accum
             if not torch.isfinite(loss):
                 finite = False
                 break
@@ -295,7 +346,7 @@ def _run(args, run_dir: Path):
             continue
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        ema.update(model, step + ema_bias)
+        ema.update(model, step)
         step += 1
         # 运行中可以改 pause_seconds 文件里的秒数，白天调大、夜里调小，不用重启。
         if step % 100 == 0 and pause_file.exists():

@@ -1,11 +1,9 @@
 from fastapi import APIRouter
 
 from . import (
+    audit,
     auth,
-    clips,
-    files,
     folders,
-    import_batch,
     model_assets,
     presence,
     repo,
@@ -21,10 +19,8 @@ api_router.include_router(users.router)
 api_router.include_router(presence.router)
 api_router.include_router(folders.router)
 api_router.include_router(taxonomies.router)
-api_router.include_router(clips.router)
-api_router.include_router(files.router)
 api_router.include_router(robot_models.router)
 api_router.include_router(model_assets.router)
 api_router.include_router(storage_repository.router)
-api_router.include_router(import_batch.router)
 api_router.include_router(repo.router)
+api_router.include_router(audit.router)

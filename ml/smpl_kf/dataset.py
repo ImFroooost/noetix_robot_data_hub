@@ -86,18 +86,26 @@ def compute_tags(cache: Path) -> dict:
     return {"category": category, "dynamic": dynamic}
 
 
-def sample_key_frames(frames: int, rng: np.random.Generator) -> np.ndarray:
-    """一成不给关键帧；一半每 0.5–1 秒一帧；两成长间隔；两成只有 1–4 帧。少数窗口带一段已知开头。"""
+KEY_MIXES = {
+    # 不给关键帧、每 0.5–1.5 秒一帧、每 1.5–3 秒一帧，剩下的只有 1–4 帧。
+    "dense": (0.10, 0.40, 0.20),
+    "sparse": (0.15, 0.30, 0.00),
+}
+
+
+def sample_key_frames(frames: int, rng: np.random.Generator, mix: str = "dense") -> np.ndarray:
+    """按 KEY_MIXES 的比例抽关键帧方案。少数窗口带一段已知开头，用来接长片段。"""
     if frames <= 0:
         return np.zeros(0, np.int64)
+    none, dense, medium = KEY_MIXES[mix]
     draw = float(rng.random())
-    if draw < 0.10:
+    if draw < none:
         return np.zeros(0, np.int64)
-    if draw < 0.60:
-        stride = int(rng.integers(15, 31))
+    if draw < none + dense:
+        stride = int(rng.integers(15, 46))
         keys = list(range(0, frames, stride))
-    elif draw < 0.80:
-        stride = int(rng.integers(30, 61))
+    elif draw < none + dense + medium:
+        stride = int(rng.integers(45, 91))
         keys = list(range(0, frames, stride))
     else:
         keys = [0]
@@ -122,8 +130,21 @@ class MotionDataset(IterableDataset):
         min_len: int = 60,
         max_len: int = 300,
         augment: bool = True,
+        key_mix: str = "dense",
+        skip_glitches: bool = False,
     ):
+        if key_mix not in KEY_MIXES:
+            raise ValueError(f"未知的关键帧方案 {key_mix}")
+        self.key_mix = key_mix
         cache = Path(cache)
+        self.bad_sum = None
+        if skip_glitches:
+            from smpl_kf.clean import load_bad
+
+            bad = load_bad(cache)
+            if bad is None:
+                raise RuntimeError("缓存里还没有跳变标记，先运行 python -m smpl_kf.clean")
+            self.bad_sum = np.concatenate(([0], np.cumsum(bad, dtype=np.int64)))
         self.path = cache / "data.npy"
         self.offsets = np.load(cache / "offsets.npy")
         groups = np.load(cache / "groups.npy")
@@ -155,12 +176,14 @@ class MotionDataset(IterableDataset):
             self._data = np.load(self.path, mmap_mode="r")
         return self._data
 
-    def _window(self, rng: np.random.Generator, clip: int, frames: int, name: str) -> np.ndarray:
+    def _window(self, rng: np.random.Generator, clip: int, frames: int, name: str) -> tuple[np.ndarray, int]:
+        """返回窗口和它在整份数据里的起始帧。"""
         start, end = int(self.offsets[clip]), int(self.offsets[clip + 1])
         length = end - start
         data = self._memmap()
         if length <= frames:
-            return np.array(data[start:end], np.float32)
+            return np.array(data[start:end], np.float32), start
+        offset = None
         if name in DYNAMIC and float(rng.random()) < 0.7:
             marked = np.flatnonzero(self.dynamic[start:end])
             if marked.size:
@@ -168,17 +191,25 @@ class MotionDataset(IterableDataset):
                 low = max(0, anchor - frames + 1)
                 high = min(anchor, length - frames)
                 offset = int(rng.integers(low, high + 1))
-                return np.array(data[start + offset : start + offset + frames], np.float32)
-        offset = int(rng.integers(0, length - frames + 1))
-        return np.array(data[start + offset : start + offset + frames], np.float32)
+        if offset is None:
+            offset = int(rng.integers(0, length - frames + 1))
+        return np.array(data[start + offset : start + offset + frames], np.float32), start + offset
+
+    def _is_clean(self, first: int, frames: int) -> bool:
+        if self.bad_sum is None:
+            return True
+        return int(self.bad_sum[first + frames] - self.bad_sum[first]) == 0
 
     def example(self, rng: np.random.Generator, length: int):
-        name = self.names[int(rng.choice(len(self.names), p=self.probs))]
-        members, weights = self.pools[name]
-        clip = int(members[int(rng.choice(len(members), p=weights))])
         factor = float(rng.uniform(0.9, 1.1)) if self.augment and float(rng.random()) < 0.5 else 1.0
         source = int(round((length - 1) * factor)) + 1
-        chunk = self._window(rng, clip, source, name)
+        for _attempt in range(10):
+            name = self.names[int(rng.choice(len(self.names), p=self.probs))]
+            members, weights = self.pools[name]
+            clip = int(members[int(rng.choice(len(members), p=weights))])
+            chunk, first = self._window(rng, clip, source, name)
+            if self._is_clean(first, len(chunk)):
+                break
         if chunk.shape[1] != LEGACY_DIM:
             raise RuntimeError(f"特征维数是 {chunk.shape[1]}，期望 {LEGACY_DIM}")
         frames = min(length, int(round((len(chunk) - 1) / factor)) + 1)
@@ -189,7 +220,7 @@ class MotionDataset(IterableDataset):
         if self.augment:
             chunk = yaw_augment(chunk, float(rng.uniform(0.0, 2.0 * np.pi)))
         encoded = encode_motion(chunk)
-        keys = sample_key_frames(frames, rng)
+        keys = sample_key_frames(frames, rng, self.key_mix)
         x = np.zeros((length, FEAT_DIM), np.float32)
         mask = np.zeros((length, FEAT_DIM), np.float32)
         valid = np.zeros((length, 1), np.float32)
@@ -207,6 +238,26 @@ class MotionDataset(IterableDataset):
         rng = np.random.default_rng()
         while True:
             yield self.batch(rng)
+
+
+STD_FLOOR = 1e-2
+
+
+def feature_stats(dataset: MotionDataset, batches: int = 60, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """按训练时的抽样和增强，统计每个特征通道的均值和标准差。几乎不变的通道标准差取下限。"""
+    rng = np.random.default_rng(seed)
+    total = np.zeros(FEAT_DIM, np.float64)
+    square = np.zeros(FEAT_DIM, np.float64)
+    count = 0
+    for _ in range(batches):
+        x, _mask, valid = dataset.batch(rng)
+        rows = x.numpy()[valid.numpy()[..., 0] > 0.5].astype(np.float64)
+        total += rows.sum(axis=0)
+        square += (rows * rows).sum(axis=0)
+        count += len(rows)
+    mean = total / max(count, 1)
+    std = np.sqrt(np.maximum(square / max(count, 1) - mean * mean, 0.0))
+    return mean.astype(np.float32), np.maximum(std, STD_FLOOR).astype(np.float32)
 
 
 def make_loader(dataset: MotionDataset, num_workers: int = 0) -> DataLoader:

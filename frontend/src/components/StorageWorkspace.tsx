@@ -26,6 +26,14 @@ import { fetchStorageOverview, INDEX_UPDATED_EVENT } from "../storageOverviewCac
 import { useUndo } from "../undo/UndoContext";
 import { patchStorageMeta, type StorageMetaTarget } from "../undo/storageMeta";
 import { formatFromFileName } from "../utils/folderUpload";
+import {
+  ORIGINAL_FILE_VERSION,
+  fileVersionName,
+  filesForVersion,
+  latestVersionName,
+  normalizeFileVersions,
+  type FileVersionInfo,
+} from "../utils/fileVersion";
 import type {
   ModelInstance,
   StorageAnnotation,
@@ -2162,16 +2170,6 @@ function DetailRow({
 
 type DetailKind = "batch" | "unit" | "file" | "upload_session" | "node" | "selection";
 
-function unitSchemeTagIds(unit: StorageUnit, scheme: string): number[] {
-  const own = tagIdList(unit.taxonomy_tag_ids?.[scheme]);
-  if (own.length) return own;
-  for (const file of unit.files || []) {
-    const tagged = tagIdList(file.taxonomy_tag_ids?.[scheme]);
-    if (tagged.length) return tagged;
-  }
-  return [];
-}
-
 function useReportSelection(
   units: StorageUnit[],
   onSelectionChange?: (units: StorageUnit[]) => void
@@ -2284,15 +2282,10 @@ function EntityDetailPanel({
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
   const [saving, setSaving] = useState(false);
-  const [selectionDrafts, setSelectionDrafts] = useState<Record<string, number[]>>({});
   const [tagOverrides, setTagOverrides] = useState<{
     key: string;
     ids: Record<string, number[]>;
   }>({ key: "", ids: {} });
-  const selectionKey = selectedUnits.map((item) => item.key).join("\0");
-  useEffect(() => {
-    setSelectionDrafts({});
-  }, [selectionKey]);
   const [saved, setSaved] = useState(false);
   const { execute } = useUndo();
 
@@ -2306,20 +2299,25 @@ function EntityDetailPanel({
     return null;
   };
 
-  const nodeShare: Record<string, { ids: number[]; mixed: boolean }> = {};
-  if (kind === "node" && nodeInfo) {
+  const shareUnits =
+    kind === "node" && nodeInfo
+      ? nodeInfo.units
+      : kind === "selection"
+        ? selectedUnits
+        : null;
+  const tagShare: Record<string, { ids: number[]; mixed: boolean }> = {};
+  if (shareUnits) {
     for (const scheme of schemes) {
-      nodeShare[scheme.key] = sharedUnitTag(nodeInfo.units, scheme.key, nodes);
+      tagShare[scheme.key] = sharedUnitTag(shareUnits, scheme.key, nodes);
     }
   }
-  const ownTagIds =
-    kind === "node"
-      ? Object.fromEntries(
-          Object.entries(nodeShare)
-            .filter(([, value]) => value.ids.length && !value.mixed)
-            .map(([key, value]) => [key, value.ids])
-        )
-      : kind === "file"
+  const ownTagIds = shareUnits
+    ? Object.fromEntries(
+        Object.entries(tagShare)
+          .filter(([, value]) => value.ids.length && !value.mixed)
+          .map(([key, value]) => [key, value.ids])
+      )
+    : kind === "file"
         ? detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}
         : kind === "unit"
           ? unit?.taxonomy_tag_ids || {}
@@ -2362,32 +2360,6 @@ function EntityDetailPanel({
           : kind === "upload_session"
             ? session?.annotation || {}
             : batch?.annotation || {};
-  const tagIds =
-    kind === "node"
-      ? ownTagIds
-      : kind === "file"
-      ? {
-          ...(detail?.unit_taxonomy_tag_ids || unit?.taxonomy_tag_ids || {}),
-          ...(detail?.taxonomy_tag_ids || file?.taxonomy_tag_ids || {}),
-        }
-      : kind === "unit"
-        ? unit?.taxonomy_tag_ids || {}
-        : kind === "upload_session"
-          ? session?.taxonomy_tag_ids || {}
-          : batch?.taxonomy_tag_ids || {};
-  const tags =
-    kind === "node"
-      ? {}
-      : kind === "file"
-      ? {
-          ...(detail?.unit_taxonomy_tags || unit?.taxonomy_tags || {}),
-          ...(detail?.taxonomy_tags || file?.taxonomy_tags || {}),
-        }
-      : kind === "unit"
-        ? unit?.taxonomy_tags || {}
-        : kind === "upload_session"
-          ? session?.taxonomy_tags || {}
-          : batch?.taxonomy_tags || {};
   const parentTags =
     kind === "file"
       ? fillTagBriefs(
@@ -2396,7 +2368,6 @@ function EntityDetailPanel({
           nodes
         )
       : {};
-  const resolvedTags = fillTagBriefs(tags, tagIds, nodes);
   const visibleSchemes = kind ? schemesForKind(kind, schemes) : [];
   const tagEntityKey = [
     kind || "",
@@ -2405,13 +2376,14 @@ function EntityDetailPanel({
     file?.path || "",
     session?.id || "",
     nodeInfo ? `${nodeInfo.batchName}/${nodeInfo.dirPath}` : "",
+    kind === "selection" ? selectedUnits.map((item) => item.key).join("\0") : "",
   ].join("\n");
   const tagEdits = tagOverrides.key === tagEntityKey ? tagOverrides.ids : {};
   const shownTagIds = (scheme: string) => {
     const schemeNodes = nodes.filter((node) => node.scheme === scheme);
     if (scheme in tagEdits) return specificTagIds(tagEdits[scheme], schemeNodes);
-    if (kind === "node") {
-      const share = nodeShare[scheme];
+    if (shareUnits) {
+      const share = tagShare[scheme];
       return share?.mixed ? [] : share?.ids || [];
     }
     return specificTagIds(tagIdList(ownTagIds[scheme]), schemeNodes);
@@ -2427,14 +2399,13 @@ function EntityDetailPanel({
     const stored = (ids: number[]) => (ids.length ? ids : null);
     const out: Record<string, number[] | null> = {};
     for (const [scheme, ids] of Object.entries(tagEdits)) {
-      if (kind === "node" && nodeShare[scheme]?.mixed) {
+      if (shareUnits && tagShare[scheme]?.mixed) {
         out[scheme] = stored(ids);
         continue;
       }
-      const prev =
-        kind === "node"
-          ? nodeShare[scheme]?.ids || []
-          : specificTagIds(
+      const prev = shareUnits
+        ? tagShare[scheme]?.ids || []
+        : specificTagIds(
               tagIdList(ownTagIds[scheme]),
               nodes.filter((node) => node.scheme === scheme)
             );
@@ -2560,13 +2531,15 @@ function EntityDetailPanel({
     const tagChanges = changedTagPayload();
     setSaving(true);
     try {
-      if (kind === "node" && nodeInfo) {
+      if (shareUnits && (kind === "node" || kind === "selection")) {
         if (!Object.keys(tagChanges).length) {
           setSaved(true);
           return;
         }
         const stored = (ids: number[]) => (ids.length ? ids : null);
-        const previous = nodeInfo.units.map((item) => ({
+        const batchOf = (item: StorageUnit) => item.batch || nodeInfo?.batchName || "";
+        const previous = shareUnits.map((item) => ({
+          batch: batchOf(item),
           name: item.name,
           taxonomy_tag_ids: Object.fromEntries(
             Object.keys(tagChanges).map((scheme) => [
@@ -2575,25 +2548,45 @@ function EntityDetailPanel({
             ])
           ),
         }));
+        const writeGroups = async (
+          rows: {
+            batch: string;
+            name: string;
+            taxonomy_tag_ids: Record<string, number[] | null>;
+          }[]
+        ) => {
+          const byBatch = new Map<string, typeof rows>();
+          for (const item of rows) {
+            const list = byBatch.get(item.batch) || [];
+            list.push(item);
+            byBatch.set(item.batch, list);
+          }
+          for (const [batchName, items] of byBatch) {
+            await api.storageUpdateNodeTaxonomy({
+              batch: batchName,
+              units: items.map((item) => ({
+                name: item.name,
+                taxonomy_tag_ids: item.taxonomy_tag_ids,
+              })),
+            });
+          }
+        };
         await execute({
           label: "保存分类标签",
           do: async () => {
-            await api.storageUpdateNodeTaxonomy({
-              batch: nodeInfo.batchName,
-              units: nodeInfo.units.map((item) => ({
+            await writeGroups(
+              shareUnits.map((item) => ({
+                batch: batchOf(item),
                 name: item.name,
                 taxonomy_tag_ids: tagChanges,
-              })),
-            });
+              }))
+            );
             setSaved(true);
-            onMessage(`已保存，并应用到 ${nodeInfo.units.length} 个数据单元`);
+            onMessage(`已保存，并应用到 ${shareUnits.length} 个数据单元`);
             await onReload();
           },
           undo: async () => {
-            await api.storageUpdateNodeTaxonomy({
-              batch: nodeInfo.batchName,
-              units: previous,
-            });
+            await writeGroups(previous);
             setTagOverrides({ key: "", ids: {} });
           },
         });
@@ -2682,136 +2675,6 @@ function EntityDetailPanel({
     }
   };
 
-  const saveTaxonomy = async (scheme: string, raw: number[]) => {
-    const stored = (ids: number[]) => (ids.length ? ids : null);
-    try {
-      if (kind === "node" && nodeInfo) {
-        const shared = nodeShare[scheme];
-        if (!shared?.mixed && sameTagIds(shared?.ids || [], raw)) return;
-        const schemeName = taxonomySchemeLabel(scheme, schemes);
-        const previous = nodeInfo.units.map((item) => ({
-          name: item.name,
-          taxonomy_tag_ids: {
-            [scheme]: stored(tagIdList(item.taxonomy_tag_ids?.[scheme])),
-          },
-        }));
-        await execute({
-          label: `更新${schemeName}分类`,
-          do: async () => {
-            await api.storageUpdateNodeTaxonomy({
-              batch: nodeInfo.batchName,
-              units: nodeInfo.units.map((item) => ({
-                name: item.name,
-                taxonomy_tag_ids: { [scheme]: stored(raw) },
-              })),
-            });
-            onMessage(`已批量修改 ${nodeInfo.units.length} 个单元的${schemeName}`);
-            await onReload();
-          },
-          undo: async () => {
-            await api.storageUpdateNodeTaxonomy({
-              batch: nodeInfo.batchName,
-              units: previous,
-            });
-          },
-        });
-        return;
-      }
-      if (kind === "selection") {
-        if (!raw.length) return;
-        const schemeName = taxonomySchemeLabel(scheme, schemes);
-        const missing = selectedUnits.filter((item) => {
-          const have = unitSchemeTagIds(item, scheme);
-          return raw.some((id) => !have.includes(id));
-        });
-        const skipped = selectedUnits.length - missing.length;
-        if (!missing.length) {
-          onMessage("所选单元都已经有这些标签，未做修改");
-          return;
-        }
-        const planned = missing.map((item) => {
-          const have = unitSchemeTagIds(item, scheme);
-          const next = [...have];
-          raw.forEach((id) => {
-            if (!next.includes(id)) next.push(id);
-          });
-          return {
-            batch: item.batch,
-            name: item.name,
-            previous: stored(tagIdList(item.taxonomy_tag_ids?.[scheme])),
-            next,
-          };
-        });
-        const writeSelection = async (mode: "next" | "previous") => {
-          const byBatch = new Map<string, typeof planned>();
-          for (const item of planned) {
-            const list = byBatch.get(item.batch) || [];
-            list.push(item);
-            byBatch.set(item.batch, list);
-          }
-          for (const [batchName, items] of byBatch) {
-            await api.storageUpdateNodeTaxonomy({
-              batch: batchName,
-              units: items.map((item) => ({
-                name: item.name,
-                taxonomy_tag_ids: {
-                  [scheme]: mode === "next" ? item.next : item.previous,
-                },
-              })),
-            });
-          }
-        };
-        setSaving(true);
-        try {
-          await execute({
-            label: `补标注${schemeName}`,
-            do: async () => {
-              await writeSelection("next");
-              onMessage(
-                skipped
-                  ? `已为 ${missing.length} 个单元补上${schemeName}，${skipped} 个已有这些标签的单元未修改`
-                  : `已为 ${missing.length} 个单元补上${schemeName}`
-              );
-              await onReload();
-              setSelectionDrafts((current) => ({ ...current, [scheme]: [] }));
-            },
-            undo: async () => {
-              await writeSelection("previous");
-            },
-          });
-        } finally {
-          setSaving(false);
-        }
-        return;
-      }
-      const target = metaTarget();
-      if (!target) return;
-      const prevIds = tagIdList(ownTagIds[scheme]);
-      if (sameTagIds(raw, prevIds)) return;
-      const schemeName = taxonomySchemeLabel(scheme, schemes);
-      await execute({
-        label: `更新${schemeName}分类`,
-        do: async () => {
-          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: stored(raw) } });
-          onMessage(
-            kind === "batch"
-              ? "分类标签已更新，已同步到该批次下的数据单元和文件"
-              : kind === "unit"
-                ? "分类标签已更新，已同步到该数据单元下的文件"
-                : kind === "upload_session"
-                  ? "分类标签已更新，已同步到这次上传的数据单元和文件"
-                  : "分类标签已更新"
-          );
-          await onReload();
-        },
-        undo: async () => {
-          await patchStorageMeta(target, { taxonomy_tag_ids: { [scheme]: stored(prevIds) } });
-        },
-      });
-    } catch (e) {
-      onError(e instanceof Error ? e.message : "更新失败");
-    }
-  };
 
   return (
     <aside className="card storage-detail-pane">
@@ -2930,9 +2793,11 @@ function EntityDetailPanel({
       {kind && (
         <section className="storage-detail-tags stack">
           <h4>标签</h4>
-          {kind === "node" && nodeInfo && canEdit && (
+          {shareUnits && (
             <p className="muted">
-              这里的标签会写到该节点下 {nodeInfo.units.length} 个数据单元上，每个单元各自保存
+              {canEdit
+                ? "相同的分类显示具体标签，不一致的显示「多个」。保存后，改过的分类会写到全部所选单元上。"
+                : "相同的分类显示具体标签，不一致的显示「多个」。"}
             </p>
           )}
           {kind === "batch" && batch && canEdit && (
@@ -2940,94 +2805,35 @@ function EntityDetailPanel({
               这里的标签会写到该批次下 {batch.unit_count} 个数据单元上，每个单元各自保存
             </p>
           )}
-          {kind === "selection" && canEdit && (
-            <p className="muted">勾选后补到还没有这些标签的单元上，已有的标签会保留</p>
-          )}
-          {kind === "selection" && canEdit ? (
-            <>
-              <TaxonomyTagPicker
-                schemes={visibleSchemes}
-                nodes={nodes}
-                value={selectionDrafts}
-                disabled={saving}
-                canCreate={canCreate}
-                onNodesReload={onNodesReload}
-                onChange={(scheme, ids) =>
-                  setSelectionDrafts((current) => ({ ...current, [scheme]: ids }))
-                }
-              />
-              <button
-                type="button"
-                disabled={
-                  saving || !Object.values(selectionDrafts).some((ids) => ids.length)
-                }
-                onClick={() => {
-                  void (async () => {
-                    for (const [scheme, ids] of Object.entries(selectionDrafts)) {
-                      if (ids.length) await saveTaxonomy(scheme, ids);
-                    }
-                  })();
-                }}
-              >
-                {saving ? "保存中…" : "补上标签"}
-              </button>
-            </>
-          ) : kind === "node" && canEdit ? (
-            <>
-              <TaxonomyTagPicker
-                schemes={visibleSchemes}
-                nodes={nodes}
-                value={Object.fromEntries(
-                  visibleSchemes.map((scheme) => [scheme.key, shownTagIds(scheme.key)])
-                )}
-                canCreate={canCreate}
-                onNodesReload={onNodesReload}
-                onChange={rememberTags}
-              />
-              {visibleSchemes.some((scheme) => nodeShare[scheme.key]?.mixed) && (
-                <p className="muted">取值不一致的分类，勾选后会统一成同一组标签</p>
-              )}
-            </>
-          ) : canEdit ? (
-            <>
-              <TaxonomyTagPicker
-                schemes={visibleSchemes}
-                nodes={nodes}
-                value={Object.fromEntries(
-                  visibleSchemes.map((scheme) => [scheme.key, shownTagIds(scheme.key)])
-                )}
-                canCreate={canCreate}
-                onNodesReload={onNodesReload}
-                inherited={Object.fromEntries(
-                  visibleSchemes
-                    .filter((scheme) => !shownTagIds(scheme.key).length)
-                    .map((scheme) => [
-                      scheme.key,
-                      (parentTags[scheme.key] || []).map((item) => item.name).join("、"),
-                    ])
-                    .filter(([, text]) => text)
-                )}
-                onChange={rememberTags}
-              />
-            </>
-          ) : (
-            visibleSchemes.map((scheme) => {
-              const own = (resolvedTags[scheme.key] || []).map((item) => item.path).join("、");
-              const inherited = (parentTags[scheme.key] || []).map((item) => item.path).join("、");
-              const share = nodeShare[scheme.key];
-              return (
-                <DetailRow
-                  key={scheme.key}
-                  label={taxonomySchemeLabel(scheme.key, schemes)}
-                  value={
-                    kind === "node" && share?.mixed
-                      ? "多个取值"
-                      : own || (inherited ? `上级：${inherited}` : "未分类")
-                  }
-                />
-              );
-            })
-          )}
+          <TaxonomyTagPicker
+            schemes={visibleSchemes}
+            nodes={nodes}
+            value={Object.fromEntries(
+              visibleSchemes.map((scheme) => [scheme.key, shownTagIds(scheme.key)])
+            )}
+            disabled={saving}
+            readOnly={!canEdit}
+            canCreate={canEdit && canCreate}
+            onNodesReload={onNodesReload}
+            placeholders={Object.fromEntries(
+              visibleSchemes
+                .filter((scheme) => tagShare[scheme.key]?.mixed && !(scheme.key in tagEdits))
+                .map((scheme) => [scheme.key, "多个"])
+            )}
+            inherited={Object.fromEntries(
+              visibleSchemes
+                .filter(
+                  (scheme) =>
+                    !tagShare[scheme.key]?.mixed && !shownTagIds(scheme.key).length
+                )
+                .map((scheme) => [
+                  scheme.key,
+                  (parentTags[scheme.key] || []).map((item) => item.name).join("、"),
+                ])
+                .filter(([, text]) => text)
+            )}
+            onChange={rememberTags}
+          />
           {(kind === "file" || kind === "upload_session") &&
             isMotionModality(
               kind === "upload_session" ? session?.modality : viewFile?.modality
@@ -3225,9 +3031,9 @@ function EntityDetailPanel({
               value={qualityLabel(String(annotation.quality || ""))}
             />
           )}
-          {kind !== "selection" && canEdit ? (
+          {canEdit ? (
             <>
-              {kind !== "node" && (
+              {kind !== "node" && kind !== "selection" && (
                 <label>
                   备注
                   <textarea
@@ -3259,8 +3065,17 @@ function EntityDetailPanel({
 
 const ONTOLOGIES = ["human", "robot"] as const;
 
-function downloadKindKey(ontology: string, modality: string, format = "") {
-  return `${ontology}:${modality}:${format}`;
+function downloadKindKey(
+  ontology: string,
+  modality: string,
+  format = "",
+  motionKind = ""
+) {
+  return `${ontology}:${modality}:${motionKind}:${format}`;
+}
+
+function fileMotionKind(file: StorageFile) {
+  return file.modality === "motion" ? resolveMotionKind(file.annotation?.motion_kind) : "";
 }
 
 function fileFormatOf(file: StorageFile) {
@@ -3305,7 +3120,7 @@ function fileRobotAcquireMethod(file: StorageFile) {
 }
 
 type DownloadConfirm = {
-  kinds: { ontology: string; modality: string; format: string }[];
+  kinds: { ontology: string; modality: string; format: string; motion_kind?: string }[];
   robotStyles?: string[];
 };
 
@@ -3324,7 +3139,9 @@ function DownloadPicker({
 }) {
   const { leftover, files, unitByPath } = filesFromDownloadTargets(batches, units);
   const available = new Set(
-    files.map((file) => downloadKindKey(file.ontology, file.modality, fileFormatOf(file)))
+    files.map((file) =>
+      downloadKindKey(file.ontology, file.modality, fileFormatOf(file), fileMotionKind(file))
+    )
   );
   const [checked, setChecked] = useState<Record<string, boolean>>(() =>
     Object.fromEntries([...available].map((key) => [key, true]))
@@ -3345,7 +3162,16 @@ function DownloadPicker({
     ? robotStyleKeys.filter((style) => checkedStyles[style])
     : undefined;
   const fileIncluded = (file: StorageFile) => {
-    if (!checked[downloadKindKey(file.ontology, file.modality, fileFormatOf(file))]) {
+    if (
+      !checked[
+        downloadKindKey(
+          file.ontology,
+          file.modality,
+          fileFormatOf(file),
+          fileMotionKind(file)
+        )
+      ]
+    ) {
       return false;
     }
     if (!showRobotStyles || file.ontology !== "robot") return true;
@@ -3357,10 +3183,22 @@ function DownloadPicker({
       ontology: file.ontology,
       modality: file.modality,
       format: fileFormatOf(file),
+      ...(file.modality === "motion" ? { motion_kind: fileMotionKind(file) } : {}),
     }))
     .filter((kind, index, list) => {
-      const key = downloadKindKey(kind.ontology, kind.modality, kind.format);
-      return list.findIndex((item) => downloadKindKey(item.ontology, item.modality, item.format) === key) === index;
+      const key = downloadKindKey(
+        kind.ontology,
+        kind.modality,
+        kind.format,
+        kind.motion_kind || ""
+      );
+      return (
+        list.findIndex(
+          (item) =>
+            downloadKindKey(item.ontology, item.modality, item.format, item.motion_kind || "") ===
+            key
+        ) === index
+      );
     });
   const selectedCount = files.filter(fileIncluded).length;
   const title =
@@ -3385,13 +3223,25 @@ function DownloadPicker({
           {ONTOLOGIES.map((ontology) => (
             <section key={ontology} className="storage-ontology-card">
               <h3>{ontology === "human" ? "人体数据" : "机器人数据"}</h3>
-              {Object.entries(MODALITY_LABEL).map(([modality, label]) => {
+              {Object.entries(MODALITY_LABEL).flatMap(([modalityKey, modalityLabel]) =>
+                modalityKey === "motion"
+                  ? MOTION_KIND_OPTIONS.map(([motionKind, kindLabel]) => ({
+                      key: `${modalityKey}:${motionKind}`,
+                      label: kindLabel,
+                      motionKind,
+                    }))
+                  : [{ key: modalityKey, label: modalityLabel, motionKind: "" }]
+              ).map(({ key: rowKey, label, motionKind }) => {
+                const modality = rowKey.startsWith("motion:") ? "motion" : rowKey;
                 const rowFiles = files.filter(
-                  (file) => file.ontology === ontology && file.modality === modality
+                  (file) =>
+                    file.ontology === ontology &&
+                    file.modality === modality &&
+                    (!motionKind || fileMotionKind(file) === motionKind)
                 );
                 const formats = [...new Set(rowFiles.map((file) => fileFormatOf(file)))].sort();
                 const formatKeys = formats.map((format) =>
-                  downloadKindKey(ontology, modality, format)
+                  downloadKindKey(ontology, modality, format, motionKind)
                 );
                 const enabled = rowFiles.length > 0;
                 const selectedFormats = formatKeys.filter((key) => checked[key]);
@@ -3399,7 +3249,7 @@ function DownloadPicker({
                 const someOn = selectedFormats.length > 0;
                 return (
                   <div
-                    key={modality}
+                    key={rowKey}
                     className={`storage-download-row ${enabled ? "" : "is-empty"}`}
                   >
                     <input
@@ -3422,7 +3272,7 @@ function DownloadPicker({
                     <span className="storage-download-formats">
                       {enabled ? (
                         formats.map((format) => {
-                          const key = downloadKindKey(ontology, modality, format);
+                          const key = downloadKindKey(ontology, modality, format, motionKind);
                           const count = rowFiles.filter((file) => {
                             if (fileFormatOf(file) !== format) return false;
                             if (!showRobotStyles || file.ontology !== "robot") return true;
@@ -3538,6 +3388,7 @@ function matrixRows() {
 
 function UnitMatrix({
   unit,
+  fileVersions,
   selectedFile,
   onFile,
   canUpload,
@@ -3545,6 +3396,7 @@ function UnitMatrix({
   showEmpty = true,
 }: {
   unit: StorageUnit;
+  fileVersions?: FileVersionInfo[];
   selectedFile: StorageFile | null;
   onFile: (file: StorageFile) => void;
   canUpload: boolean;
@@ -3557,7 +3409,28 @@ function UnitMatrix({
   showEmpty?: boolean;
 }) {
   const preview = usePreview();
-  const robotFiles = unit.files.filter((f) => f.ontology === "robot");
+  const versions = useMemo(
+    () => normalizeFileVersions(fileVersions, unit.files),
+    [fileVersions, unit.files]
+  );
+  const latest = latestVersionName(versions);
+  const [selectedVersion, setSelectedVersion] = useState(latest);
+  const pickedRef = useRef(false);
+  useEffect(() => {
+    pickedRef.current = false;
+    setSelectedVersion(latest);
+  }, [unit.key]);
+  useEffect(() => {
+    if (!pickedRef.current) setSelectedVersion(latest);
+  }, [latest, unit.key]);
+  const activeVersion = versions.some((item) => item.name === selectedVersion)
+    ? selectedVersion
+    : latest;
+  const visibleFiles = useMemo(
+    () => filesForVersion(unit.files, versions, activeVersion),
+    [unit.files, versions, activeVersion]
+  );
+  const robotFiles = visibleFiles.filter((f) => f.ontology === "robot");
   const robotStyles = [
     ...new Set(
       robotFiles.map((f) => String(f.robot_style || f.annotation?.robot_style || "").trim()).filter(Boolean)
@@ -3582,8 +3455,32 @@ function UnitMatrix({
 
   return (
     <div className="storage-unit-matrix">
+      <div className="storage-file-version-bar">
+        <label>
+          文件版本
+          <select
+            value={activeVersion}
+            onChange={(event) => {
+              pickedRef.current = true;
+              setSelectedVersion(event.target.value);
+            }}
+          >
+            {versions.map((item) => (
+              <option key={item.name} value={item.name}>
+                {item.name}
+                {item.name === latest ? "（最新）" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        <span className="storage-file-version-note">
+          {activeVersion === ORIGINAL_FILE_VERSION
+            ? "正在查看最初上传的文件"
+            : "没有出现在这个版本里的文件，沿用更早的版本"}
+        </span>
+      </div>
       {(["human", "robot"] as const).map((ontology) => {
-        const hasFiles = unit.files.some((file) => file.ontology === ontology);
+        const hasFiles = visibleFiles.some((file) => file.ontology === ontology);
         if (!showEmpty && !hasFiles) return null;
         return (
         <section key={ontology} className="storage-ontology-card">
@@ -3620,7 +3517,7 @@ function UnitMatrix({
             </div>
           )}
           {matrixRows().map(({ key, modality, motionKind, label }) => {
-            const files = unit.files.filter(
+            const files = visibleFiles.filter(
               (f) =>
                 f.ontology === ontology &&
                 f.modality === modality &&
@@ -3645,21 +3542,28 @@ function UnitMatrix({
                   {label}
                 </div>
                 <div className="storage-file-pills">
-                  {files.map((file) => (
+                  {files.map((file) => {
+                    const versionName = fileVersionName(file);
+                    const inherited = versionName !== activeVersion;
+                    return (
                     <button
                       type="button"
                       key={file.id}
                       className={selectedFile?.id === file.id ? "active" : "secondary"}
-                      title={file.path}
+                      title={inherited ? `${file.path}（沿用${versionName}）` : file.path}
                       onClick={() => onFile(file)}
                     >
                       {file.channel ? `${file.channel}/` : ""}
                       {file.format}
+                      {inherited && (
+                        <span className="storage-file-uploader">沿用{versionName}</span>
+                      )}
                       <span className="storage-file-uploader">
                         {file.uploader?.username || "未知用户"}
                       </span>
                     </button>
-                  ))}
+                    );
+                  })}
                   {!files.length && <span className="muted">缺省</span>}
                 </div>
                 {canUpload && (
@@ -4465,6 +4369,12 @@ export function StorageWorkspace({
     if (preview.activeFile) lastVisualizedRef.current = preview.activeFile;
   }, [preview.activeFile]);
 
+  const latestFilesOf = (unit: StorageUnit) => {
+    const listed = data?.batches.find((batch) => batch.name === unit.batch)?.file_versions;
+    const versions = normalizeFileVersions(listed, unit.files);
+    return filesForVersion(unit.files, versions, latestVersionName(versions));
+  };
+
   const selectUnit = (unit: StorageUnit) => {
     setSelectedKey(unit.key);
     if (preview.contrastMode) {
@@ -4472,13 +4382,13 @@ export function StorageWorkspace({
       return;
     }
     previewUnitFile(unit, false);
-    if (!pickPreviewFile(unit.files, lastVisualizedRef.current)) {
+    if (!pickPreviewFile(latestFilesOf(unit), lastVisualizedRef.current)) {
       setFocus({ kind: "unit", key: unit.key });
     }
   };
 
   const previewUnitFile = (unit: StorageUnit, keepFocus: boolean) => {
-    const file = pickPreviewFile(unit.files, lastVisualizedRef.current);
+    const file = pickPreviewFile(latestFilesOf(unit), lastVisualizedRef.current);
     if (!file) return;
     lastVisualizedRef.current = file;
     preview.add(file);
@@ -4490,7 +4400,7 @@ export function StorageWorkspace({
 
   const previewRandomUnit = (units: StorageUnit[], keepFocus: boolean) => {
     const playable = units.filter((unit) =>
-      unit.files.some((file) => isVisualizableStorageFile(file))
+      latestFilesOf(unit).some((file) => isVisualizableStorageFile(file))
     );
     if (!playable.length) return;
     const unit = playable[Math.floor(Math.random() * playable.length)];
@@ -5472,6 +5382,9 @@ export function StorageWorkspace({
 
               <UnitMatrix
                 unit={selected}
+                fileVersions={
+                  data?.batches.find((batch) => batch.name === selected.batch)?.file_versions
+                }
                 selectedFile={focus?.kind === "file" ? focusedFile : null}
                 onFile={(file) => {
                   setSelectedKey(`${file.batch}::${file.unit_name}`);

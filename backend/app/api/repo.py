@@ -1244,6 +1244,14 @@ def get_retarget_priority(
     return public_config(Path(settings.hub_repo_root))
 
 
+@router.get("/retarget/storage-tree")
+def get_retarget_storage_tree(_: User = Depends(require_admin)):
+    """Human motion batches and subdirectories for priority rules."""
+    from ..services.retarget_priority import storage_structure_nodes
+
+    return storage_structure_nodes(Path(settings.hub_repo_root))
+
+
 @router.put("/retarget/priority")
 def put_retarget_priority(
     body: RetargetPriorityBody,
@@ -1275,6 +1283,20 @@ def post_retarget_pin(
     hub = Path(settings.hub_repo_root)
     try:
         return promote_targets(hub, body.items)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/retarget/priority/{rule_id}/redo")
+def redo_retarget_tier(
+    rule_id: str,
+    _: User = Depends(require_admin),
+):
+    """把某一档已完成和失败的重定向全部再跑一遍，新 CSV 写好后覆盖旧文件。"""
+    from ..services.retarget_priority import request_tier_redo
+
+    try:
+        return request_tier_redo(Path(settings.hub_repo_root), rule_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

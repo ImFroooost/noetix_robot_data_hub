@@ -25,6 +25,7 @@ type PreviewContextValue = {
   removeByPaths: (paths: string[]) => void;
   replaceByPath: (oldPath: string, file: StorageFile) => void;
   syncFromOverview: (files: StorageFile[], units: { files: StorageFile[] }[]) => void;
+  filesForUnit: (batch: string, unitName: string) => StorageFile[];
   setActive: (index: number) => void;
   addSlot: () => void;
   clear: () => void;
@@ -47,6 +48,7 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
   );
   const [activeIndex, setActiveIndex] = useState(0);
   const [contrastMode, setContrastModeState] = useState(false);
+  const [unitFiles, setUnitFiles] = useState<Map<string, StorageFile[]>>(() => new Map());
   const slotsRef = useRef(slots);
   const activeRef = useRef(activeIndex);
   const contrastRef = useRef(contrastMode);
@@ -136,7 +138,15 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const syncFromOverview = useCallback(
-    (files: StorageFile[], units: { files: StorageFile[] }[]) => {
+    (files: StorageFile[], units: { batch?: string; name?: string; files: StorageFile[] }[]) => {
+      const next = new Map<string, StorageFile[]>();
+      for (const unit of units) {
+        const list = unit.files || [];
+        const batch = unit.batch || list[0]?.batch || "";
+        const name = unit.name || list[0]?.unit_name || "";
+        if (batch && name && list.length) next.set(`${batch}::${name}`, list);
+      }
+      setUnitFiles(next);
       setSlots((current) =>
         current.map((file) => {
           if (!file) return file;
@@ -149,6 +159,10 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
       );
     },
     []
+  );
+  const filesForUnit = useCallback(
+    (batch: string, unitName: string) => unitFiles.get(`${batch}::${unitName}`) || [],
+    [unitFiles]
   );
 
   const addSlot = useCallback(() => {
@@ -206,13 +220,14 @@ export function PreviewProvider({ children }: { children: ReactNode }) {
       removeByPaths,
       replaceByPath,
       syncFromOverview,
+      filesForUnit,
       setActive: setActiveIndex,
       addSlot,
       clear,
       setContrastMode,
       reorder,
     }),
-    [slots, activeIndex, contrastMode, add, removeAt, removeByPaths, replaceByPath, syncFromOverview, addSlot, clear, setContrastMode, reorder]
+    [slots, activeIndex, contrastMode, add, removeAt, removeByPaths, replaceByPath, syncFromOverview, filesForUnit, addSlot, clear, setContrastMode, reorder]
   );
 
   return <PreviewContext.Provider value={value}>{children}</PreviewContext.Provider>;

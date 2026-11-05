@@ -32,6 +32,9 @@ from ..services.disk_repository import (
     local_write_generation,
     apply_upload_taxonomy,
     assemble_upload_sessions,
+    ORIGINAL_FILE_VERSION,
+    clean_file_version,
+    clean_motion_kind,
     create_batch,
     create_model_instance,
     delete_batches,
@@ -48,6 +51,7 @@ from ..services.disk_repository import (
     refresh_catalog_paths,
     start_catalog_rebuild,
     record_upload_session,
+    register_file_version,
     resolve_import_zip,
     rename_batch,
     rename_file,
@@ -142,6 +146,7 @@ class DataKindIn(BaseModel):
     ontology: str
     modality: str
     format: str | None = None
+    motion_kind: str | None = None
 
 
 class StorageSelectionIn(BaseModel):
@@ -359,6 +364,13 @@ def _has_capability_on_unit(
     return any(
         _unit_allowed(db, user, capability, unit) for capability in capabilities
     )
+
+
+def _require_model_library_write(db: Session, user: User) -> None:
+    """3D 模型库是全局资源。角色包含管理数据时，可以直接新增实例、上传文件并设置默认描述。"""
+    if has_role_capability(user, Capability.manage_data):
+        return
+    ensure_capability(db, user, Capability.upload, "/")
 
 
 def _require_tag_edit(
@@ -743,6 +755,15 @@ def _slim_file(file: dict[str, Any], unit: dict[str, Any]) -> dict[str, Any]:
         value = file.get(key)
         if value not in (None, "", 0):
             item[key] = value
+    version = str(file.get("file_version") or "")
+    if version and version != ORIGINAL_FILE_VERSION:
+        item["file_version"] = version
+    try:
+        version_order = int(file.get("file_version_order") or 0)
+    except (TypeError, ValueError):
+        version_order = 0
+    if version_order:
+        item["file_version_order"] = version_order
     uploader = file.get("uploader")
     if isinstance(uploader, dict) and uploader.get("id") is not None:
         item["uploader"] = {"id": uploader.get("id"), "username": uploader.get("username")}
@@ -800,6 +821,8 @@ def _compact_overview(payload: dict[str, Any]) -> dict[str, Any]:
             row["annotation"] = batch["annotation"]
         if batch.get("meta"):
             row["meta"] = batch["meta"]
+        if batch.get("file_versions"):
+            row["file_versions"] = batch["file_versions"]
         batches.append(row)
     return {**payload, "batches": batches}
 
@@ -1278,16 +1301,22 @@ def bulk_delete(
         delete_units(removed_units)
     if removed_batches:
         delete_batches(removed_batches)
-    write_audit(
-        db,
-        user_id=user.id,
-        action="bulk_delete",
-        entity_type="storage",
-        detail={
-            "batches": removed_batches,
-            "units": [{"batch": batch, "name": name} for batch, name in removed_units],
-        },
-    )
+    for name in removed_batches:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="delete",
+            entity_type="storage_batch",
+            detail={"batch": name},
+        )
+    for batch_name, unit_name in removed_units:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="delete",
+            entity_type="storage_unit",
+            detail={"batch": batch_name, "unit_name": unit_name},
+        )
     db.commit()
     return {
         "ok": True,
@@ -1328,7 +1357,35 @@ def archive_selection(
         filename = f"{units[0][1]}.zip"
     else:
         filename = "storage_selection.zip"
-    kinds = [(item.ontology, item.modality, item.format) for item in body.kinds]
+    kinds = [
+        (item.ontology, item.modality, item.format, item.motion_kind or "")
+        for item in body.kinds
+    ]
+    for name in batches:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="download",
+            entity_type="storage_batch",
+            detail={"batch": name},
+        )
+    for batch_name, unit_name in units:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="download",
+            entity_type="storage_unit",
+            detail={"batch": batch_name, "unit_name": unit_name},
+        )
+    if not batches and not units:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="download",
+            entity_type="storage",
+            detail={"kinds": kinds, "robot_styles": body.robot_styles},
+        )
+    db.commit()
 
     def accept(record: dict[str, Any]) -> bool:
         unit = _find_unit(snapshot, record["batch"], record["unit_name"])
@@ -1491,6 +1548,71 @@ def patch_unit(
     return result
 
 
+_UPLOAD_AUDIT_ACTION = {
+    "uploaded": "upload",
+    "replaced": "replace",
+    "skip": "skip",
+    "failed": "fail",
+}
+
+
+def _audit_upload_items(
+    db: Session,
+    user: User,
+    *,
+    batch: str,
+    file_version: str,
+    results: list[dict[str, Any]],
+) -> None:
+    """One audit row per file in a folder or zip upload."""
+    version = file_version or ORIGINAL_FILE_VERSION
+    if not results:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="upload",
+            entity_type="storage_batch",
+            detail={"batch": batch, "file_version": version, "total": 0},
+        )
+        return
+    for item in results:
+        status = str(item.get("status") or "")
+        file = item.get("file") if isinstance(item.get("file"), dict) else {}
+        write_audit(
+            db,
+            user_id=user.id,
+            action=_UPLOAD_AUDIT_ACTION.get(status, status or "upload"),
+            entity_type="storage_file",
+            detail={
+                "batch": batch,
+                "file_version": version,
+                "name": item.get("name") or "",
+                "unit_name": item.get("unit_name") or "",
+                "path": (file or {}).get("path") or "",
+                "status": status,
+                "detail": item.get("detail") or "",
+            },
+        )
+
+
+def _stored_file_version(item: dict[str, Any]) -> str:
+    return str(item.get("file_version") or ORIGINAL_FILE_VERSION)
+
+
+def _resolve_upload_file_version(snapshot: dict[str, Any], batch: str, raw: str) -> str:
+    try:
+        version = clean_file_version(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if version == ORIGINAL_FILE_VERSION:
+        return version
+    known = {str(item.get("name") or "") for item in snapshot.get("batches") or []}
+    if batch not in known and batch not in (read_metadata().get("batches") or {}):
+        raise HTTPException(status_code=400, detail="文件版本只能加到已有批次")
+    register_file_version(batch, version)
+    return version
+
+
 @router.post("/data/upload")
 async def upload_data(
     ontology: str = Form(...),
@@ -1504,6 +1626,7 @@ async def upload_data(
     annotation: str = Form(""),
     taxonomy_tag_ids: str = Form(""),
     robot_acquire_method: str = Form(""),
+    file_version: str = Form(""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1511,7 +1634,9 @@ async def upload_data(
     if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
         raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
     parsed_annotation = _parse_annotation_form(annotation)
-    current = _find_unit(scan_data(), batch, unit_name)
+    snapshot = scan_data()
+    version = _resolve_upload_file_version(snapshot, batch, file_version)
+    current = _find_unit(snapshot, batch, unit_name)
     if current:
         _require_unit(db, user, Capability.upload, current)
     else:
@@ -1535,6 +1660,12 @@ async def upload_data(
                     or (item.get("robot_acquire_method") or "omniretarget")
                     == (robot_acquire_method.strip().lower() or "omniretarget")
                 )
+                and (
+                    modality.strip().lower() != "motion"
+                    or clean_motion_kind((item.get("annotation") or {}).get("motion_kind"))
+                    == clean_motion_kind(parsed_annotation.get("motion_kind"))
+                )
+                and _stored_file_version(item) == version
             ),
             None,
         )
@@ -1554,6 +1685,8 @@ async def upload_data(
             update_index=False,
             robot_style=str(parsed_annotation.get("robot_style") or ""),
             robot_acquire_method=robot_acquire_method,
+            file_version=version,
+            motion_kind=str(parsed_annotation.get("motion_kind") or ""),
         )
         uploader = {
             "id": user.id,
@@ -1675,6 +1808,12 @@ async def upload_data_folder(
     robot_style = str(parsed_annotation.get("robot_style") or "")
     robot_acquire_method = str(form.get("robot_acquire_method") or "")
     snapshot = scan_data()
+    raw_version = form.get("file_version", "")
+    version = _resolve_upload_file_version(
+        snapshot,
+        str(batch or "").strip(),
+        raw_version if isinstance(raw_version, str) else "",
+    )
     current_units = {
         (item["batch"], item["name"]): item for item in snapshot.get("units", [])
     }
@@ -1736,6 +1875,8 @@ async def upload_data_folder(
                     db, user, Capability.upload, f"/{batch}/{raw_unit_name}/"
                 )
             if action == "replace" and current:
+                wanted_kind = clean_motion_kind(parsed_annotation.get("motion_kind"))
+                wanted_method = robot_acquire_method.strip().lower() or "omniretarget"
                 existing = next(
                     (
                         item
@@ -1746,10 +1887,29 @@ async def upload_data_folder(
                         and item["format"] == file_fmt
                         and item["name"] == stored_name
                         and (item.get("sub_path") or "") == (sub_path or "")
+                        and _stored_file_version(item) == version
+                        and (
+                            ontology != "robot"
+                            or str(item.get("robot_style") or "").strip() == robot_style
+                        )
+                        and (
+                            modality != "motion"
+                            or clean_motion_kind(
+                                (item.get("annotation") or {}).get("motion_kind")
+                                or item.get("motion_kind")
+                            )
+                            == wanted_kind
+                        )
+                        and (
+                            ontology != "robot"
+                            or modality != "motion"
+                            or (item.get("robot_acquire_method") or "omniretarget")
+                            == wanted_method
+                        )
                     ),
                     None,
                 )
-                if existing:
+                if existing and not user_has_any_capability(db, user, Capability.manage_data):
                     _require_file_owner(user, existing)
             result = save_data_file(
                 file.file,
@@ -1765,6 +1925,8 @@ async def upload_data_folder(
                 robot_style=robot_style,
                 robot_acquire_method=robot_acquire_method,
                 sub_path=sub_path,
+                file_version=version,
+                motion_kind=str(parsed_annotation.get("motion_kind") or ""),
                 preserve_tree=True,
             )
             result["uploader"] = {
@@ -1818,6 +1980,7 @@ async def upload_data_folder(
         refresh_catalog_paths(saved_paths)
     summary = {
         "batch": batch,
+        "file_version": version,
         "total": len(files),
         "uploaded": sum(item["status"] == "uploaded" for item in results),
         "replaced": sum(item["status"] == "replaced" for item in results),
@@ -1826,16 +1989,12 @@ async def upload_data_folder(
         "items": results,
         "upload_session_id": session["id"] if session else None,
     }
-    write_audit(
+    _audit_upload_items(
         db,
-        user_id=user.id,
-        action="upload_folder",
-        entity_type="storage_batch",
-        detail={
-            key: value
-            for key, value in summary.items()
-            if key != "items"
-        },
+        user,
+        batch=batch,
+        file_version=version,
+        results=results,
     )
     db.commit()
     return summary
@@ -1853,6 +2012,7 @@ async def upload_data_zip(
     annotation: str = Form(""),
     taxonomy_tag_ids: str = Form(""),
     robot_acquire_method: str = Form(""),
+    file_version: str = Form(""),
     local_path: str = Form(""),
     file: UploadFile | None = File(None),
     db: Session = Depends(get_db),
@@ -1870,6 +2030,7 @@ async def upload_data_zip(
     channel = channel.strip().lower()
     parsed_annotation = _parse_annotation_form(annotation)
     ensure_capability(db, user, Capability.upload, f"/{batch}/")
+    version = _resolve_upload_file_version(scan_data(), batch, file_version)
 
     _tmp_root = Path("/hub_repo/index/tmp")
     _tmp_root.mkdir(parents=True, exist_ok=True)
@@ -1979,6 +2140,7 @@ async def upload_data_zip(
                         and item["format"] == fmt
                         and item["name"] == stored_name
                         and (item.get("sub_path") or "") == file_sub_path
+                        and _stored_file_version(item) == version
                         and (
                             ontology != "robot"
                             or not new_robot_style
@@ -2014,6 +2176,8 @@ async def upload_data_zip(
                         robot_style=str(parsed_annotation.get("robot_style") or ""),
                         robot_acquire_method=robot_acquire_method,
                         sub_path=file_sub_path,
+                        file_version=version,
+                        motion_kind=str(parsed_annotation.get("motion_kind") or ""),
                         preserve_tree=True,
                     )
                 result["uploader"] = {"id": user.id, "username": user.username}
@@ -2071,6 +2235,7 @@ async def upload_data_zip(
 
         summary = {
             "batch": batch,
+            "file_version": version,
             "total": len(results),
             "uploaded": sum(item["status"] == "uploaded" for item in results),
             "replaced": sum(item["status"] == "replaced" for item in results),
@@ -2080,12 +2245,12 @@ async def upload_data_zip(
             "warnings": warnings,
             "upload_session_id": session["id"] if session else None,
         }
-        write_audit(
+        _audit_upload_items(
             db,
-            user_id=user.id,
-            action="upload_zip",
-            entity_type="storage_batch",
-            detail={key: value for key, value in summary.items() if key != "items"},
+            user,
+            batch=batch,
+            file_version=version,
+            results=results,
         )
         db.commit()
         return summary
@@ -2214,11 +2379,44 @@ def get_file(
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     disposition = "attachment" if download else "inline"
+    # Retarget redo and merges overwrite files in place. Without this the browser
+    # treats Last-Modified as a heuristic lifetime and keeps showing the old copy.
     return FileResponse(
         file_path,
         filename=file_path.name if download else None,
         content_disposition_type=disposition,
+        headers={"Cache-Control": "no-cache"},
     )
+
+
+@router.get("/retarget-frame")
+def get_retarget_frame(
+    path: str = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Where holosoma placed this human FBX in the robot CSV world (scripts/retarget_frames.py)."""
+    import hashlib
+
+    from ..services.disk_repository import root as hub_root
+
+    if not path.startswith("data/human/"):
+        raise HTTPException(status_code=400, detail="只支持人体动作文件")
+    snapshot = scan_data()
+    unit = _unit_for_file(snapshot, path)
+    if not unit:
+        raise HTTPException(status_code=404, detail="文件未纳入数据单元")
+    _require_unit(db, user, Capability.browse, unit)
+    frame_dir = hub_root() / "index" / "retarget_frames"
+    frame_file = frame_dir / f"{hashlib.sha1(path.encode('utf-8')).hexdigest()}.json"
+    if not frame_file.is_file():
+        raise HTTPException(status_code=404, detail="还没有记录这个文件的重定向坐标系")
+    try:
+        frame = json.loads(frame_file.read_text(encoding="utf-8"))
+        robots = json.loads((frame_dir / "robots.json").read_text(encoding="utf-8")).get("robots") or {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"重定向坐标系文件损坏：{exc}") from exc
+    return {**frame, "robot_heights": robots}
 
 
 @router.get("/smpl-model")
@@ -2359,7 +2557,7 @@ def add_model_instance(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    ensure_capability(db, user, Capability.upload, "/")
+    _require_model_library_write(db, user)
     try:
         result = create_model_instance(body.ontology, body.name)
     except ValueError as exc:
@@ -2381,10 +2579,11 @@ async def upload_model(
     instance: str = Form(...),
     kind: str = Form(...),
     file: UploadFile = File(...),
+    default_description_file: str = Form(""),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    ensure_capability(db, user, Capability.upload, "/")
+    _require_model_library_write(db, user)
     try:
         result = save_model_upload(
             file.file,
@@ -2392,6 +2591,7 @@ async def upload_model(
             instance=instance,
             kind=kind.strip().lower(),
             filename=file.filename or "model.bin",
+            default_description_file=default_description_file,
         )
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2414,11 +2614,19 @@ def patch_model_instance(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    ensure_capability(db, user, Capability.edit, "/")
+    _require_model_library_write(db, user)
     from ..services.disk_repository import update_model_instance_meta
 
     try:
         result = update_model_instance_meta(ontology, name, body.model_dump(exclude_none=True))
+        rel = str(body.default_description_file or "")
+        if ontology == "robot" and rel.lower().endswith((".urdf", ".xacro")):
+            from ..services.disk_repository import root as hub_root
+            from ..services.robot_retarget_profile import write_uploaded_profile
+
+            result["retarget_profile_ready"], result["retarget_profile_error"] = write_uploaded_profile(
+                hub_root(), name, rel
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     write_audit(

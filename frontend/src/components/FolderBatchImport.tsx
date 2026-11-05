@@ -47,6 +47,32 @@ const MODALITIES = [
 type FolderAction = "upload" | "replace" | "skip";
 type BatchChoice = "new" | "existing" | "";
 
+function resolveImportTarget(
+  choice: BatchChoice,
+  folderName: string,
+  batchName: string,
+  repairBatch: string
+) {
+  const repair = repairBatch.trim();
+  if (repair) return { batch: repair, existing: true };
+  if (choice === "existing") return { batch: folderName, existing: true };
+  return { batch: batchName.trim(), existing: false };
+}
+
+function validateFileVersion(
+  target: { batch: string; existing: boolean },
+  repairBatch: string,
+  fileVersion: string,
+  batches: { name: string }[]
+) {
+  const version = target.existing ? fileVersion.trim() : "";
+  if (repairBatch.trim() && !version) return "请填写文件版本名";
+  if (version && !batches.some((item) => item.name === target.batch)) {
+    return "找不到要修复的批次";
+  }
+  return "";
+}
+
 type ZipImportDraft = {
   file: File | null;
   localPath: string;
@@ -67,6 +93,8 @@ type ZipImportDraft = {
   motionKind: MotionKind;
   replace: boolean;
   followPaths: boolean;
+  repairBatch: string;
+  fileVersion: string;
 };
 
 type FolderImportDraft = {
@@ -90,6 +118,8 @@ type FolderImportDraft = {
   actions: Record<string, FolderAction>;
   replace: boolean;
   followPaths: boolean;
+  repairBatch: string;
+  fileVersion: string;
 };
 
 const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
@@ -97,7 +127,7 @@ const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 function normalizeUnitStem(name: string) {
   const cleaned = name
     .replace(
-      /(?:[\s._-]+|\.[A-Za-z0-9]{1,8}[\s._-]*)(?:skeleton|rigid[\s._-]*bod(?:y|ies)|marker).*$/i,
+      /(?:[\s._-]+|\.[A-Za-z0-9]{1,8}[\s._-]*)(?:skeleton|rigid[\s._-]*bod(?:y|ies)|marker|merged).*$/i,
       ""
     )
     .replace(/[ .\t_]+$/, "");
@@ -170,6 +200,60 @@ function usableFolderFiles(files: RelFile[]) {
     if (!file.size || IGNORED_FILE_NAMES.has(file.name)) return false;
     return !path.split("/").some((part) => part.startsWith("."));
   });
+}
+
+function FileVersionFields({
+  batches,
+  repairBatch,
+  fileVersion,
+  batchChoice,
+  disabled,
+  onRepairBatch,
+  onFileVersion,
+}: {
+  batches: { name: string }[];
+  repairBatch: string;
+  fileVersion: string;
+  batchChoice: BatchChoice;
+  disabled: boolean;
+  onRepairBatch: (value: string) => void;
+  onFileVersion: (value: string) => void;
+}) {
+  const enabled = Boolean(repairBatch.trim()) || batchChoice === "existing";
+  return (
+    <div className="storage-folder-format-warning">
+      <strong>文件版本</strong>
+      <label>
+        修复到已有批次
+        <select
+          value={repairBatch}
+          disabled={disabled}
+          onChange={(event) => onRepairBatch(event.target.value)}
+        >
+          <option value="">不指定（沿用上面的批次选择）</option>
+          {batches.map((item) => (
+            <option key={item.name} value={item.name}>
+              {item.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        文件版本名
+        <input
+          value={fileVersion}
+          disabled={disabled || !enabled}
+          placeholder={
+            enabled ? "例如 第一次修复版；留空表示原版" : "先选择已有批次后再填写"
+          }
+          onChange={(event) => onFileVersion(event.target.value)}
+        />
+      </label>
+      <small>
+        填写版本名后，这些文件会作为该批次的这个版本保存，原版仍留在原地。查看数据单元时默认显示最新版本；这个版本里没有的文件会沿用更早的版本。
+      </small>
+    </div>
+  );
 }
 
 export function FolderBatchImport({
@@ -267,7 +351,7 @@ export function FolderBatchImport({
       onError("请选择 zip 或填写服务器路径");
       return;
     }
-    const storage = await fetchStorageOverview();
+    const storage = await fetchStorageOverview({}, true);
     setOverview(storage);
     const batchExists = storage.batches.some((item) => item.name === folderName);
     setFolderResult(null);
@@ -292,6 +376,8 @@ export function FolderBatchImport({
       motionKind: DEFAULT_MOTION_KIND,
       replace: false,
       followPaths: false,
+      repairBatch: "",
+      fileVersion: "",
     });
   };
 
@@ -310,7 +396,7 @@ export function FolderBatchImport({
       onError("文件夹为空，或仅包含隐藏文件和空文件");
       return;
     }
-    const storage = await fetchStorageOverview();
+    const storage = await fetchStorageOverview({}, true);
     setOverview(storage);
     const folderName = guessFolderName(rawFiles);
     const batchExists = storage.batches.some((item) => item.name === folderName);
@@ -340,6 +426,8 @@ export function FolderBatchImport({
       actions: {},
       replace: false,
       followPaths: false,
+      repairBatch: "",
+      fileVersion: "",
     });
   };
 
@@ -389,16 +477,30 @@ export function FolderBatchImport({
 
   const submitZipImport = async () => {
     if (!zipDraft) return;
-    const targetBatch =
-      zipDraft.batchChoice === "existing"
-        ? zipDraft.folderName
-        : zipDraft.batchName.trim();
-    if (!zipDraft.batchChoice) {
+    const target = resolveImportTarget(
+      zipDraft.batchChoice,
+      zipDraft.folderName,
+      zipDraft.batchName,
+      zipDraft.repairBatch
+    );
+    const targetBatch = target.batch;
+    const fileVersion = target.existing ? zipDraft.fileVersion.trim() : "";
+    if (!zipDraft.batchChoice && !zipDraft.repairBatch.trim()) {
       setFolderError("请选择修改名称创建新批次，或添加至现有批次");
       return;
     }
     if (!targetBatch) {
       setFolderError("批次名称不能为空");
+      return;
+    }
+    const versionError = validateFileVersion(
+      target,
+      zipDraft.repairBatch,
+      zipDraft.fileVersion,
+      overview?.batches || []
+    );
+    if (versionError) {
+      setFolderError(versionError);
       return;
     }
     setFolderBusy(true);
@@ -410,6 +512,7 @@ export function FolderBatchImport({
       form.set("modality", zipDraft.modality);
       form.set("channel", zipDraft.modality === "fpv_video" ? zipDraft.channel : "");
       form.set("batch", targetBatch);
+      form.set("file_version", fileVersion);
       form.set("replace", String(zipDraft.replace));
       form.set("follow_paths", zipDraft.followPaths ? "1" : "0");
       form.set(
@@ -481,10 +584,16 @@ export function FolderBatchImport({
 
   const folderRows = useMemo(() => {
     if (!folderDraft) return [];
-    const targetBatch =
-      folderDraft.batchChoice === "existing"
-        ? folderDraft.folderName
-        : folderDraft.batchName.trim();
+    const target = resolveImportTarget(
+      folderDraft.batchChoice,
+      folderDraft.folderName,
+      folderDraft.batchName,
+      folderDraft.repairBatch
+    );
+    const targetBatch = target.batch;
+    const expectedVersion = target.existing
+      ? folderDraft.fileVersion.trim() || "原版"
+      : "原版";
     const existingUnits =
       overview?.batches.find((item) => item.name === targetBatch)?.units || [];
     const clipPlan = folderDraft.followPaths
@@ -508,11 +617,16 @@ export function FolderBatchImport({
         (item) =>
           item.ontology === folderDraft.ontology &&
           item.modality === folderDraft.modality &&
-          item.channel ===
+          (item.channel || "") ===
             (folderDraft.modality === "fpv_video" ? folderDraft.channel : "") &&
           item.format === (fileExtension(relFile) || folderDraft.format) &&
           item.name === storedName &&
-          String(item.robot_style || item.annotation?.robot_style || "").trim() === newRobotStyle
+          (item.file_version || "原版") === expectedVersion &&
+          String(item.robot_style || item.annotation?.robot_style || "").trim() ===
+            newRobotStyle &&
+          (!isMotionModality(folderDraft.modality) ||
+            resolveMotionKind(item.annotation?.motion_kind) ===
+              resolveMotionKind(folderDraft.motionKind))
       );
       const existingRobotStyle = existingFile ? String(existingFile.robot_style || existingFile.annotation?.robot_style || "").trim() : "";
       const styleDiffers =
@@ -550,16 +664,30 @@ export function FolderBatchImport({
 
   const submitFolderImport = async () => {
     if (!folderDraft) return;
-    const targetBatch =
-      folderDraft.batchChoice === "existing"
-        ? folderDraft.folderName
-        : folderDraft.batchName.trim();
-    if (!folderDraft.batchChoice) {
+    const target = resolveImportTarget(
+      folderDraft.batchChoice,
+      folderDraft.folderName,
+      folderDraft.batchName,
+      folderDraft.repairBatch
+    );
+    const targetBatch = target.batch;
+    const fileVersion = target.existing ? folderDraft.fileVersion.trim() : "";
+    if (!folderDraft.batchChoice && !folderDraft.repairBatch.trim()) {
       setFolderError("请选择修改名称创建新批次，或添加至现有批次");
       return;
     }
     if (!targetBatch) {
       setFolderError("批次名称不能为空");
+      return;
+    }
+    const versionError = validateFileVersion(
+      target,
+      folderDraft.repairBatch,
+      folderDraft.fileVersion,
+      overview?.batches || []
+    );
+    if (versionError) {
+      setFolderError(versionError);
       return;
     }
 
@@ -576,6 +704,7 @@ export function FolderBatchImport({
       );
       form.set("format", folderDraft.format.trim());
       form.set("batch", targetBatch);
+      form.set("file_version", fileVersion);
       form.set("follow_paths", folderDraft.followPaths ? "1" : "0");
       form.set("actions", JSON.stringify(folderRows.map((row) => row.action)));
       form.set(
@@ -849,6 +978,20 @@ export function FolderBatchImport({
               </label>
             )}
 
+            <FileVersionFields
+              batches={overview?.batches || []}
+              repairBatch={folderDraft.repairBatch}
+              fileVersion={folderDraft.fileVersion}
+              batchChoice={folderDraft.batchChoice}
+              disabled={folderBusy}
+              onRepairBatch={(repairBatch) =>
+                updateFolderDraft({ repairBatch, actions: {} })
+              }
+              onFileVersion={(fileVersion) =>
+                updateFolderDraft({ fileVersion, actions: {} })
+              }
+            />
+
             <label className="storage-follow-path">
               <input
                 type="checkbox"
@@ -861,7 +1004,7 @@ export function FolderBatchImport({
               <small>
                 {folderDraft.followPaths
                   ? "按文件夹里的目录显示"
-                  : "同一条动作的不同格式合成一个数据单元，批次内不再分层"}
+                  : "忽略所有目录，只按文件格式归入同一条动作"}
               </small>
             </label>
 
@@ -1047,8 +1190,9 @@ export function FolderBatchImport({
             )}
 
             <div className="storage-folder-summary">
-              将导入 {folderRows.filter((row) => row.action !== "skip").length} 个，
-              跳过 {folderRows.filter((row) => row.action === "skip").length} 个
+              将上传 {folderRows.filter((row) => row.action === "upload").length} 个，替换{" "}
+              {folderRows.filter((row) => row.action === "replace").length} 个，跳过{" "}
+              {folderRows.filter((row) => row.action === "skip").length} 个
               {(() => {
                 const dupCount = folderRows.filter((r) => r.duplicate && r.action === "skip").length;
                 const conflictCount = folderRows.filter((r) => r.existingConflict && !r.duplicate && r.action === "skip").length;
@@ -1295,6 +1439,15 @@ export function FolderBatchImport({
                   />
                 </label>
               )}
+              <FileVersionFields
+                batches={overview?.batches || []}
+                repairBatch={zipDraft.repairBatch}
+                fileVersion={zipDraft.fileVersion}
+                batchChoice={zipDraft.batchChoice}
+                disabled={folderBusy}
+                onRepairBatch={(repairBatch) => updateZipDraft({ repairBatch })}
+                onFileVersion={(fileVersion) => updateZipDraft({ fileVersion })}
+              />
               <label className="storage-follow-path">
                 <input
                   type="checkbox"
@@ -1305,7 +1458,7 @@ export function FolderBatchImport({
                 <small>
                   {zipDraft.followPaths
                     ? "按压缩包里的目录显示"
-                    : "同一条动作的不同格式合成一个数据单元，批次内不再分层"}
+                    : "忽略所有目录，只按文件格式归入同一条动作"}
                 </small>
               </label>
               <div className="grid-2">

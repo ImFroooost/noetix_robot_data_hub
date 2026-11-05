@@ -25,12 +25,15 @@ def load_trained(path: str | Path, device: str):
     model = build_denoiser(config)
     state = checkpoint.get("ema") or checkpoint["model"]
     model.load_state_dict(state)
-    model.to(device).eval()
-    schedule = Schedule(int(config["diffusion_steps"])).to(device)
     mean = checkpoint["mean"]
     std = checkpoint["std"]
     if torch.is_tensor(mean):
         mean = mean.detach().cpu().numpy()
     if torch.is_tensor(std):
         std = std.detach().cpu().numpy()
-    return model, schedule, np.asarray(mean, np.float32), np.asarray(std, np.float32), checkpoint
+    mean = np.asarray(mean, np.float32)
+    std = np.asarray(std, np.float32)
+    model.set_normalizer(mean, std)
+    model.to(device).eval()
+    schedule = Schedule(int(config["diffusion_steps"])).to(device)
+    return model, schedule, mean, std, checkpoint

@@ -607,6 +607,65 @@ function unsupportedHint(file: ModelInstanceFile) {
   return `暂不支持预览 .${ext || "该"} 文件，请选择网格、URDF、MJCF、FBX 或 BVH。`;
 }
 
+const SOURCE_EXTS = new Set([
+  "urdf",
+  "xacro",
+  "xml",
+  "mjcf",
+  "yaml",
+  "yml",
+  "json",
+  "txt",
+  "toml",
+  "md",
+  "launch",
+]);
+
+function isSourceFile(file: ModelInstanceFile) {
+  return SOURCE_EXTS.has(fileExt(file.name));
+}
+
+function ModelSourceView({ path }: { path: string }) {
+  const [text, setText] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancel = false;
+    setLoading(true);
+    setError("");
+    setText("");
+    fetchAuth(api.storageFileUrl(path))
+      .then((res) => res.text())
+      .then((body) => {
+        if (cancel) return;
+        const limit = 200_000;
+        setText(body.length > limit ? `${body.slice(0, limit)}\n…（后面的内容已省略）` : body);
+        setLoading(false);
+      })
+      .catch((err: unknown) => {
+        if (cancel) return;
+        setError(err instanceof Error ? err.message : "无法读取文件");
+        setLoading(false);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [path]);
+
+  return (
+    <>
+      {loading ? (
+        <div className="muted">正在读取代码…</div>
+      ) : error ? (
+        <div className="error">{error}</div>
+      ) : (
+        <pre className="storage-model-source">{text || "（文件是空的）"}</pre>
+      )}
+    </>
+  );
+}
+
 export function ModelFilePreview({
   file,
   instance,
@@ -618,6 +677,8 @@ export function ModelFilePreview({
   const url = api.storageFileUrl(file.path);
   const packageRoot = packageRootOf(file);
   const rotateZUp = instance.ontology === "robot" || kind === "stl";
+  const showSource = isSourceFile(file);
+  const [tab, setTab] = useState<"view" | "code">("view");
   const [banner, setBanner] = useState<{
     status: "loading" | "ready" | "error";
     message: string;
@@ -638,53 +699,89 @@ export function ModelFilePreview({
     setBanner({ status: "loading", message: "模型加载中…" });
   }, [file.path]);
 
-  if (kind === "unsupported") {
-    return <div className="storage-preview-empty">{unsupportedHint(file)}</div>;
-  }
+  useEffect(() => {
+    if (!showSource) setTab("view");
+  }, [showSource, file.path]);
 
-  if (kind === "fbx" || kind === "bvh") {
-    return (
+  let body: ReactNode;
+  if (showSource && tab === "code") {
+    body = <ModelSourceView path={file.path} />;
+  } else if (kind === "unsupported") {
+    body = <div className="storage-preview-empty">{unsupportedHint(file)}</div>;
+  } else if (kind === "fbx" || kind === "bvh") {
+    body = (
       <div className="storage-model-canvas is-animated">
         <AnimationFormatPreview url={url} format={kind} />
       </div>
     );
+  } else {
+    body = (
+      <ModelPreviewCanvas
+        status={banner.status}
+        message={banner.message}
+        resetKey={file.path}
+      >
+        {kind === "urdf" ? (
+          <UrdfModelScene
+            key={`${instance.key}:${file.path}`}
+            urdfPath={file.path}
+            packageRoot={packageRoot}
+            onStatus={onStatus}
+          />
+        ) : kind === "mjcf" ? (
+          <MjcfModelScene
+            key={`${instance.key}:${file.path}`}
+            mjcfPath={file.path}
+            packageRoot={packageRoot}
+            onStatus={onStatus}
+          />
+        ) : kind === "smpl" ? (
+          <SmplModelScene
+            key={`${instance.key}:${file.path}`}
+            path={file.path}
+            onStatus={onStatus}
+          />
+        ) : (
+          <StaticModelScene
+            key={`${instance.key}:${file.path}`}
+            url={url}
+            format={kind}
+            rotateZUp={rotateZUp}
+            onStatus={onStatus}
+          />
+        )}
+      </ModelPreviewCanvas>
+    );
   }
 
   return (
-    <ModelPreviewCanvas
-      status={banner.status}
-      message={banner.message}
-      resetKey={file.path}
-    >
-      {kind === "urdf" ? (
-        <UrdfModelScene
-          key={`${instance.key}:${file.path}`}
-          urdfPath={file.path}
-          packageRoot={packageRoot}
-          onStatus={onStatus}
-        />
-      ) : kind === "mjcf" ? (
-        <MjcfModelScene
-          key={`${instance.key}:${file.path}`}
-          mjcfPath={file.path}
-          packageRoot={packageRoot}
-          onStatus={onStatus}
-        />
-      ) : kind === "smpl" ? (
-        <SmplModelScene
-          key={`${instance.key}:${file.path}`}
-          path={file.path}
-          onStatus={onStatus}
-        />
+    <div className="stack">
+      {showSource ? (
+        <div className="source-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "view"}
+            className={tab === "view" ? "active" : ""}
+            onClick={() => setTab("view")}
+          >
+            可视化
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "code"}
+            className={tab === "code" ? "active" : ""}
+            onClick={() => setTab("code")}
+          >
+            代码
+          </button>
+        </div>
       ) : (
-        <StaticModelScene
-          key={`${instance.key}:${file.path}`}
-          url={url}
-          format={kind}
-          rotateZUp={rotateZUp}
-          onStatus={onStatus}
-        />
+        <h3 style={{ margin: 0 }}>可视化</h3>
       )}
-    </ModelPreviewCanvas>
+      <span className="muted">{file.relative_path}</span>
+      {body}
+    </div>
   );
 }

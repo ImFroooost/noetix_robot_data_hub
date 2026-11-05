@@ -122,6 +122,12 @@ def _migrate_schema(conn):
     ]
     # folders / user_permissions / real_videos / taxonomy_nodes created by create_all
     for table, col, stmt in alters:
+        reg = conn.execute(
+            text("SELECT to_regclass(:q)"),
+            {"q": f"public.{table}"},
+        ).scalar()
+        if not reg:
+            continue
         # folders must exist first for FK
         if table == "motion_clips" and col == "folder_id":
             exists = conn.execute(
@@ -269,24 +275,29 @@ def _migrate_schema(conn):
             "ADD CONSTRAINT uq_clip_taxonomy_node UNIQUE (clip_id, scheme, node_id)",
         )
 
+    for table in (
+        "clip_taxonomy_tags",
+        "human_motion_files",
+        "robot_motion_files",
+        "real_videos",
+        "shared_text_files",
+        "motion_clips",
+    ):
+        conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+
 
 def _migrate_data(db):
-    from .models import Capability, Folder, MotionClip, User, UserPermission, UserRole
+    from .models import Capability, Folder, User, UserPermission, UserRole
     from .models.enums import ROLE_ALIASES, is_super_role
     from .services.permissions import (
         ensure_trash_folder,
-        ensure_unclassified_folder,
-        get_or_create_folder_by_path,
-        normalize_path,
         set_user_permissions,
     )
     from .services.taxonomy_schemes import (
-        backfill_clip_taxonomy_tags,
         ensure_builtin_schemes,
         ensure_default_custom_schemes,
     )
 
-    unclassified = ensure_unclassified_folder(db)
     ensure_trash_folder(db)
 
     # Initialize folder sort_order per sibling group if all zeros
@@ -299,24 +310,6 @@ def _migrate_data(db):
         if all((getattr(s, "sort_order", 0) or 0) == 0 for s in siblings):
             for idx, s in enumerate(siblings):
                 s.sort_order = idx
-
-    # Assign folders from legacy category/subcategory
-    clips = db.query(MotionClip).filter(MotionClip.folder_id.is_(None)).all()
-    for clip in clips:
-        cat = (clip.category or "").strip()
-        sub = (clip.subcategory or "").strip()
-        if cat and sub:
-            path = normalize_path(f"/{cat}/{sub}/")
-        elif cat:
-            path = normalize_path(f"/{cat}/")
-        else:
-            clip.folder_id = unclassified.id
-            continue
-        try:
-            folder = get_or_create_folder_by_path(db, path)
-            clip.folder_id = folder.id
-        except Exception:
-            clip.folder_id = unclassified.id
 
     # Legacy admin/editor/viewer → 超级管理者 / 超级上传者 / 游客
     users = db.query(User).all()
@@ -338,13 +331,11 @@ def _migrate_data(db):
             )
 
     # Seed / rebuild taxonomy trees + heuristic map from legacy folders
-    from .services.taxonomy_seed import apply_folder_heuristic_to_clips, ensure_taxonomies
+    from .services.taxonomy_seed import ensure_taxonomies
 
     ensure_builtin_schemes(db)
     ensure_default_custom_schemes(db)
     ensure_taxonomies(db)
-    apply_folder_heuristic_to_clips(db)
-    backfill_clip_taxonomy_tags(db)
     db.commit()
 
 
@@ -358,11 +349,6 @@ def init_db():
     with engine.begin() as conn:
         _migrate_schema(conn)
         for stmt in [
-            "CREATE INDEX IF NOT EXISTS ix_clips_category_trgm ON motion_clips USING gin (category gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS ix_clips_subcategory_trgm ON motion_clips USING gin (subcategory gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS ix_clips_summary_trgm ON motion_clips USING gin (summary gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS ix_clips_description_trgm ON motion_clips USING gin (description gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS ix_clips_tags_gin ON motion_clips USING gin (tags)",
             "CREATE INDEX IF NOT EXISTS ix_folders_path ON folders (path)",
         ]:
             try:

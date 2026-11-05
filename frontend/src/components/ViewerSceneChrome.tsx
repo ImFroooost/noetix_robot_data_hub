@@ -1,4 +1,4 @@
-import { Grid } from "@react-three/drei";
+import { Grid, Html } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef, useSyncExternalStore, type RefObject } from "react";
 import * as THREE from "three";
@@ -207,15 +207,63 @@ function GroundFloor({ color }: { color: string }) {
     floor.position.z = camera.position.z;
   });
   return (
-    <mesh ref={ref} rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.02, 0]} renderOrder={-1}>
+    <mesh
+      ref={ref}
+      rotation={[-Math.PI / 2, 0, 0]}
+      position={[0, -0.02, 0]}
+      renderOrder={-1}
+      receiveShadow
+    >
       <planeGeometry args={[240, 240]} />
-      <meshBasicMaterial
+      <meshStandardMaterial
         color={color}
+        roughness={1}
+        metalness={0}
         polygonOffset
         polygonOffsetFactor={2}
         polygonOffsetUnits={2}
       />
     </mesh>
+  );
+}
+
+/** 数据原点的坐标轴。父级已经带上单位缩放和朝上校正，长度用数据单位。 */
+export function DataOriginAxes({ length }: { length: number }) {
+  const axisLen = Math.max(length * 0.42, 1e-4);
+  const group = useMemo(() => {
+    const root = new THREE.Group();
+    root.name = "__data_origin";
+    const head = axisLen * 0.16;
+    const width = Math.max(axisLen * 0.028, 1e-4);
+    const axes: Array<[THREE.Vector3, number]> = [
+      [new THREE.Vector3(1, 0, 0), 0xe23b3b],
+      [new THREE.Vector3(0, 1, 0), 0x2f9e44],
+      [new THREE.Vector3(0, 0, 1), 0x3b6fe2],
+    ];
+    for (const [dir, color] of axes) {
+      root.add(new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), axisLen, color, head, width));
+    }
+    return root;
+  }, [axisLen]);
+  const label = {
+    fontSize: "12px",
+    fontWeight: 700,
+    lineHeight: "1",
+    textShadow: "0 1px 2px rgba(0,0,0,0.45)",
+  };
+  return (
+    <group>
+      <primitive object={group} />
+      <Html position={[axisLen * 1.08, 0, 0]} center style={{ ...label, color: "#e23b3b" }}>
+        X
+      </Html>
+      <Html position={[0, axisLen * 1.08, 0]} center style={{ ...label, color: "#2f9e44" }}>
+        Y
+      </Html>
+      <Html position={[0, 0, axisLen * 1.08]} center style={{ ...label, color: "#3b6fe2" }}>
+        Z
+      </Html>
+    </group>
   );
 }
 
@@ -251,8 +299,22 @@ export function ViewerSceneChrome({ hemisphere = false }: { hemisphere?: boolean
       <color attach="background" args={[look.background]} />
       <CameraClip />
       <ambientLight intensity={look.ambient} />
-      <directionalLight position={[3, 5, 2]} intensity={look.directional} />
-      {hemisphere ? <hemisphereLight args={[look.hemiSky, look.hemiGround, 0.4]} /> : null}
+      <hemisphereLight args={[look.hemiSky, look.hemiGround, 0.35]} />
+      <directionalLight
+        position={[4.2, 8.5, 5.4]}
+        intensity={look.directional}
+        castShadow
+        shadow-mapSize-width={2048}
+        shadow-mapSize-height={2048}
+        shadow-camera-near={0.2}
+        shadow-camera-far={28}
+        shadow-camera-left={-7}
+        shadow-camera-right={7}
+        shadow-camera-top={7}
+        shadow-camera-bottom={-7}
+        shadow-bias={-0.0006}
+      />
+      {hemisphere ? <hemisphereLight args={[look.hemiSky, look.hemiGround, 0.25]} /> : null}
       <GroundFloor color={look.hemiGround} />
       <Grid
         ref={gridRef}

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from ..core.deps import require_admin
 from ..core.security import hash_password
 from ..database import get_db
-from ..models import AuditLog, MotionClip, User, UserRole
+from ..models import AuditLog, User, UserRole
 from ..models.enums import canonical_role, is_super_manager_role, is_super_role
 from ..schemas import (
     PermissionItem,
@@ -159,13 +159,7 @@ def delete_user(
         if _active_super_manager_count(db, exclude_id=user.id) == 0:
             raise HTTPException(status_code=400, detail="不能删除最后一个启用的超级管理者")
 
-    # Preserve clips/audit history; drop FK to the removed user.
-    db.query(MotionClip).filter(MotionClip.created_by == user.id).update(
-        {MotionClip.created_by: None}, synchronize_session=False
-    )
-    db.query(MotionClip).filter(MotionClip.updated_by == user.id).update(
-        {MotionClip.updated_by: None}, synchronize_session=False
-    )
+    # Keep the audit trail, but drop its link to the removed user.
     db.query(AuditLog).filter(AuditLog.user_id == user.id).update(
         {AuditLog.user_id: None}, synchronize_session=False
     )

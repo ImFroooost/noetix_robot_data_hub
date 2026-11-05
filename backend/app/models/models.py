@@ -15,7 +15,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..database import Base
-from .enums import Capability, QualityLevel, RobotStage, UserRole
+from .enums import Capability, UserRole
 
 
 def utcnow():
@@ -34,7 +34,6 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    clips_created = relationship("MotionClip", back_populates="creator", foreign_keys="MotionClip.created_by")
     permissions = relationship(
         "UserPermission", back_populates="user", cascade="all, delete-orphan"
     )
@@ -55,7 +54,6 @@ class Folder(Base):
 
     parent = relationship("Folder", remote_side="Folder.id", back_populates="children")
     children = relationship("Folder", back_populates="parent")
-    clips = relationship("MotionClip", back_populates="folder")
 
 
 class UserPermission(Base):
@@ -123,165 +121,6 @@ class TaxonomyNode(Base):
     children = relationship("TaxonomyNode", back_populates="parent")
 
 
-class ClipTaxonomyTag(Base):
-    """Per-clip tags. One clip can carry several nodes of the same scheme."""
-
-    __tablename__ = "clip_taxonomy_tags"
-    __table_args__ = (
-        UniqueConstraint("clip_id", "scheme", "node_id", name="uq_clip_taxonomy_node"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    clip_id: Mapped[int] = mapped_column(
-        ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True
-    )
-    scheme: Mapped[str] = mapped_column(String(64), index=True)
-    node_id: Mapped[int] = mapped_column(
-        ForeignKey("taxonomy_nodes.id", ondelete="CASCADE"), index=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    clip = relationship("MotionClip", back_populates="taxonomy_tag_rows")
-    node = relationship("TaxonomyNode")
-
-
-class MotionClip(Base):
-    __tablename__ = "motion_clips"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    folder_id: Mapped[int | None] = mapped_column(
-        ForeignKey("folders.id", ondelete="RESTRICT"), nullable=True, index=True
-    )
-    atomic_tag_id: Mapped[int | None] = mapped_column(
-        ForeignKey("taxonomy_nodes.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    intent_tag_id: Mapped[int | None] = mapped_column(
-        ForeignKey("taxonomy_nodes.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    style_tag_id: Mapped[int | None] = mapped_column(
-        ForeignKey("taxonomy_nodes.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    category: Mapped[str] = mapped_column(String(128), index=True, default="")  # legacy
-    subcategory: Mapped[str] = mapped_column(String(128), index=True, default="")  # legacy
-    summary: Mapped[str] = mapped_column(String(512), default="")  # 可作动作名称兜底
-    description: Mapped[str] = mapped_column(Text, default="")  # 动作详细描述
-    # —— 动作定义 / 版本 / 多模态（对齐数据表字段）——
-    action_code: Mapped[str] = mapped_column(String(128), default="", index=True)  # 动作ID（业务）
-    action_name: Mapped[str] = mapped_column(String(512), default="")  # 动作名称
-    brief: Mapped[str] = mapped_column(String(1024), default="")  # 动作简释
-    detail_def: Mapped[str] = mapped_column(Text, default="")  # 动作详细定义
-    action_version: Mapped[str] = mapped_column(String(64), default="")  # 动作版本号
-    routine_label: Mapped[str] = mapped_column(String(256), default="")  # 动作分级·套路
-    duel_label: Mapped[str] = mapped_column(String(256), default="")  # 动作分级·决斗
-    compute_level: Mapped[str] = mapped_column(String(64), default="")  # 算力级别
-    multimodal_overall: Mapped[str] = mapped_column(Text, default="")  # 多模态·整体描述
-    multimodal_segment: Mapped[str] = mapped_column(Text, default="")  # 多模态·分段描述
-    multimodal_atomic: Mapped[str] = mapped_column(Text, default="")  # 多模态·原子描述
-    tags: Mapped[list] = mapped_column(ARRAY(String), default=list)
-    duration_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
-    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
-    thumbnail_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    slice_json_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    slice_json_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    slice_json_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
-
-    folder = relationship("Folder", back_populates="clips")
-    atomic_tag = relationship("TaxonomyNode", foreign_keys=[atomic_tag_id])
-    intent_tag = relationship("TaxonomyNode", foreign_keys=[intent_tag_id])
-    style_tag = relationship("TaxonomyNode", foreign_keys=[style_tag_id])
-    taxonomy_tag_rows = relationship(
-        "ClipTaxonomyTag", back_populates="clip", cascade="all, delete-orphan"
-    )
-    creator = relationship("User", foreign_keys=[created_by], back_populates="clips_created")
-    human_files = relationship(
-        "HumanMotionFile", back_populates="clip", cascade="all, delete-orphan"
-    )
-    robot_files = relationship(
-        "RobotMotionFile", back_populates="clip", cascade="all, delete-orphan"
-    )
-    real_videos = relationship(
-        "RealVideo", back_populates="clip", cascade="all, delete-orphan"
-    )
-    shared_texts = relationship(
-        "SharedTextFile", back_populates="clip", cascade="all, delete-orphan"
-    )
-
-
-class HumanMotionFile(Base):
-    __tablename__ = "human_motion_files"
-    __table_args__ = (
-        UniqueConstraint("clip_id", "format", "label", name="uq_human_clip_format_label"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    clip_id: Mapped[int] = mapped_column(ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True)
-    format: Mapped[str] = mapped_column(String(32), index=True)  # bvh/smpl/csv/fbx/npz/...
-    label: Mapped[str] = mapped_column(String(64), default="v1")  # version label within format
-    fps: Mapped[float | None] = mapped_column(Float, nullable=True)
-    frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    quality: Mapped[QualityLevel] = mapped_column(Enum(QualityLevel), default=QualityLevel.medium)
-    # 数据评价：'' 未评价 / pass 直接通过 / needs_fix 需要修改 / discard 建议丢弃
-    review: Mapped[str] = mapped_column(String(32), default="", index=True)
-    file_path: Mapped[str] = mapped_column(String(1024))
-    original_name: Mapped[str] = mapped_column(String(512), default="")
-    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    preview_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    process_status: Mapped[str] = mapped_column(String(32), default="pending")  # pending/done/error
-    process_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    clip = relationship("MotionClip", back_populates="human_files")
-
-
-class RealVideo(Base):
-    __tablename__ = "real_videos"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    clip_id: Mapped[int] = mapped_column(
-        ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True
-    )
-    # human=真人视频；robot_motion=motion播放；robot_policy_sim=策略仿真；robot_policy_real=策略真机
-    kind: Mapped[str] = mapped_column(String(32), default="human", index=True)
-    quality: Mapped[QualityLevel] = mapped_column(Enum(QualityLevel), default=QualityLevel.medium)
-    review: Mapped[str] = mapped_column(String(32), default="", index=True)
-    file_path: Mapped[str] = mapped_column(String(1024))
-    original_name: Mapped[str] = mapped_column(String(512), default="")
-    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    duration_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
-    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    clip = relationship("MotionClip", back_populates="real_videos")
-
-
-class SharedTextFile(Base):
-    """人机共享·文本描述文件（txt/json/…）。"""
-
-    __tablename__ = "shared_text_files"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    clip_id: Mapped[int] = mapped_column(
-        ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True
-    )
-    format: Mapped[str] = mapped_column(String(32), index=True)  # txt/json/md/...
-    label: Mapped[str] = mapped_column(String(64), default="v1")
-    file_path: Mapped[str] = mapped_column(String(1024))
-    original_name: Mapped[str] = mapped_column(String(512), default="")
-    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    review: Mapped[str] = mapped_column(String(32), default="", index=True)
-    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    clip = relationship("MotionClip", back_populates="shared_texts")
-
-
 class ModelAsset(Base):
     """3D 模型库文件：人体（fbx/bvh/smpl/blender）与机器人（urdf/xml/fbx/blender）。"""
 
@@ -311,46 +150,6 @@ class RobotModel(Base):
     joint_names: Mapped[list] = mapped_column(ARRAY(String), default=list)
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    motion_files = relationship("RobotMotionFile", back_populates="robot_model")
-
-
-class RobotMotionFile(Base):
-    __tablename__ = "robot_motion_files"
-    __table_args__ = (
-        UniqueConstraint(
-            "clip_id",
-            "robot_model_id",
-            "stage",
-            "format",
-            "label",
-            name="uq_robot_clip_model_stage_fmt_label",
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    clip_id: Mapped[int] = mapped_column(ForeignKey("motion_clips.id", ondelete="CASCADE"), index=True)
-    robot_model_id: Mapped[int] = mapped_column(
-        ForeignKey("robot_models.id", ondelete="RESTRICT"), index=True
-    )
-    stage: Mapped[RobotStage] = mapped_column(Enum(RobotStage), index=True)
-    format: Mapped[str] = mapped_column(String(32), default="csv", index=True)
-    label: Mapped[str] = mapped_column(String(64), default="v1")
-    fps: Mapped[float | None] = mapped_column(Float, nullable=True)
-    frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    quality: Mapped[QualityLevel] = mapped_column(Enum(QualityLevel), default=QualityLevel.medium)
-    review: Mapped[str] = mapped_column(String(32), default="", index=True)
-    file_path: Mapped[str] = mapped_column(String(1024))
-    original_name: Mapped[str] = mapped_column(String(512), default="")
-    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    preview_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    process_status: Mapped[str] = mapped_column(String(32), default="pending")
-    process_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    clip = relationship("MotionClip", back_populates="robot_files")
-    robot_model = relationship("RobotModel", back_populates="motion_files")
 
 
 class ActionUnit(Base):

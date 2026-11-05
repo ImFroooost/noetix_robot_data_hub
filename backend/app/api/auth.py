@@ -57,10 +57,37 @@ def _token_out(db: Session, user: User, token: str, actor: User | None = None) -
 def login(body: LoginIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == body.username).first()
     if not user or not verify_password(body.password, user.password_hash):
+        write_audit(
+            db,
+            user_id=user.id if user else None,
+            action="login_failed",
+            entity_type="user",
+            entity_id=user.id if user else None,
+            detail={"username": body.username},
+        )
+        db.commit()
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     if not user.is_active:
+        write_audit(
+            db,
+            user_id=user.id,
+            action="login_failed",
+            entity_type="user",
+            entity_id=user.id,
+            detail={"username": body.username, "reason": "账号已禁用"},
+        )
+        db.commit()
         raise HTTPException(status_code=401, detail="账号已禁用")
     token = create_access_token(user.id, user.username, user.role)
+    write_audit(
+        db,
+        user_id=user.id,
+        action="login",
+        entity_type="user",
+        entity_id=user.id,
+        detail={"username": user.username},
+    )
+    db.commit()
     return _token_out(db, user, token)
 
 

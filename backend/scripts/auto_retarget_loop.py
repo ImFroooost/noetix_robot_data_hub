@@ -1,10 +1,11 @@
 """Keep retargeting human motions onto every holosoma robot style.
 
 For each data unit that has human motion and is missing one or more robot styles,
-pick a source file (skeleton before merged, then fbx, bvh, smpl) and run
+pick a source file (merged before skeleton, then fbx, bvh, smpl) and run
 holosoma_retargeting's data_utils/batch_retarget_to_csv.py in a fresh process
-(same flags as the official batch command). Outputs are headerless
-30 Hz CSVs under data/robot/<style>/motion/omniretarget/csv/<batch>/...
+(same flags as the official batch command). Merged FBX carries the scene
+objects the new retargeter reads. Outputs stay headerless 30 Hz skeleton
+CSVs under data/robot/<style>/motion/omniretarget/skeleton/csv/<batch>/...
 
 Run on the host with the holosoma virtualenv:
 
@@ -14,15 +15,18 @@ Run on the host with the holosoma virtualenv:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
+import zipfile
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,27 +49,37 @@ sys.path.insert(0, str(PKG / "holosoma_retargeting" / "data_utils"))
 
 from app.services.retarget_control import load_control, wave_plan  # noqa: E402
 from app.services.retarget_priority import (  # noqa: E402
-    ROBOTS,
+    FOLDER_SCHEME,
     UNLISTED,
     config_path,
     describe_rule,
+    folder_constraints,
+    job_queue,
     job_queue,
     load_config,
     load_pins,
+    load_redo,
     migrate_pins_into_rules,
     pin_index,
     pins_path,
+    redo_generation,
+    robot_catalog,
+    scheduled_robots,
+    settle_redo,
     targets_match,
 )
 from app.services.retarget_select import (  # noqa: E402
     choose_human_source,
     human_height_m,
-    motion_kind,
     output_stem,
 )
-from app.services.unit_names import normalize_unit_stem  # noqa: E402
+from app.services.unit_names import (  # noqa: E402
+    FILE_VERSION_DIR,
+    ORIGINAL_FILE_VERSION,
+    normalize_unit_stem,
+    split_file_version,
+)
 
-STYLES = list(ROBOTS)
 # Interpreter that can run data_utils/batch_retarget_to_csv.py. A fresh process
 # each job so a long-lived worker cannot keep an old copy of the solver.
 RETARGET_PYTHON = Path(
@@ -78,6 +92,11 @@ INNER = PKG / "holosoma_retargeting"
 RETARGET_METHOD = "batch_retarget_to_csv"
 # CSVs written by the in-process loop on this day used a stale solver and are redone.
 REDO_AFTER = datetime(2026, 9, 24).timestamp()
+# Acquire-method directory inserted under robot/<style>/motion/.
+_ACQUIRE_METHODS = frozenset({"omniretarget", "umr", "gmr"})
+# Outputs finished in this process. A priority rescan can happen before the
+# next catalog pass attaches them to their data unit.
+_finished_outputs: set[str] = set()
 # Eight one-thread jobs. A 26-way wave filled swap and the desktop OOM killer
 # stopped Cursor and Chrome, so the ceiling stays well under the 32 cores.
 WORKERS = max(1, int(os.environ.get("AUTO_RETARGET_WORKERS", "8")))
@@ -164,7 +183,11 @@ def _fill_eta(queues: list[dict]) -> None:
         ahead += remaining
 
 
-def fresh_queues(jobs: list[dict], rules: list[dict]) -> list[dict]:
+def fresh_queues(
+    jobs: list[dict],
+    rules: list[dict],
+    scope: dict[str, dict[str, int]] | None = None,
+) -> list[dict]:
     seen_robots: set[str] = set()
     rows = []
     pinned = [job for job in jobs if job.get("queue") == "pinned"]
@@ -198,7 +221,7 @@ def fresh_queues(jobs: list[dict], rules: list[dict]) -> list[dict]:
                 "key": rule["id"],
                 "rule_id": rule["id"],
                 "rank": str(index + 1),
-                "title": describe_rule(rule, seen_robots),
+                "title": describe_rule(rule, seen_robots, rules),
                 "total": 0,
                 "done": 0,
                 "failed": 0,
@@ -208,13 +231,39 @@ def fresh_queues(jobs: list[dict], rules: list[dict]) -> list[dict]:
         seen_robots.update(rule.get("robots") or [])
     by_key = {row["key"]: row for row in rows}
     other = 0
-    for job in jobs:
-        row = by_key.get(job.get("queue") or "")
-        if row is None:
-            other += 1
-        else:
-            row["total"] += 1
-    if other:
+    if scope is None:
+        for job in jobs:
+            row = by_key.get(job.get("queue") or "")
+            if row is None:
+                other += 1
+            else:
+                row["total"] += 1
+    else:
+        for key, counts in scope.items():
+            if key == "pinned":
+                continue
+            row = by_key.get(key)
+            if row is None and key == UNLISTED and int(counts.get("total") or 0) > 0:
+                rows.append(
+                    {
+                        "key": UNLISTED,
+                        "rule_id": UNLISTED,
+                        "rank": str(len(rows) + 1),
+                        "title": "还没有写进规则的机器人，排在最后",
+                        "total": 0,
+                        "done": 0,
+                        "failed": 0,
+                        "active": False,
+                    }
+                )
+                row = rows[-1]
+                by_key[key] = row
+            if row is None:
+                continue
+            row["total"] = int(counts.get("total") or 0)
+            row["done"] = int(counts.get("done") or 0)
+        other = 0
+    if other and not any(row["key"] == UNLISTED for row in rows):
         rows.append(
             {
                 "key": UNLISTED,
@@ -239,6 +288,13 @@ def _priority_mtime() -> float:
         except OSError:
             continue
     return max(stamps) if stamps else 0.0
+
+
+def _redo_generation() -> int:
+    try:
+        return redo_generation(HUB)
+    except OSError:
+        return 0
 
 
 def _load_pace() -> None:
@@ -298,34 +354,64 @@ def unit_name_for(sub_path: str, stem: str) -> str:
     return normalize_unit_stem(raw.replace("/", "_")) or raw.replace("/", "_")
 
 
+def robot_csv_batch(rel_parts: tuple[str, ...]) -> tuple[str, str, str] | None:
+    """batch, sub_path and file_version for a file under robot/<style>/motion.
+
+    Accepts ``omniretarget/skeleton/csv/<batch>/...`` and the older layouts
+    that omit the motion kind or the acquire method.
+    ``.file_versions/<name>/`` after the batch stays on the same unit.
+    """
+    if len(rel_parts) < 3:
+        return None
+    idx = 1 if rel_parts[0] in _ACQUIRE_METHODS else 0
+    if idx < len(rel_parts) and rel_parts[idx] in {"skeleton", "object", "merged"}:
+        idx += 1
+    if len(rel_parts) < idx + 3 or rel_parts[idx] != "csv":
+        return None
+    batch = rel_parts[idx + 1]
+    version, rest = split_file_version(rel_parts[idx + 2 :])
+    if not rest:
+        return None
+    sub = "/".join(rest[:-1])
+    return batch, sub, version
+
+
 def iter_motion_files() -> list[dict]:
     records = []
     human_root = HUB / "data" / "human" / "motion"
     if human_root.is_dir():
-        for fmt_dir in human_root.iterdir():
-            if not fmt_dir.is_dir():
+        for kind_dir in human_root.iterdir():
+            if not kind_dir.is_dir() or kind_dir.name not in {"skeleton", "object", "merged"}:
                 continue
-            for path in fmt_dir.rglob("*"):
-                if not path.is_file() or path.name.startswith("."):
+            for fmt_dir in kind_dir.iterdir():
+                if not fmt_dir.is_dir():
                     continue
-                rel = path.relative_to(fmt_dir)
-                if len(rel.parts) < 2:
-                    continue
-                batch = rel.parts[0]
-                sub = "/".join(rel.parts[1:-1])
-                records.append(
-                    {
-                        "ontology": "human",
-                        "modality": "motion",
-                        "format": path.suffix.lstrip(".").lower(),
-                        "name": path.name,
-                        "batch": batch,
-                        "sub_path": sub,
-                        "path": path.relative_to(HUB).as_posix(),
-                        "abs": path,
-                        "unit": unit_name_for(sub, path.stem),
-                    }
-                )
+                for path in fmt_dir.rglob("*"):
+                    if not path.is_file() or path.name.startswith("."):
+                        continue
+                    rel = path.relative_to(fmt_dir)
+                    if len(rel.parts) < 2:
+                        continue
+                    batch = rel.parts[0]
+                    version, rest = split_file_version(rel.parts[1:])
+                    if not rest:
+                        continue
+                    sub = "/".join(rest[:-1])
+                    records.append(
+                        {
+                            "ontology": "human",
+                            "modality": "motion",
+                            "format": path.suffix.lstrip(".").lower(),
+                            "name": path.name,
+                            "batch": batch,
+                            "sub_path": sub,
+                            "file_version": version,
+                            "path": path.relative_to(HUB).as_posix(),
+                            "abs": path,
+                            "unit": unit_name_for(sub, path.stem),
+                            "path_motion_kind": kind_dir.name,
+                        }
+                    )
     robot_root = HUB / "data" / "robot"
     if robot_root.is_dir():
         for style_dir in robot_root.iterdir():
@@ -333,12 +419,10 @@ def iter_motion_files() -> list[dict]:
             if not motion.is_dir():
                 continue
             for path in motion.rglob("*.csv"):
-                rel = path.relative_to(motion)
-                # motion/<fmt>/<batch>/...
-                if len(rel.parts) < 3:
+                located = robot_csv_batch(path.relative_to(motion).parts)
+                if located is None:
                     continue
-                fmt, batch = rel.parts[0], rel.parts[1]
-                sub = "/".join(rel.parts[2:-1])
+                batch, sub, version = located
                 records.append(
                     {
                         "ontology": "robot",
@@ -347,6 +431,7 @@ def iter_motion_files() -> list[dict]:
                         "name": path.name,
                         "batch": batch,
                         "sub_path": sub,
+                        "file_version": version,
                         "robot_style": style_dir.name,
                         "path": path.relative_to(HUB).as_posix(),
                         "unit": unit_name_for(sub, path.stem),
@@ -362,7 +447,23 @@ def attach_annotations(records: list[dict]) -> None:
     data = json.loads(meta_path.read_text())
     files = data.get("files") or {}
     units = data.get("units") or {}
+    batch_orders: dict[str, dict[str, int]] = {}
+    for batch_name, row in (data.get("batches") or {}).items():
+        mapping = {ORIGINAL_FILE_VERSION: 0}
+        for item in (row or {}).get("file_versions") or []:
+            if isinstance(item, dict) and item.get("name"):
+                mapping[str(item["name"])] = int(item.get("order") or 0)
+        batch_orders[str(batch_name)] = mapping
     for record in records:
+        version = str(record.get("file_version") or ORIGINAL_FILE_VERSION)
+        record["file_version"] = version
+        orders = batch_orders.get(str(record.get("batch") or ""), {ORIGINAL_FILE_VERSION: 0})
+        if version in orders:
+            record["file_version_order"] = orders[version]
+        elif version == ORIGINAL_FILE_VERSION:
+            record["file_version_order"] = 0
+        else:
+            record["file_version_order"] = 1 + max(orders.values(), default=0)
         row = files.get(record["path"]) or {}
         record["annotation"] = dict(row.get("annotation") or {})
         unit_row = units.get(f"{record['batch']}::{record['unit']}") or {}
@@ -518,8 +619,17 @@ def prepare_rules() -> tuple[list[tuple], list[dict], float]:
         if not rule.get("enabled"):
             continue
         if rule.get("data_mode") == "taxonomy":
-            include_picks = _priority_picks(rule, "include_picks", "include_names")
-            exclude_picks = _priority_picks(rule, "exclude_picks", "exclude_names")
+            include_picks = [
+                pick
+                for pick in _priority_picks(rule, "include_picks", "include_names")
+                if pick["scheme"] != FOLDER_SCHEME
+            ]
+            exclude_picks = [
+                pick
+                for pick in _priority_picks(rule, "exclude_picks", "exclude_names")
+                if pick["scheme"] != FOLDER_SCHEME
+            ]
+            folder_include, folder_exclude = folder_constraints(rule)
             names_by_scheme: dict[str, list[str]] = {}
             for pick in include_picks:
                 bucket = names_by_scheme.setdefault(pick["scheme"], [])
@@ -557,7 +667,10 @@ def prepare_rules() -> tuple[list[tuple], list[dict], float]:
             exclude_ids = set()
             include_groups = []
             scope_sets = []
-        compiled.append((rule, include_ids, exclude_ids, include_groups, scope_sets))
+            folder_include, folder_exclude = [], []
+        compiled.append(
+            (rule, include_ids, exclude_ids, include_groups, scope_sets, folder_include, folder_exclude)
+        )
         enabled.append(rule)
     return compiled, enabled, _priority_mtime()
 
@@ -591,19 +704,21 @@ def sort_jobs(
     order[UNLISTED] = len(compiled)
     grouped_rules = {
         rule["id"]: (rule, include_groups)
-        for rule, _include, _exclude, include_groups, _scopes in compiled
+        for rule, _include, _exclude, include_groups, *_rest in compiled
     }
 
     for job in jobs:
         if pin_index(pins, job["batch"], job["unit"]) is not None:
             job["queue"] = "pinned"
         else:
+            source = job.get("source") or {}
             job["queue"] = job_queue(
                 job["style"],
                 set(job.get("tag_ids") or ()),
                 compiled,
                 batch=job["batch"],
                 unit=job["unit"],
+                sub_path=str(source.get("sub_path") or ""),
             )
 
     def selection_rank(job: dict) -> tuple[int, int]:
@@ -665,27 +780,119 @@ def _stop_if_requested() -> bool:
     return True
 
 
+# Same pose widths batch_retarget_to_csv.py accepts: SMPL 72, SMPL-H 156, SMPL-X 165.
+_AMASS_POSE_DIMS = frozenset({72, 156, 165})
+_amass_npz_cache: dict[str, tuple[int, int, bool]] = {}
+_last_skipped_npz = -1
+
+
+def _npy_shape(prefix: bytes) -> tuple[int, ...] | None:
+    """Read a ``.npy`` shape from its header without loading the array."""
+    if len(prefix) < 10 or prefix[:6] != b"\x93NUMPY":
+        return None
+    major = prefix[6]
+    if major == 1:
+        header_len = struct.unpack_from("<H", prefix, 8)[0]
+        start = 10
+    elif major in (2, 3):
+        if len(prefix) < 12:
+            return None
+        header_len = struct.unpack_from("<I", prefix, 8)[0]
+        start = 12
+    else:
+        return None
+    if len(prefix) < start + header_len:
+        return None
+    header = prefix[start : start + header_len].decode("latin1").strip()
+    try:
+        meta = ast.literal_eval(header)
+        shape = tuple(int(item) for item in meta["shape"])
+    except (SyntaxError, ValueError, KeyError, TypeError):
+        return None
+    return shape
+
+
+def _npz_is_amass_smpl(path: Path) -> bool:
+    """True when the npz is raw AMASS SMPL, matching holosoma's input filter.
+
+    LocoMujoco mocap stores MuJoCo ``qpos`` for a robot (Atlas, Apollo, G1, …).
+    Those files sit under the smpl tree but have no ``poses``/``trans``, so
+    batch_retarget_to_csv.py ignores them and reports an empty input dir.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    key = str(path)
+    token = (stat.st_size, stat.st_mtime_ns)
+    cached = _amass_npz_cache.get(key)
+    if cached is not None and cached[:2] == token:
+        return cached[2]
+    ok = False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if "poses.npy" in names and "trans.npy" in names:
+                with archive.open("poses.npy") as handle:
+                    shape = _npy_shape(handle.read(65536))
+                ok = shape is not None and len(shape) == 2 and shape[-1] in _AMASS_POSE_DIMS
+    except (OSError, zipfile.BadZipFile, KeyError):
+        ok = False
+    _amass_npz_cache[key] = (token[0], token[1], ok)
+    return ok
+
+
 def _source_is_motion(source: dict) -> bool:
-    """Shape files and GRAB stage-i captures have no pose sequence."""
+    """Shape files, GRAB stage-i captures, and non-AMASS npz have no SMPL sequence."""
     name = Path(str(source.get("name") or source.get("path") or "")).name.lower()
     if name == "shape.npz" or name.endswith("_stagei.npz"):
         return False
+    if name.endswith(".npz"):
+        abs_path = source.get("abs")
+        if not abs_path:
+            return False
+        return _npz_is_amass_smpl(Path(abs_path))
     return True
 
 
-def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> list[dict]:
+def _note_skipped_npz(count: int) -> None:
+    global _last_skipped_npz
+    if count != _last_skipped_npz:
+        if count:
+            log(f"跳过 {count} 个 npz：不是 AMASS 人体骨架（没有 SMPL poses/trans），不送去重定向")
+        _last_skipped_npz = count
+
+
+def collect_jobs(
+    grouped: dict[tuple[str, str], list[dict]],
+    state: dict,
+    compiled: list[tuple] | None = None,
+    redo: dict[str, float] | None = None,
+) -> list[dict]:
     failures = state.get("failures") or {}
     pins = load_pins(HUB)
+    rules = load_config(HUB)["rules"]
+    styles = scheduled_robots(HUB, rules)
     targeted = [
         rule
-        for rule in load_config(HUB)["rules"]
+        for rule in rules
         if rule.get("enabled") and rule.get("data_mode") == "targets"
     ]
+    redo = dict(redo or {})
+    compiled = compiled or []
+    pending_redo: set[str] = set()
+    scope: dict[str, dict[str, int]] = {}
     now = time.time()
     jobs = []
+    skipped_npz = 0
+    redo_jobs = 0
     for (batch, unit), files in grouped.items():
         source = choose_human_source(files)
-        if source is None or not _source_is_motion(source):
+        if source is None:
+            continue
+        if not _source_is_motion(source):
+            if str(source.get("name") or "").lower().endswith(".npz"):
+                skipped_npz += 1
             continue
         source = dict(source)
         source["abs"] = str(source.get("abs") or "")
@@ -693,21 +900,52 @@ def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> lis
         for item in files:
             tag_ids |= set(item.get("tag_ids") or ())
         tag_list = sorted(tag_ids)
-        for style in STYLES:
+        pinned = pin_index(pins, batch, unit) is not None
+        for style in styles:
             key = f"{batch}::{unit}::{style}::{source['path']}"
             until = float(failures.get(key) or 0)
-            if until > now and pin_index(pins, batch, unit) is None and not any(
-                targets_match(rule, batch, unit) for rule in targeted
-            ):
-                continue
+            redo_after = None
+            scope_queue = ""
+            if compiled:
+                scope_queue = job_queue(
+                    style,
+                    set(tag_list),
+                    compiled,
+                    batch=batch,
+                    unit=unit,
+                    sub_path=str(source.get("sub_path") or ""),
+                )
+                redo_after = redo.get(scope_queue)
             stem = output_stem(source["name"])
             sub = source.get("sub_path") or ""
-            dest = HUB / "data" / "robot" / style / "motion" / "omniretarget" / "csv" / batch
+            version = str(source.get("file_version") or ORIGINAL_FILE_VERSION)
+            dest = HUB / "data" / "robot" / style / "motion" / "omniretarget" / "skeleton" / "csv" / batch
+            if version and version != ORIGINAL_FILE_VERSION:
+                dest = dest / FILE_VERSION_DIR / version
             if sub:
                 dest = dest / sub
             dest = dest / f"{stem}.csv"
-            if not needs_official_retarget(dest, files, style):
+            needs = needs_official_retarget(dest, files, style, redo_after=redo_after)
+            if scope_queue:
+                bucket = scope.setdefault(scope_queue, {"total": 0, "done": 0})
+                bucket["total"] += 1
+                if not needs:
+                    bucket["done"] += 1
+            if redo_after is not None:
+                failed_at = until - 30 * 60
+                cooling = until > now and failed_at >= redo_after
+                if cooling or needs:
+                    pending_redo.add(scope_queue)
+                if cooling or not needs:
+                    continue
+            elif until > now and not pinned and not any(
+                targets_match(rule, batch, unit) for rule in targeted
+            ):
                 continue
+            elif not needs:
+                continue
+            if redo_after is not None:
+                redo_jobs += 1
             jobs.append(
                 {
                     "batch": batch,
@@ -716,12 +954,19 @@ def collect_jobs(grouped: dict[tuple[str, str], list[dict]], state: dict) -> lis
                     "source": source,
                     "dest": str(dest),
                     "failure_key": key,
-                    "kind": motion_kind(source.get("annotation")),
+                    "kind": "skeleton",
                     "height": human_height_m(source.get("annotation")),
                     "tag_ids": tag_list,
+                    "redo_after": redo_after,
+                    "scope_queue": scope_queue,
                 }
             )
-    return jobs
+    _note_skipped_npz(skipped_npz)
+    if redo_jobs:
+        log(f"全部重做 {redo_jobs} 条，新的 CSV 写好后覆盖原来的文件")
+    if redo and compiled:
+        settle_redo(HUB, redo, pending_redo)
+    return jobs, scope
 
 
 def remember_files(rows: list[tuple[str, dict]]) -> None:
@@ -749,19 +994,57 @@ def remember_files(rows: list[tuple[str, dict]]) -> None:
     tmp.replace(meta_path)
 
 
-def needs_official_retarget(dest: Path, files: list[dict], style: str) -> bool:
+def mark_finished_output(rel: str) -> None:
+    if rel:
+        _finished_outputs.add(rel)
+
+
+def _redo_epoch(files: list[dict], rel: str, style: str) -> float:
+    for item in files:
+        if item.get("path") != rel:
+            continue
+        item_style = str(item.get("robot_style") or "")
+        if style and item_style and item_style != style:
+            continue
+        try:
+            return float((item.get("annotation") or {}).get("redo_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def needs_official_retarget(
+    dest: Path,
+    files: list[dict],
+    style: str,
+    *,
+    redo_after: float | None = None,
+) -> bool:
     """True when this style still needs data_utils/batch_retarget_to_csv.py.
 
     Files written on 2026-09-24 by the long-lived in-process solver are redone.
     A later run stamps retarget_method and is kept, including a genuinely still clip.
+    A file finished in this process is kept even when the unit list has not
+    picked up that stamp yet.
+    A tier redo runs again even when that stamp is present. The existing CSV
+    stays in place until the new file is ready, then replaces it. redo_epoch
+    records which request already overwrote it.
     """
+    rel = dest.relative_to(HUB).as_posix()
+    if redo_after is not None:
+        if dest.is_file() and dest.stat().st_size > 0 and _redo_epoch(files, rel, style) >= redo_after:
+            return False
+        _finished_outputs.discard(rel)
+        return True
     if not dest.is_file() or dest.stat().st_size <= 0:
         return True
-    rel = dest.relative_to(HUB).as_posix()
+    if rel in _finished_outputs:
+        return False
     for item in files:
-        if item.get("robot_style") != style:
-            continue
         if item.get("path") != rel:
+            continue
+        item_style = str(item.get("robot_style") or "")
+        if style and item_style and item_style != style:
             continue
         if (item.get("annotation") or {}).get("retarget_method") == RETARGET_METHOD:
             return False
@@ -804,6 +1087,9 @@ def retarget(job: dict) -> list[Path]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["TMPDIR"] = "/tmp"
+    profile_root = HUB / "index" / "retarget_robots"
+    profile_root.mkdir(parents=True, exist_ok=True)
+    env["HOLOSOMA_ROBOT_PROFILES"] = str(profile_root)
     for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         env[key] = "1"
     with tempfile.TemporaryDirectory(prefix="hub_retarget_", dir="/tmp") as raw:
@@ -812,6 +1098,9 @@ def retarget(job: dict) -> list[Path]:
         out_dir = tmp / "out"
         in_dir.mkdir()
         (in_dir / source.name).symlink_to(source)
+        from app.services.robot_retarget_profile import ensure_retarget_profile
+
+        ensure_retarget_profile(HUB, job["style"], python=str(RETARGET_PYTHON))
         log_path = tmp / "run.log"
         cmd = [
             str(RETARGET_PYTHON),
@@ -855,9 +1144,25 @@ def retarget(job: dict) -> list[Path]:
     return written
 
 
+def record_retarget_frame(source: Path) -> None:
+    """Keep index/retarget_frames in step so previews place FBX objects next to the robot."""
+    if source.suffix.lower() != ".fbx":
+        return
+    try:
+        sys.path.insert(0, str(BACKEND / "scripts"))
+        from retarget_frames import FRAME_DIR, write_frame, write_robot_heights
+
+        if not (FRAME_DIR / "robots.json").is_file():
+            write_robot_heights()
+        write_frame(source)
+    except Exception as exc:  # noqa: BLE001
+        log(f"记录重定向坐标系失败 {source.name}: {exc}")
+
+
 def _worker(job: dict) -> tuple[str, list[str] | None, str | None]:
     try:
         written = [str(path) for path in retarget(job)]
+        record_retarget_frame(Path(job["source"]["abs"]))
         return job["failure_key"], written, None
     except Exception as exc:
         reason = str(exc).strip().splitlines()[-1] if str(exc).strip() else "重定向失败"
@@ -904,18 +1209,17 @@ def _record_wave(jobs: list[dict], results: list[tuple[str, list[str] | None, st
             path = Path(path_str)
             if not path.is_file():
                 continue
-            rows.append(
-                (
-                    path.relative_to(HUB).as_posix(),
-                    {
-                        "robot_style": job["style"],
-                        "motion_kind": job["kind"],
-                        "fps": 30,
-                        "retarget_method": RETARGET_METHOD,
-                        "note": note,
-                    },
-                )
-            )
+            mark_finished_output(path.relative_to(HUB).as_posix())
+            annotation = {
+                "robot_style": job["style"],
+                "motion_kind": job["kind"],
+                "fps": 30,
+                "retarget_method": RETARGET_METHOD,
+                "note": note,
+            }
+            if job.get("redo_after"):
+                annotation["redo_epoch"] = job["redo_after"]
+            rows.append((path.relative_to(HUB).as_posix(), annotation))
         log(f"完成 {Path(job['dest']).relative_to(HUB).as_posix()}")
     save_state(state)
     remember_files(rows)
@@ -949,7 +1253,7 @@ def main() -> None:
         running=True,
         started_at=started_at,
         priority_style="",
-        styles=list(STYLES),
+        styles=robot_catalog(HUB),
         reserved_cpus=RESERVED_CPUS,
         priority_note="优先级按页面上保存的规则执行：每条规则指定机器人和数据分类，排在上面的先做。",
         queues=[],
@@ -986,7 +1290,9 @@ def main() -> None:
             records = iter_motion_files()
             attach_annotations(records)
             grouped = group_units(records)
-            jobs = sort_jobs(collect_jobs(grouped, load_state()), grouped, compiled)
+            jobs, scope = collect_jobs(grouped, load_state(), compiled, load_redo(HUB))
+            jobs = sort_jobs(jobs, grouped, compiled)
+            redo_gen = _redo_generation()
             if _stop_if_requested():
                 return
             if not jobs:
@@ -1002,7 +1308,7 @@ def main() -> None:
                     round_total=0,
                     round_done=0,
                     round_failed=0,
-                    queues=fresh_queues([], rules),
+                    queues=fresh_queues([], rules, scope),
                     message="没有待重定向的数据",
                     recent=recent,
                     **_performance_fields(),
@@ -1010,7 +1316,7 @@ def main() -> None:
                 )
                 time.sleep(60)
                 continue
-            queues = fresh_queues(jobs, rules)
+            queues = fresh_queues(jobs, rules, scope)
             done = 0
             failed = 0
             round_started = _now()
@@ -1041,6 +1347,10 @@ def main() -> None:
             while cursor < len(jobs):
                 if _stop_if_requested():
                     return
+                if _redo_generation() != redo_gen:
+                    log("有一档要求全部重做，重新扫描")
+                    snapshot("scanning", [], "有一档要求全部重做，正在重新扫描")
+                    break
                 if _priority_mtime() != priority_mtime:
                     log("优先级已调整，重新扫描")
                     snapshot("scanning", [], "优先级已调整，正在重新扫描")
@@ -1087,7 +1397,10 @@ def main() -> None:
                 _observe_pace(time.monotonic() - wave_started, len(wave))
                 notes: list[dict] = []
                 for job, (_key, _written, error) in zip(wave, results):
-                    row = next((item for item in queues if item["key"] == job.get("queue")), None)
+                    row = next(
+                        (item for item in queues if item["key"] == (job.get("scope_queue") or job.get("queue"))),
+                        None,
+                    )
                     note = {
                         "at": _now(),
                         "batch": job["batch"],

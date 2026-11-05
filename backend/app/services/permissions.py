@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from ..models import Capability, Folder, MotionClip, User, UserPermission
+from ..models import Capability, Folder, User, UserPermission
 from ..models.enums import (
     alias_capability,
     is_super_manager_role,
@@ -73,14 +72,6 @@ def path_matches(folder_path: str, prefix: str, recursive: bool = True) -> bool:
     if recursive:
         return folder_path == prefix or folder_path.startswith(prefix)
     return folder_path == prefix
-
-
-def folder_path_of_clip(db: Session, clip: MotionClip) -> str:
-    if clip.folder_id:
-        folder = db.get(Folder, clip.folder_id)
-        if folder:
-            return normalize_path(folder.path)
-    return "/未分类/"
 
 
 def is_admin(user: User) -> bool:
@@ -209,64 +200,6 @@ def unit_matches_facet(unit: dict, scheme: str, path_prefix: str) -> bool:
     return False
 
 
-def _clip_tag_paths(db: Session, clip: MotionClip) -> dict[str, str]:
-    """scheme key -> taxonomy node path for the clip's tags."""
-    from ..models import ClipTaxonomyTag, TaxonomyNode
-
-    rows = (
-        db.query(ClipTaxonomyTag.scheme, TaxonomyNode.path)
-        .join(TaxonomyNode, ClipTaxonomyTag.node_id == TaxonomyNode.id)
-        .filter(ClipTaxonomyTag.clip_id == clip.id)
-        .all()
-    )
-    return {scheme: path for scheme, path in rows}
-
-
-def user_has_clip_capability(
-    db: Session, user: User, capability: Capability, clip: MotionClip
-) -> bool:
-    """Clip-level check: folder-tree perms OR taxonomy-scheme perms."""
-    if (
-        capability
-        in (
-            Capability.browse,
-            Capability.download,
-            Capability.annotate,
-        )
-        and clip.created_by == user.id
-    ):
-        return True
-    if not has_role_capability(user, capability):
-        return False
-    if is_super_role(user.role):
-        return True
-    perms = (
-        db.query(UserPermission)
-        .filter(
-            UserPermission.user_id == user.id,
-            UserPermission.capability.in_(capability_query_values(capability)),
-        )
-        .all()
-    )
-    if not perms:
-        return False
-    folder_path = folder_path_of_clip(db, clip)
-    tag_paths: dict[str, str] | None = None
-    for p in perms:
-        if not p.scheme:
-            if path_matches(folder_path, p.path_prefix, p.recursive):
-                return True
-            continue
-        if p.scheme in FACET_SCHEMES:
-            continue
-        if tag_paths is None:
-            tag_paths = _clip_tag_paths(db, clip)
-        tpath = tag_paths.get(p.scheme)
-        if tpath and path_matches(tpath, p.path_prefix, p.recursive):
-            return True
-    return False
-
-
 def ensure_capability(db: Session, user: User, capability: Capability, folder_path: str) -> None:
     from fastapi import HTTPException, status
 
@@ -282,95 +215,6 @@ def ensure_capability(db: Session, user: User, capability: Capability, folder_pa
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"缺少浏览权限：{normalize_path(folder_path)}",
         )
-
-
-def ensure_clip_capability(
-    db: Session, user: User, capability: Capability, clip: MotionClip
-) -> str:
-    from fastapi import HTTPException, status
-
-    path = folder_path_of_clip(db, clip)
-    if not user_has_clip_capability(db, user, capability, clip):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"缺少权限：{capability.value} @ {path}",
-        )
-    if capability != Capability.browse and not user_has_clip_capability(
-        db, user, Capability.browse, clip
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"缺少浏览权限：{path}",
-        )
-    return path
-
-
-def browse_path_prefixes(db: Session, user: User) -> list[str] | None:
-    """Folder-tree browse prefixes, or None if unrestricted browse."""
-    if is_super_role(user.role) and has_role_capability(user, Capability.browse):
-        return None
-    rows = (
-        db.query(UserPermission)
-        .filter(
-            UserPermission.user_id == user.id,
-            UserPermission.capability.in_(capability_query_values(Capability.browse)),
-            UserPermission.scheme == "",
-        )
-        .all()
-    )
-    return [normalize_path(r.path_prefix) for r in rows]
-
-
-def _scheme_browse_perms(db: Session, user: User) -> list[UserPermission]:
-    return (
-        db.query(UserPermission)
-        .filter(
-            UserPermission.user_id == user.id,
-            UserPermission.capability.in_(capability_query_values(Capability.browse)),
-            UserPermission.scheme != "",
-        )
-        .all()
-    )
-
-
-def apply_browse_filter(query, db: Session, user: User):
-    """Filter MotionClip query by folder-tree and taxonomy-scheme browse perms."""
-    from ..models import ClipTaxonomyTag, TaxonomyNode
-
-    prefixes = browse_path_prefixes(db, user)
-    if prefixes is None:
-        return query
-    scheme_perms = _scheme_browse_perms(db, user)
-    owner_clause = MotionClip.created_by == user.id
-    if not prefixes and not scheme_perms:
-        return query.filter(owner_clause)
-    # join folder; clips without folder treated as /未分类/
-    query = query.outerjoin(Folder, MotionClip.folder_id == Folder.id)
-    clauses = []
-    for pref in prefixes:
-        if pref == "/":
-            return query  # full access
-        # Folder.path like prefix% OR (no folder and /未分类/ matches)
-        clauses.append(Folder.path.like(f"{pref}%"))
-        if path_matches("/未分类/", pref, True):
-            clauses.append(MotionClip.folder_id.is_(None))
-    for p in scheme_perms:
-        if p.scheme in FACET_SCHEMES:
-            continue
-        pref = normalize_path(p.path_prefix)
-        tagged = (
-            db.query(ClipTaxonomyTag.clip_id)
-            .join(TaxonomyNode, ClipTaxonomyTag.node_id == TaxonomyNode.id)
-            .filter(
-                ClipTaxonomyTag.scheme == p.scheme,
-                TaxonomyNode.path.like(f"{pref}%")
-                if pref != "/"
-                else TaxonomyNode.path.like("/%"),
-            )
-        )
-        clauses.append(MotionClip.id.in_(tagged))
-    clauses.append(owner_clause)
-    return query.filter(or_(*clauses))
 
 
 def folder_visible(db: Session, user: User, folder: Folder) -> bool:

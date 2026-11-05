@@ -1,14 +1,16 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Html, OrbitControls } from "@react-three/drei";
-import { Component, useEffect, useRef, useState, type ReactNode } from "react";
+import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import { BVHLoader } from "three/examples/jsm/loaders/BVHLoader.js";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { getToken } from "../api";
+import type { RetargetFrame, RetargetFrameSkeleton } from "../types";
 import {
   applyViewerFigureColors,
   FrameFigure,
   shiftCameraWithPoint,
+  DataOriginAxes,
   SkeletonLines,
   useViewerLook,
   ViewerSceneChrome,
@@ -120,6 +122,7 @@ export function BvhScene({
   const [boneRoot, setBoneRoot] = useState<THREE.Bone | null>(null);
   const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
   const [scale, setScale] = useState(0.01);
+  const [axisLength, setAxisLength] = useState(1);
   const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
@@ -211,6 +214,7 @@ export function BvhScene({
         onDetectedRef.current?.(detectUpAxisFromPointFrames(poseFrames));
         const unit = detectLengthUnit(maxHeight);
         setDetectedUnit(unit);
+        setAxisLength(maxHeight > 1e-6 ? maxHeight : 1);
         onDetectedUnitRef.current?.(unit);
         samplesRef.current = { points, roots };
         setLayoutNonce((value) => value + 1);
@@ -322,6 +326,7 @@ export function BvhScene({
         <group rotation={[rotationX, 0, 0]}>
           {boneRoot && (
             <group scale={scale}>
+              <DataOriginAxes length={axisLength} />
               <primitive object={boneRoot} />
             </group>
           )}
@@ -446,6 +451,239 @@ function expandMeshBox(root: THREE.Object3D, box: THREE.Box3) {
   });
 }
 
+function isObstacleMesh(mesh: THREE.Mesh) {
+  const name = `${mesh.name} ${mesh.parent?.name || ""}`;
+  return /obstacle/i.test(name);
+}
+
+function styleObstacleMeshes(root: THREE.Object3D) {
+  const wood = new THREE.MeshStandardMaterial({
+    color: 0xd7b98a,
+    roughness: 0.55,
+    metalness: 0.04,
+    emissive: 0x4a3218,
+    emissiveIntensity: 0.28,
+  });
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0xfff3df });
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh || !isObstacleMesh(mesh)) return;
+    if (!mesh.geometry?.attributes?.position?.count) return;
+    mesh.material = wood;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry, 15), edgeMat);
+    edges.name = "__obstacle_edges";
+    edges.castShadow = false;
+    mesh.add(edges);
+  });
+}
+
+type CaptureRole =
+  | "table-marker"
+  | "table"
+  | "rigid-marker"
+  | "rigid"
+  | "skeleton-marker"
+  | "marker";
+
+type CaptureTable = {
+  markers: THREE.Object3D[];
+  surface: THREE.BufferAttribute;
+  edge: THREE.BufferAttribute;
+};
+
+const RIGID_COLORS = [0xf08c00, 0x4dabf7, 0xbe4bdb, 0x40c057];
+
+function captureLabel(obj: THREE.Object3D) {
+  const original = String(obj.userData.originalName || obj.name || "");
+  return original.toLowerCase().replace(/[:\s]+/g, "_");
+}
+
+function captureRole(obj: THREE.Object3D): CaptureRole | null {
+  const name = captureLabel(obj);
+  if (/_root$/.test(name) || name === "marker_null_root" || /optical$/.test(name)) return null;
+  if (/table_marker_\d+/.test(name)) return "table-marker";
+  if (/(^|_)table$/.test(name)) return "table";
+  if (/rigid_body_\d+_marker_\d+/.test(name)) return "rigid-marker";
+  if (/rigid_body_\d+$/.test(name)) return "rigid";
+  if (/skeleton_\d+_/.test(name)) return "skeleton-marker";
+  if (/unlabeled_\d+/.test(name) || /marker_\d+/.test(name)) return "marker";
+  return null;
+}
+
+function rigidColor(name: string) {
+  const match = name.match(/rigid_body_(\d+)/);
+  const index = match ? Math.max(0, Number(match[1]) - 1) : 0;
+  return RIGID_COLORS[index % RIGID_COLORS.length];
+}
+
+function orderPlanar(points: THREE.Vector3[]) {
+  const center = new THREE.Vector3();
+  points.forEach((point) => center.add(point));
+  center.multiplyScalar(1 / points.length);
+  const variance = [0, 0, 0];
+  for (const point of points) {
+    variance[0] += (point.x - center.x) ** 2;
+    variance[1] += (point.y - center.y) ** 2;
+    variance[2] += (point.z - center.z) ** 2;
+  }
+  const normal = variance.indexOf(Math.min(...variance));
+  const u = normal === 0 ? 1 : 0;
+  const v = normal === 2 ? 1 : 2;
+  const coord = (point: THREE.Vector3, axis: number) =>
+    axis === 0 ? point.x : axis === 1 ? point.y : point.z;
+  return [...points].sort((left, right) => {
+    const leftAngle = Math.atan2(coord(left, v) - coord(center, v), coord(left, u) - coord(center, u));
+    const rightAngle = Math.atan2(coord(right, v) - coord(center, v), coord(right, u) - coord(center, u));
+    return leftAngle - rightAngle;
+  });
+}
+
+function addCaptureDot(parent: THREE.Object3D, radius: number, color: number, name: string) {
+  const dot = new THREE.Mesh(
+    new THREE.SphereGeometry(radius, 12, 10),
+    new THREE.MeshBasicMaterial({ color })
+  );
+  dot.name = name;
+  dot.frustumCulled = false;
+  parent.add(dot);
+}
+
+function attachCaptureProps(
+  root: THREE.Object3D,
+  height: number,
+  options?: { skipSkeletonMarkers?: boolean }
+) {
+  const markerRadius = Math.max(height * 0.012, 0.8);
+  const bodyRadius = Math.max(height * 0.048, 3);
+  const tableMarkers: THREE.Object3D[] = [];
+  root.traverse((obj) => {
+    const role = captureRole(obj);
+    if (!role || obj.userData.__capture) return;
+    if (role === "skeleton-marker" && options?.skipSkeletonMarkers) return;
+    obj.userData.__capture = role;
+    const label = captureLabel(obj);
+    if (role === "table-marker") {
+      tableMarkers.push(obj);
+      addCaptureDot(obj, markerRadius, 0xf8f9fa, "__capture_marker");
+      return;
+    }
+    if (role === "table") {
+      addCaptureDot(obj, markerRadius * 1.35, 0xfff3bf, "__capture_marker");
+      return;
+    }
+    if (role === "skeleton-marker") {
+      addCaptureDot(obj, markerRadius * 0.85, 0x66d9e8, "__capture_marker");
+      return;
+    }
+    if (role === "marker") {
+      addCaptureDot(obj, markerRadius * 0.7, 0xdee2e6, "__capture_marker");
+      return;
+    }
+    const color = rigidColor(label);
+    if (role === "rigid-marker") {
+      addCaptureDot(obj, markerRadius * 0.85, color, "__capture_marker");
+      return;
+    }
+    const paddle = new THREE.Mesh(
+      new THREE.CylinderGeometry(bodyRadius, bodyRadius, Math.max(bodyRadius * 0.08, 0.4), 24),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.82, side: THREE.DoubleSide })
+    );
+    paddle.geometry.rotateX(Math.PI / 2);
+    paddle.name = "__capture_body";
+    paddle.frustumCulled = false;
+    obj.add(paddle);
+  });
+
+  if (tableMarkers.length >= 4) {
+    const surfaceAttr = new THREE.BufferAttribute(new Float32Array(12), 3);
+    const edgeAttr = new THREE.BufferAttribute(new Float32Array(12), 3);
+    const surface = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({
+        color: 0x2b8a3e,
+        transparent: true,
+        opacity: 0.62,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    surface.geometry.setAttribute("position", surfaceAttr);
+    surface.geometry.setIndex([0, 1, 2, 0, 2, 3]);
+    surface.name = "__capture_table";
+    surface.frustumCulled = false;
+    const edge = new THREE.LineLoop(
+      new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: 0xf4fce3 })
+    );
+    edge.geometry.setAttribute("position", edgeAttr);
+    edge.name = "__capture_table_edge";
+    edge.frustumCulled = false;
+    root.add(surface);
+    root.add(edge);
+    root.userData.__captureTable = { markers: tableMarkers, surface: surfaceAttr, edge: edgeAttr } satisfies CaptureTable;
+    updateCaptureTable(root);
+  }
+}
+
+function updateCaptureTable(root: THREE.Object3D) {
+  const table = root.userData.__captureTable as CaptureTable | undefined;
+  if (!table || table.markers.length < 4) return;
+  root.updateWorldMatrix(true, true);
+  const points = table.markers.slice(0, 4).map((marker) => {
+    const point = new THREE.Vector3();
+    marker.getWorldPosition(point);
+    root.worldToLocal(point);
+    return point;
+  });
+  const ordered = orderPlanar(points);
+  ordered.forEach((point, index) => {
+    table.surface.setXYZ(index, point.x, point.y, point.z);
+    table.edge.setXYZ(index, point.x, point.y, point.z);
+  });
+  table.surface.needsUpdate = true;
+  table.edge.needsUpdate = true;
+}
+
+function capturePoints(root: THREE.Object3D) {
+  const points: LayoutPoint[] = [];
+  root.updateWorldMatrix(true, true);
+  root.traverse((obj) => {
+    if (!captureRole(obj)) return;
+    const point = new THREE.Vector3();
+    obj.getWorldPosition(point);
+    root.worldToLocal(point);
+    points.push({ x: point.x, y: point.y, z: point.z });
+  });
+  return points;
+}
+
+function detachCaptureProps(root: THREE.Object3D | null) {
+  if (!root) return;
+  const doomed: THREE.Object3D[] = [];
+  root.traverse((obj) => {
+    if (
+      obj.name === "__capture_marker" ||
+      obj.name === "__capture_body" ||
+      obj.name === "__capture_table" ||
+      obj.name === "__capture_table_edge"
+    ) {
+      doomed.push(obj);
+    }
+    if (obj.userData.__capture) delete obj.userData.__capture;
+  });
+  doomed.forEach((obj) => {
+    obj.parent?.remove(obj);
+    const mesh = obj as THREE.Mesh;
+    mesh.geometry?.dispose();
+    const material = mesh.material as THREE.Material | THREE.Material[] | undefined;
+    if (Array.isArray(material)) material.forEach((item) => item.dispose());
+    else material?.dispose();
+  });
+  delete root.userData.__captureTable;
+}
+
 function applyFbxMeshMaterials(root: THREE.Object3D, look: { bone: string; joint: string }) {
   const meshMat = new THREE.MeshStandardMaterial({
     color: 0x8a9aa8,
@@ -462,7 +700,7 @@ function applyFbxMeshMaterials(root: THREE.Object3D, look: { bone: string; joint
   });
   root.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh && mesh.name !== "__joint_dot") {
+    if (mesh.isMesh && mesh.name !== "__joint_dot" && !isObstacleMesh(mesh)) {
       if (!mesh.geometry || !mesh.geometry.attributes?.position?.count) return;
       mesh.material = meshMat;
       mesh.castShadow = false;
@@ -473,6 +711,7 @@ function applyFbxMeshMaterials(root: THREE.Object3D, look: { bone: string; joint
     // 非 Mesh、非 Bone 的节点（FBX 里的 Null/Empty/Marker）画一个小球标位
     if ((obj as THREE.Bone).isBone) return;
     if (obj === root) return;
+    if (captureRole(obj)) return;
     if (obj.children.length > 0) return; // 只给叶子空节点加标记
     // 排除已添加的标记
     if (obj.userData.__marker_added) return;
@@ -587,6 +826,7 @@ export function FbxScene({
   const [object, setObject] = useState<THREE.Group | null>(null);
   const [helper, setHelper] = useState<THREE.SkeletonHelper | null>(null);
   const [scale, setScale] = useState(0.01);
+  const [axisLength, setAxisLength] = useState(1);
   const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
@@ -699,12 +939,16 @@ export function FbxScene({
         setDetectedUnit(unit);
         onDetectedUnitRef.current?.(unit);
         const charHeight = skelHeight > 1e-6 ? skelHeight : meshHeight;
+        setAxisLength(charHeight > 1e-6 ? charHeight : 1);
         samplesRef.current = { points, roots };
         setLayoutNonce((value) => value + 1);
 
         if (meshCount) {
           applyFbxMeshMaterials(obj, look);
+          styleObstacleMeshes(obj);
         }
+        attachCaptureProps(obj, charHeight || 1);
+        points.push(...capturePoints(obj));
         if (boneCount) {
           attachJointDots(obj, charHeight || 1, look);
         }
@@ -739,6 +983,7 @@ export function FbxScene({
       }
       detachJointDots(objectRef.current);
       detachFbxMarkers(objectRef.current);
+      detachCaptureProps(objectRef.current);
       rootRef.current = null;
     };
   }, [url]);
@@ -768,6 +1013,7 @@ export function FbxScene({
       action.current.time = Math.min(Math.max(time, 0), clipDur);
       mixer.current.update(0);
     }
+    if (objectRef.current) updateCaptureTable(objectRef.current);
     if (center && offsetReady.current) {
       center.position.copy(fixedOffset.current);
     }
@@ -792,6 +1038,7 @@ export function FbxScene({
         <group rotation={[rotationX, 0, 0]}>
           {object && (
             <group scale={scale}>
+              <DataOriginAxes length={axisLength} />
               <primitive object={object} />
             </group>
           )}
@@ -814,6 +1061,396 @@ export function FbxScene({
         )}
       </group>
     </>
+  );
+}
+
+/** Motive 厘米、Y 轴向上，转到米、Z 轴向上。还没有镜像，也没有对齐朝向。 */
+const FBX_CM_TO_Z_UP_M = new THREE.Matrix4().set(
+  0.01, 0, 0, 0,
+  0, 0, 0.01, 0,
+  0, 0.01, 0, 0,
+  0, 0, 0, 1
+);
+
+/** 上面的换算再镜像 X，和重定向里 Motive 到机器人的左右约定一致。 */
+const FBX_CM_TO_ROBOT_M = new THREE.Matrix4().makeScale(-1, 1, 1).multiply(FBX_CM_TO_Z_UP_M);
+
+type FbxHipsSample = {
+  name: string;
+  point: THREE.Vector3;
+  spine: THREE.Vector3 | null;
+  left: THREE.Vector3 | null;
+  right: THREE.Vector3 | null;
+};
+
+type RobotBodyPose = {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+};
+
+export type RobotTrackFrame = {
+  root: [number, number, number];
+  quat: [number, number, number, number];
+};
+
+const EMPTY_TRACK: RobotTrackFrame[] = [];
+
+function baseYaw(quat: [number, number, number, number]) {
+  const [x, y, z, w] = quat;
+  return Math.atan2(2 * (x * y + w * z), 1 - 2 * (y * y + z * z));
+}
+
+/** Older holosoma heading rules leave a CSV about 166° off the recorded frame. */
+const OLD_HEADING_RULE_MIN_RAD = (60 * Math.PI) / 180;
+
+/**
+ * 不同版本的 holosoma 摆放朝向的规则不同，库里的 CSV 新旧都有。
+ * 用这条 CSV 自己的机身朝向和根轨迹，求出它相对当前规则多转的角度和平移。
+ * 按当前规则生成的 CSV 不修正：机器人被障碍物挡住时根轨迹本来就会偏离人体，
+ * 拿它去拟合会把障碍物挪离求解时的位置。
+ */
+function trackCorrection(item: RetargetFrameSkeleton, scale: number, robot: RobotTrackFrame[]) {
+  const track = item.track;
+  if (!track || !robot.length) return null;
+  const count = Math.min(track.hips_xy.length, track.yaw.length, robot.length);
+  if (count < 2) return null;
+  let sin = 0;
+  let cos = 0;
+  for (let index = 0; index < count; index += 1) {
+    const diff = baseYaw(robot[index].quat) - track.yaw[index];
+    sin += Math.sin(diff);
+    cos += Math.cos(diff);
+  }
+  const delta = Math.atan2(sin, cos);
+  if (Math.abs(delta) < OLD_HEADING_RULE_MIN_RAD) return null;
+  const c = Math.cos(delta);
+  const s = Math.sin(delta);
+  let tx = 0;
+  let ty = 0;
+  for (let index = 0; index < count; index += 1) {
+    const [hx, hy] = track.hips_xy[index];
+    const px = scale * hx;
+    const py = scale * hy;
+    tx += robot[index].root[0] - (c * px - s * py);
+    ty += robot[index].root[1] - (s * px + c * py);
+  }
+  return new THREE.Matrix4()
+    .makeTranslation(tx / count, ty / count, 0)
+    .multiply(new THREE.Matrix4().makeRotationZ(delta));
+}
+
+function skeletonPrefix(hipsName: string) {
+  return hipsName.replace(/(hips|hip|pelvis)$/, "");
+}
+
+const SIDE_TAILS = {
+  left: ["leftshoulder", "leftarm", "leftupleg", "lshoulder", "l_shoulder"],
+  right: ["rightshoulder", "rightarm", "rightupleg", "rshoulder", "r_shoulder"],
+} as const;
+
+function sidePoint(root: THREE.Object3D, hipsName: string, side: "left" | "right") {
+  const prefix = skeletonPrefix(hipsName);
+  const tails = SIDE_TAILS[side];
+  let bestRank = 99;
+  let best: THREE.Vector3 | null = null;
+  root.traverse((obj) => {
+    if (!(obj as THREE.Bone).isBone) return;
+    const name = captureLabel(obj);
+    if (prefix && !name.startsWith(prefix)) return;
+    const rank = tails.findIndex((tail) => name === `${prefix}${tail}` || name.endsWith(tail));
+    if (rank < 0 || rank >= bestRank) return;
+    bestRank = rank;
+    best = new THREE.Vector3();
+    obj.getWorldPosition(best);
+  });
+  return best;
+}
+
+function spinePoint(root: THREE.Object3D, hipsName: string) {
+  const prefix = skeletonPrefix(hipsName);
+  const rankOf = (name: string) => {
+    if (prefix && !name.startsWith(prefix)) return 99;
+    if (name === `${prefix}spine1` || name.endsWith("spine1")) return 0;
+    if (name === `${prefix}spine` || /spine$/.test(name)) return 1;
+    if (name.endsWith("spine2")) return 2;
+    if (name.endsWith("chest")) return 3;
+    return 99;
+  };
+  let bestRank = 99;
+  let best: THREE.Vector3 | null = null;
+  root.traverse((obj) => {
+    if (!(obj as THREE.Bone).isBone) return;
+    const rank = rankOf(captureLabel(obj));
+    if (rank >= bestRank) return;
+    bestRank = rank;
+    best = new THREE.Vector3();
+    obj.getWorldPosition(best);
+  });
+  return best;
+}
+
+function sampleFbxHips(root: THREE.Object3D): FbxHipsSample[] {
+  const found: FbxHipsSample[] = [];
+  root.updateMatrixWorld(true);
+  root.traverse((obj) => {
+    if (!(obj as THREE.Bone).isBone) return;
+    const name = captureLabel(obj);
+    if (!name.includes("hips") && !name.endsWith("_hip") && !name.endsWith("pelvis")) return;
+    const point = new THREE.Vector3();
+    obj.getWorldPosition(point);
+    found.push({ name, point, spine: null, left: null, right: null });
+  });
+  // Motive 会把同一个髋部导出成重合的多层节点。位置重合的算同一个人。
+  const people: FbxHipsSample[] = [];
+  for (const item of found) {
+    if (people.some((other) => other.point.distanceTo(item.point) < 5)) continue;
+    people.push({
+      ...item,
+      spine: spinePoint(root, item.name),
+      left: sidePoint(root, item.name, "left"),
+      right: sidePoint(root, item.name, "right"),
+    });
+  }
+  return people;
+}
+
+function anatomicalPoint(point: THREE.Vector3) {
+  return point.clone().applyMatrix4(FBX_CM_TO_Z_UP_M).applyMatrix4(
+    new THREE.Matrix4().makeScale(-1, 1, 1)
+  );
+}
+
+function humanBodyAxes(sample: FbxHipsSample) {
+  if (!sample.left || !sample.right) return null;
+  const origin = anatomicalPoint(sample.point);
+  const up = new THREE.Vector3(0, 0, 1);
+  if (sample.spine) {
+    const along = anatomicalPoint(sample.spine).sub(origin);
+    if (along.lengthSq() > 1e-8) up.copy(along.normalize());
+  }
+  const lateral = anatomicalPoint(sample.left).sub(anatomicalPoint(sample.right));
+  lateral.addScaledVector(up, -lateral.dot(up));
+  if (lateral.lengthSq() < 1e-6) return null;
+  lateral.normalize();
+  const forward = new THREE.Vector3().crossVectors(lateral, up);
+  if (forward.lengthSq() < 1e-8) return null;
+  forward.normalize();
+  const left = new THREE.Vector3().crossVectors(up, forward).normalize();
+  return { origin, forward, left, up };
+}
+
+/** 把人体机身坐标轴对齐到这台机器人的机身坐标轴：前向 +X，左侧 +Y，上方 +Z。 */
+function bodyFrameBasis(sample: FbxHipsSample, pose: RobotBodyPose) {
+  const human = humanBodyAxes(sample);
+  const quaternion = new THREE.Quaternion(
+    pose.quaternion[0],
+    pose.quaternion[1],
+    pose.quaternion[2],
+    pose.quaternion[3]
+  );
+  if (!human || quaternion.lengthSq() < 1e-8) return null;
+  quaternion.normalize();
+  const robotForward = new THREE.Vector3(1, 0, 0).applyQuaternion(quaternion);
+  const robotLeft = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+  const robotUp = new THREE.Vector3(0, 0, 1).applyQuaternion(quaternion);
+  const humanFrame = new THREE.Matrix4().makeBasis(human.forward, human.left, human.up);
+  const robotFrame = new THREE.Matrix4().makeBasis(robotForward, robotLeft, robotUp);
+  const rotation = robotFrame.multiply(humanFrame.clone().invert());
+  const anatomical = new THREE.Matrix4().makeScale(-1, 1, 1).multiply(FBX_CM_TO_Z_UP_M);
+  const movedOrigin = human.origin.clone().applyMatrix4(rotation);
+  const translation = new THREE.Vector3(...pose.position).sub(movedOrigin);
+  return new THREE.Matrix4()
+    .makeTranslation(translation.x, translation.y, translation.z)
+    .multiply(rotation)
+    .multiply(anatomical);
+}
+
+function hideHumanSkeleton(root: THREE.Object3D) {
+  root.traverse((obj) => {
+    if ((obj as THREE.Bone).isBone || (obj as THREE.SkinnedMesh).isSkinnedMesh) {
+      obj.visible = false;
+    }
+  });
+}
+
+function skeletonToken(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+/**
+ * holosoma 的世界变换：先用重定向时实测的仿射（单位、轴向、朝向、镜像、原点），
+ * 再把脚趾地面降到 z = 0，最后按 ROBOT_HEIGHT / 人体身高 缩放。物体和人体关节走同一条变换。
+ */
+function retargetFrameMatrix(
+  frame: RetargetFrame,
+  robotStyle: string,
+  pose: RobotBodyPose | null | undefined,
+  hipsHint: string | null | undefined,
+  robotTrack: RobotTrackFrame[]
+) {
+  const robotHeight = frame.robot_heights[robotStyle];
+  if (!robotHeight || !frame.skeletons.length) return null;
+  const scaleOf = (item: RetargetFrameSkeleton) => robotHeight / Math.max(item.height, 1e-6);
+  const hint = skeletonToken(hipsHint || "");
+  let chosen = hint
+    ? frame.skeletons.find((item) => item.skeleton && skeletonToken(item.skeleton).endsWith(hint))
+    : undefined;
+  if (!chosen && pose) {
+    let best = Number.POSITIVE_INFINITY;
+    for (const item of frame.skeletons) {
+      const scale = scaleOf(item);
+      const dx = scale * item.hips0[0] - pose.position[0];
+      const dy = scale * item.hips0[1] - pose.position[1];
+      const distance = dx * dx + dy * dy;
+      if (distance < best) {
+        best = distance;
+        chosen = item;
+      }
+    }
+  }
+  chosen ??= frame.skeletons[frame.skeletons.length - 1];
+  const [r0, r1, r2] = chosen.affine;
+  const affine = new THREE.Matrix4().set(
+    r0[0], r0[1], r0[2], r0[3],
+    r1[0], r1[1], r1[2], r1[3],
+    r2[0], r2[1], r2[2], r2[3],
+    0, 0, 0, 1
+  );
+  const scale = scaleOf(chosen);
+  const placed = new THREE.Matrix4()
+    .makeScale(scale, scale, scale)
+    .multiply(new THREE.Matrix4().makeTranslation(0, 0, -chosen.floor_z))
+    .multiply(affine);
+  const correction = trackCorrection(chosen, scale, robotTrack);
+  return correction ? correction.multiply(placed) : placed;
+}
+
+function fbxPropsMatrix(
+  hips: FbxHipsSample[],
+  pose: RobotBodyPose | null | undefined,
+  hipsHint: string | null | undefined,
+  frame?: RetargetFrame | null,
+  robotStyle?: string,
+  robotTrack: RobotTrackFrame[] = []
+) {
+  if (frame && robotStyle) {
+    const measured = retargetFrameMatrix(frame, robotStyle, pose, hipsHint, robotTrack);
+    if (measured) return measured;
+  }
+  if (!pose || !hips.length) return FBX_CM_TO_ROBOT_M.clone();
+  const hint = (hipsHint || "").toLowerCase();
+  let chosen = hint ? hips.find((item) => item.name.includes(hint)) : undefined;
+  const target = new THREE.Vector3(pose.position[0], pose.position[1], pose.position[2]);
+  if (!chosen) {
+    let best = Number.POSITIVE_INFINITY;
+    for (const item of hips) {
+      const distance = anatomicalPoint(item.point).distanceTo(target);
+      if (distance < best) {
+        best = distance;
+        chosen = item;
+      }
+    }
+  }
+  if (!chosen) return FBX_CM_TO_ROBOT_M.clone();
+  return bodyFrameBasis(chosen, pose) ?? FBX_CM_TO_ROBOT_M.clone();
+}
+
+/** 人体 FBX 里的场景物体，叠到机器人坐标系里，不画人体骨架。 */
+export function FbxSceneObjects({
+  url,
+  time,
+  alignPose = null,
+  hipsHint = null,
+  retargetFrame = null,
+  robotStyle = "",
+  robotTrack = EMPTY_TRACK,
+  onReady,
+}: {
+  url: string;
+  time: number;
+  alignPose?: RobotBodyPose | null;
+  hipsHint?: string | null;
+  retargetFrame?: RetargetFrame | null;
+  robotStyle?: string;
+  robotTrack?: RobotTrackFrame[];
+  onReady?: () => void;
+}) {
+  const objectRef = useRef<THREE.Group | null>(null);
+  const mixer = useRef<THREE.AnimationMixer | null>(null);
+  const action = useRef<THREE.AnimationAction | null>(null);
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
+  const [object, setObject] = useState<THREE.Group | null>(null);
+  const [hips, setHips] = useState<FbxHipsSample[]>([]);
+  const matrix = useMemo(
+    () => fbxPropsMatrix(hips, alignPose, hipsHint, retargetFrame, robotStyle, robotTrack),
+    [hips, alignPose, hipsHint, retargetFrame, robotStyle, robotTrack]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setObject(null);
+    setHips([]);
+    objectRef.current = null;
+    mixer.current = null;
+    action.current = null;
+    const loader = new FBXLoader();
+    fetchBinary(url)
+      .then((buf) => {
+        if (cancelled) return;
+        const obj = loader.parse(buf, "");
+        const clip = obj.animations?.[0];
+        const probeMixer = clip ? new THREE.AnimationMixer(obj) : null;
+        const probeAction = clip && probeMixer ? probeMixer.clipAction(clip) : null;
+        if (probeAction && probeMixer) {
+          probeAction.play();
+          probeAction.paused = true;
+          probeAction.time = 0;
+          probeMixer.update(0);
+        }
+        const measureRoot = primaryBoneRoot(obj) ?? obj;
+        expandSkeletonBox(measureRoot, _bvhBox);
+        const spanY = _bvhBox.isEmpty() ? 0 : _bvhBox.max.y - _bvhBox.min.y;
+        const spanZ = _bvhBox.isEmpty() ? 0 : _bvhBox.max.z - _bvhBox.min.z;
+        const charHeight = Math.max(spanY, spanZ, 1);
+        const samples = sampleFbxHips(obj);
+        hideHumanSkeleton(obj);
+        styleObstacleMeshes(obj);
+        attachCaptureProps(obj, charHeight, { skipSkeletonMarkers: true });
+        objectRef.current = obj;
+        mixer.current = probeMixer;
+        action.current = probeAction;
+        setHips(samples);
+        setObject(obj);
+        onReadyRef.current?.();
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        console.error("[preview] 场景物体加载失败", err);
+      });
+    return () => {
+      cancelled = true;
+      detachCaptureProps(objectRef.current);
+      objectRef.current = null;
+      mixer.current = null;
+      action.current = null;
+    };
+  }, [url]);
+
+  useFrame(() => {
+    if (action.current && mixer.current) {
+      const clipDur = action.current.getClip().duration || 1;
+      action.current.time = Math.min(Math.max(time, 0), clipDur);
+      mixer.current.update(0);
+    }
+    if (objectRef.current) updateCaptureTable(objectRef.current);
+  });
+
+  if (!object) return null;
+  return (
+    <group matrix={matrix} matrixAutoUpdate={false}>
+      <primitive object={object} />
+    </group>
   );
 }
 
@@ -895,6 +1532,7 @@ export function AnimationFormatPreview({
           camera={{ position: [2.4, 1.8, 3.2], fov: 50 }}
           style={{ width: "100%", height: "100%", display: "block" }}
           resize={{ debounce: 0 }}
+          shadows
           gl={{ antialias: true, alpha: false }}
           onCreated={({ gl }) => {
             try {

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .unit_names import normalize_unit_stem
 
-KIND_RANK = {"skeleton": 0, "merged": 1, "object": 2}
+KIND_RANK = {"merged": 0, "skeleton": 1, "object": 2}
 FORMAT_RANK = {"fbx": 0, "bvh": 1, "smpl": 2}
 SOURCE_FORMATS = frozenset(FORMAT_RANK)
 
@@ -18,7 +18,11 @@ def file_format(name: str, fmt: str = "") -> str:
     return raw
 
 
-def motion_kind(annotation: dict | None) -> str:
+def motion_kind(annotation: dict | None = None, record: dict | None = None) -> str:
+    """Merged human motion is preferred. The directory kind wins over a stale tag."""
+    path_kind = str((record or {}).get("path_motion_kind") or "").strip().lower()
+    if path_kind in KIND_RANK:
+        return path_kind
     kind = str((annotation or {}).get("motion_kind") or "").strip().lower()
     if kind in KIND_RANK:
         return kind
@@ -34,11 +38,16 @@ def is_human_retarget_source(record: dict) -> bool:
 
 
 def source_sort_key(record: dict) -> tuple:
-    kind = motion_kind(record.get("annotation"))
+    kind = motion_kind(record.get("annotation"), record)
     fmt = file_format(str(record.get("name") or ""), str(record.get("format") or ""))
+    try:
+        version_order = int(record.get("file_version_order") or 0)
+    except (TypeError, ValueError):
+        version_order = 0
     return (
         KIND_RANK.get(kind, 9),
         FORMAT_RANK.get(fmt, 9),
+        -version_order,
         str(record.get("name") or ""),
     )
 

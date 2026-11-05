@@ -25,6 +25,7 @@ const PAGES: Record<string, { title: string; subtitle: string }> = {
   "/retarget": { title: "重定向管理", subtitle: "查看自动重定向的进度和优先级" },
   "/robots": { title: "3D 模型", subtitle: "管理人体与机器人的描述和网格" },
   "/users": { title: "用户与权限", subtitle: "开账号、配范围，并进入对方视角验收" },
+  "/audit": { title: "操作记录", subtitle: "每个用户的每次操作单独保存一条" },
 };
 
 export function Layout() {
@@ -75,7 +76,9 @@ export function Layout() {
                 ? "查看模型"
                 : page.title === "用户与权限"
                   ? "管理用户"
-                  : page.title;
+                  : page.title === "操作记录"
+                    ? "查看操作记录"
+                    : page.title;
 
   useEffect(() => {
     let debounce = 0;
@@ -251,6 +254,11 @@ export function Layout() {
             {hasPerm("manage_users") && (
               <SideLink to="/users" icon={<IconUsers />} onClick={() => setNavOpen(false)}>
                 用户与权限
+              </SideLink>
+            )}
+            {(isAdmin || hasPerm("manage_users")) && (
+              <SideLink to="/audit" icon={<IconAudit />} onClick={() => setNavOpen(false)}>
+                操作记录
               </SideLink>
             )}
           </nav>
@@ -447,6 +455,15 @@ function IconRobot() {
       <circle cx="12" cy="5" r="1.2" />
       <circle cx="9.2" cy="13" r="1.1" />
       <circle cx="14.8" cy="13" r="1.1" />
+    </svg>
+  );
+}
+
+function IconAudit() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M6 4h9l3 3v13H6z" />
+      <path d="M9 11h6M9 15h6" />
     </svg>
   );
 }

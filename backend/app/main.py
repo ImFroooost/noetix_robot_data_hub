@@ -22,6 +22,7 @@ logging.basicConfig(level=logging.WARNING)
 
 
 from .api import api_router
+from .audit_middleware import AuditMiddleware
 from .config import settings
 from .core.security import hash_password
 from .database import SessionLocal, init_db
@@ -118,6 +119,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(AuditMiddleware)
 
 
 @app.middleware("http")

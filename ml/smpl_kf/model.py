@@ -92,22 +92,42 @@ class TwoStageDenoiser(nn.Module):
         num_layers: int = 4,
         dropout: float = 0.1,
         max_len: int = 512,
+        normalized: bool = False,
     ):
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError("d_model 必须能被 nhead 整除")
         self.feat_dim = feat_dim
         self.root_dim = root_dim
+        self.normalized = normalized
         body_dim = feat_dim - root_dim
         self.root_stage = _Stage(feat_dim * 2, root_dim, d_model, nhead, num_layers, dropout, max_len)
         self.body_stage = _Stage(4 + body_dim * 2, body_dim, d_model, nhead, num_layers, dropout, max_len)
+        # 归一化统计量跟着权重文件里的 mean/std 走，不进 state_dict。旧权重是 0 和 1，等于不归一化。
+        self.register_buffer("feat_mean", torch.zeros(feat_dim), persistent=False)
+        self.register_buffer("feat_std", torch.ones(feat_dim), persistent=False)
+        self.register_buffer("local_scale", torch.tensor([30.0, 30.0, 30.0, 1.0]), persistent=False)
+
+    def set_normalizer(self, mean, std) -> None:
+        self.feat_mean.copy_(torch.as_tensor(mean, dtype=self.feat_mean.dtype))
+        self.feat_std.copy_(torch.as_tensor(std, dtype=self.feat_std.dtype))
+
+    def normalize(self, feat: torch.Tensor) -> torch.Tensor:
+        return (feat - self.feat_mean) / self.feat_std
+
+    def denormalize(self, feat: torch.Tensor) -> torch.Tensor:
+        return feat * self.feat_std + self.feat_mean
 
     def forward(self, x_in: torch.Tensor, mask: torch.Tensor, timesteps: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         pad = valid.squeeze(-1) < 0.5
         root = self.root_stage(torch.cat((x_in, mask), dim=-1), timesteps, pad)
         # 已经给定的根通道用输入里的值，身体不跟着一条和约束打架的根。
         root_for_body = torch.where(mask[..., : self.root_dim] > 0.5, x_in[..., : self.root_dim], root)
-        local_root = global_root_to_local(root_for_body)
+        if self.normalized:
+            raw_root = root_for_body * self.feat_std[: self.root_dim] + self.feat_mean[: self.root_dim]
+            local_root = global_root_to_local(raw_root) * self.local_scale
+        else:
+            local_root = global_root_to_local(root_for_body)
         body_in = torch.cat((local_root, x_in[..., self.root_dim :], mask[..., self.root_dim :]), dim=-1)
         body = self.body_stage(body_in, timesteps, pad)
         return torch.cat((root, body), dim=-1)
@@ -124,4 +144,5 @@ def build_denoiser(config: dict) -> TwoStageDenoiser:
         num_layers=config["num_layers"],
         dropout=config.get("dropout", 0.0),
         max_len=config.get("max_len", 512),
+        normalized=bool(config.get("normalized", False)),
     )

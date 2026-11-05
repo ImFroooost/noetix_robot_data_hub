@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..core.deps import get_current_user
 from ..database import get_db
-from ..models import Folder, MotionClip, User, UserPermission
+from ..models import Folder, User, UserPermission
 from ..models.enums import Capability
 from ..schemas import FolderCreate, FolderEnsureIn, FolderOut, FolderReorderIn, FolderUpdate
 from ..services.audit import write_audit
@@ -25,12 +25,6 @@ router = APIRouter(prefix="/folders", tags=["folders"])
 
 
 def _folder_out(db: Session, folder: Folder) -> FolderOut:
-    clip_count = (
-        db.query(func.count(MotionClip.id))
-        .filter(MotionClip.folder_id == folder.id)
-        .scalar()
-        or 0
-    )
     child_count = (
         db.query(func.count(Folder.id)).filter(Folder.parent_id == folder.id).scalar() or 0
     )
@@ -41,7 +35,7 @@ def _folder_out(db: Session, folder: Folder) -> FolderOut:
         path=folder.path,
         sort_order=getattr(folder, "sort_order", 0) or 0,
         created_at=folder.created_at,
-        clip_count=clip_count,
+        clip_count=0,
         child_count=child_count,
     )
 
@@ -74,15 +68,7 @@ def _subtree_folder_ids(db: Session, folder: Folder) -> list[int]:
 def _subtree_stats(db: Session, folder: Folder) -> dict:
     ids = _subtree_folder_ids(db, folder)
     child_folders = max(0, len(ids) - 1)
-    clips = 0
-    if ids:
-        clips = (
-            db.query(func.count(MotionClip.id))
-            .filter(MotionClip.folder_id.in_(ids))
-            .scalar()
-            or 0
-        )
-    return {"folder_count": child_folders, "clip_count": clips}
+    return {"folder_count": child_folders, "clip_count": 0}
 
 
 def _unique_name_under(db: Session, parent: Folder | None, base_name: str) -> str:
@@ -148,14 +134,10 @@ def _relocate_folder(
 
 
 def _purge_folder_subtree(db: Session, folder: Folder) -> dict:
-    """Permanently delete folder, descendants, and clips inside."""
+    """Permanently delete folder and its descendants."""
     ids = _subtree_folder_ids(db, folder)
     stats = _subtree_stats(db, folder)
     if ids:
-        clips = db.query(MotionClip).filter(MotionClip.folder_id.in_(ids)).all()
-        for c in clips:
-            db.delete(c)
-        db.flush()
         nodes = (
             db.query(Folder)
             .filter(Folder.id.in_(ids))
@@ -341,12 +323,6 @@ def empty_trash(
         folder_count += 1 + int(stats["folder_count"])
         clip_count += int(stats["clip_count"])
         _purge_folder_subtree(db, child)
-
-    # clips placed directly under 回收站
-    direct_clips = db.query(MotionClip).filter(MotionClip.folder_id == trash.id).all()
-    for c in direct_clips:
-        db.delete(c)
-        clip_count += 1
 
     write_audit(
         db,

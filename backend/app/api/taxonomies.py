@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from ..core.deps import get_current_user, require_manage_data
 from ..database import get_db
-from ..models import ClipTaxonomyTag, MotionClip, TaxonomyNode, TaxonomySchemeDef, User
+from ..models import TaxonomyNode, TaxonomySchemeDef, User
 from ..schemas import (
     TaxonomyNodeCreate,
     TaxonomyNodeOut,
@@ -17,7 +17,7 @@ from ..schemas import (
     TaxonomySchemeReorder,
     TaxonomySchemeUpdate,
 )
-from ..services.audit import write_audit
+from ..services.audit import skip_request_audit, write_audit
 from ..services.permissions import (
     join_folder_path,
     normalize_path,
@@ -53,23 +53,7 @@ def _scheme_str(scheme) -> str:
 
 
 def _clip_count(db: Session, node: TaxonomyNode) -> int:
-    ids = [
-        r[0]
-        for r in db.query(TaxonomyNode.id)
-        .filter(TaxonomyNode.scheme == node.scheme, TaxonomyNode.path.like(f"{node.path}%"))
-        .all()
-    ]
-    if not ids:
-        return 0
-    return (
-        db.query(func.count(ClipTaxonomyTag.id))
-        .filter(
-            ClipTaxonomyTag.scheme == node.scheme,
-            ClipTaxonomyTag.node_id.in_(ids),
-        )
-        .scalar()
-        or 0
-    )
+    return 0
 
 
 def _browse_count(
@@ -78,7 +62,7 @@ def _browse_count(
     *,
     pack_count: int | None = None,
 ) -> int:
-    """旧库 MotionClip 数 + 维度仓库上传包数（含子树）。"""
+    """维度仓库里挂在该分类上的数据数量（含子树）。"""
     clips = _clip_count(db, node)
     if pack_count is not None:
         return clips + pack_count
@@ -216,7 +200,15 @@ def _siblings_query(db: Session, scheme: str, parent_id: int | None):
     return q.filter(TaxonomyNode.parent_id == parent_id)
 
 
-def _renumber_from(db: Session, scheme: str, parent_id: int | None) -> None:
+def _assign_node_order(node: TaxonomyNode, sort_order: int, code: str) -> bool:
+    changed = node.sort_order != sort_order or (node.code or "") != code
+    if changed:
+        node.sort_order = sort_order
+        node.code = code
+    return changed
+
+
+def _renumber_from(db: Session, scheme: str, parent_id: int | None) -> bool:
     """按当前树顺序重算该节点以下全部序号码。数据标签按 node_id 绑定，不受改码影响。"""
     db.flush()
     siblings = (
@@ -224,27 +216,31 @@ def _renumber_from(db: Session, scheme: str, parent_id: int | None) -> None:
         .order_by(TaxonomyNode.sort_order.asc(), TaxonomyNode.id.asc())
         .all()
     )
+    changed = False
     if parent_id is None:
         scheme_def = get_scheme(db, scheme)
         prefix = ((scheme_def.code_prefix if scheme_def else "") or "X").strip()
         for idx, node in enumerate(siblings):
-            node.sort_order = idx
-            node.code = prefix if len(siblings) == 1 else _child_code(prefix, idx + 1)
-        db.flush()
+            code = prefix if len(siblings) == 1 else _child_code(prefix, idx + 1)
+            changed = _assign_node_order(node, idx, code) or changed
+        if changed:
+            db.flush()
         for node in siblings:
-            _renumber_from(db, scheme, node.id)
-        return
+            changed = _renumber_from(db, scheme, node.id) or changed
+        return changed
 
     parent = db.get(TaxonomyNode, parent_id)
     if not parent or _scheme_str(parent.scheme) != scheme:
-        return
+        return False
     parent_code = (parent.code or "").strip()
     for idx, node in enumerate(siblings):
-        node.sort_order = idx
-        node.code = _child_code(parent_code, idx + 1) if parent_code else str(idx + 1)
-    db.flush()
+        code = _child_code(parent_code, idx + 1) if parent_code else str(idx + 1)
+        changed = _assign_node_order(node, idx, code) or changed
+    if changed:
+        db.flush()
     for node in siblings:
-        _renumber_from(db, scheme, node.id)
+        changed = _renumber_from(db, scheme, node.id) or changed
+    return changed
 
 
 def _renumber_children(db: Session, scheme: str, parent_id: int | None) -> None:
@@ -477,15 +473,18 @@ def renumber_scheme_tree(
 ):
     """按当前树顺序重算该标准下全部节点序号。标签仍指向同一节点 id。"""
     _require_registered_scheme(db, key)
-    _renumber_from(db, key, None)
-    write_audit(
-        db,
-        user_id=admin.id,
-        action="renumber",
-        entity_type="taxonomy_scheme",
-        entity_id=None,
-        detail={"key": key},
-    )
+    changed = _renumber_from(db, key, None)
+    if changed:
+        write_audit(
+            db,
+            user_id=admin.id,
+            action="renumber",
+            entity_type="taxonomy_scheme",
+            entity_id=None,
+            detail={"key": key},
+        )
+    else:
+        skip_request_audit()
     db.commit()
     nodes = (
         db.query(TaxonomyNode)
@@ -557,9 +556,6 @@ def delete_scheme(
         )
 
     if cascade and node_count:
-        db.query(ClipTaxonomyTag).filter(ClipTaxonomyTag.scheme == key).delete(
-            synchronize_session=False
-        )
         nodes = (
             db.query(TaxonomyNode)
             .filter(TaxonomyNode.scheme == key)
@@ -877,23 +873,6 @@ def delete_node(
     child = db.query(TaxonomyNode).filter(TaxonomyNode.parent_id == node_id).first()
     if child:
         raise HTTPException(status_code=400, detail="请先删除子节点")
-    used = (
-        db.query(ClipTaxonomyTag.id)
-        .filter(ClipTaxonomyTag.node_id == node_id)
-        .first()
-    )
-    if not used:
-        used = (
-            db.query(MotionClip.id)
-            .filter(
-                (MotionClip.atomic_tag_id == node_id)
-                | (MotionClip.intent_tag_id == node_id)
-                | (MotionClip.style_tag_id == node_id)
-            )
-            .first()
-        )
-    if used:
-        raise HTTPException(status_code=400, detail="仍有条目使用该标签，禁止删除")
 
     scheme = _scheme_str(node.scheme)
     parent_id = node.parent_id

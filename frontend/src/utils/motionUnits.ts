@@ -22,7 +22,7 @@ const FORMAT_TAIL = new RegExp(
 const SKIP_EXT = new Set(["zip", "rar", "7z", "gz"]);
 const ACTOR_TOKEN = /^[A-Za-z]{2,20}$/;
 const ROLE_SUFFIX =
-  /(?:[\s._-]+|\.[A-Za-z0-9]{1,8}[\s._-]*)(?:skeleton|rigid[\s._-]*bod(?:y|ies)|marker).*$/i;
+  /(?:[\s._-]+|\.[A-Za-z0-9]{1,8}[\s._-]*)(?:skeleton|rigid[\s._-]*bod(?:y|ies)|marker|merged).*$/i;
 
 export type ClipPlan = {
   unitName: string;
@@ -144,6 +144,14 @@ function mergeActorSuffixes(keys: Map<string, Set<string>>) {
   return resolved;
 }
 
+function redundantClipDir(dirname: string, clip: string) {
+  if (!dirname || !clip || !/[A-Za-z]/.test(dirname)) return false;
+  if (clip === dirname) return true;
+  const prefix = `${dirname}_`;
+  if (!clip.startsWith(prefix)) return false;
+  return /^\d{1,4}$/.test(clip.slice(prefix.length));
+}
+
 export function planFollowedPaths(
   relPaths: string[],
   stripCommonRoot: boolean
@@ -180,42 +188,21 @@ export function planFollowedPaths(
 
 export function planClipUnits(relPaths: string[]): Map<string, ClipPlan> {
   const rels = relPaths.map(posix).filter(Boolean);
-  const wrappers = wrapperPrefixes(rels);
-  let located: { rel: string; place: string; key: string; ext: string }[] = [];
-  const byPlace = new Map<string, Map<string, Set<string>>>();
-  const addPlace = (place: string, key: string, ext: string) => {
-    const keys = byPlace.get(place) || new Map<string, Set<string>>();
-    const exts = keys.get(key) || new Set<string>();
-    exts.add(ext);
-    keys.set(key, exts);
-    byPlace.set(place, keys);
-  };
+  const keys = new Map<string, Set<string>>();
+  const located: { rel: string; key: string }[] = [];
   for (const rel of rels) {
     if (skipReason(rel)) continue;
     const name = partsOf(rel).pop() || rel;
-    let place = contentDirs(rel, wrappers);
-    const firsts = rels
-      .filter((other) => !skipReason(other))
-      .map((other) => contentDirs(other, wrappers)[0] || "");
-    if (place.length && firsts.every((item) => item && item === place[0])) place = place.slice(1);
     const key = clipStem(name);
-    const ext = extKey(name);
-    located.push({ rel, place: place.join("/"), key, ext });
-    addPlace(place.join("/"), key, ext);
+    const exts = keys.get(key) || new Set<string>();
+    exts.add(extKey(name));
+    keys.set(key, exts);
+    located.push({ rel, key });
   }
-  const nonempty = [...byPlace.keys()].filter(Boolean);
-  if (nonempty.length === 1) {
-    byPlace.clear();
-    located = located.map((item) => {
-      addPlace("", item.key, item.ext);
-      return { ...item, place: "" };
-    });
-  }
-  const canon = new Map<string, Map<string, string>>();
-  for (const [place, keys] of byPlace) canon.set(place, mergeActorSuffixes(keys));
+  const canon = mergeActorSuffixes(keys);
   const used = new Map<string, number>();
   const plan = new Map<string, ClipPlan>();
-  const locatedByRel = new Map(located.map((item) => [item.rel, item]));
+  const locatedByRel = new Map(located.map((item) => [item.rel, item.key]));
   for (const rel of rels) {
     const reason = skipReason(rel);
     if (reason) {
@@ -223,20 +210,13 @@ export function planClipUnits(relPaths: string[]): Map<string, ClipPlan> {
       continue;
     }
     const name = partsOf(rel).pop() || rel;
-    const found = locatedByRel.get(rel);
-    let key = found ? canon.get(found.place)?.get(found.key) || found.key : clipStem(name);
+    let clip = canon.get(locatedByRel.get(rel) || clipStem(name)) || clipStem(name);
     const suffix = suffixOf(name);
-    const subPath = found?.place || "";
-    let clip = key;
-    let unit = subPath ? `${subPath.replace(/\//g, "_")}_${clip}` : clip;
-    const slot = `${subPath}\0${clip}\0${suffix.toLowerCase()}`;
+    const slot = `${clip}\0${suffix.toLowerCase()}`;
     const count = (used.get(slot) || 0) + 1;
     used.set(slot, count);
-    if (count > 1) {
-      clip = `${clip}_${count}`;
-      unit = subPath ? `${subPath.replace(/\//g, "_")}_${clip}` : clip;
-    }
-    plan.set(rel, { unitName: unit, subPath, storedName: `${clip}${suffix}`, skip: "" });
+    if (count > 1) clip = `${clip}_${count}`;
+    plan.set(rel, { unitName: clip, subPath: "", storedName: `${clip}${suffix}`, skip: "" });
   }
   return plan;
 }

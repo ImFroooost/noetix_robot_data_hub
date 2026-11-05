@@ -1,8 +1,9 @@
 import { api, getToken } from "../api";
 
-export async function fetchAuth(url: string) {
+export async function fetchAuth(url: string, init: RequestInit = {}) {
   const token = getToken();
   const res = await fetch(url, {
+    ...init,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) throw new Error(`文件下载失败（${res.status}）`);

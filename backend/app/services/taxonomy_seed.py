@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from ..models import Folder, MotionClip, TaxonomyNode
+from ..models import Folder, TaxonomyNode
 from ..models.enums import TaxonomyScheme
 from .permissions import join_folder_path, normalize_path
 from .taxonomy_schemes import ensure_builtin_schemes
@@ -699,21 +699,7 @@ def needs_taxonomy_rebuild(db: Session) -> bool:
 
 def rebuild_taxonomies(db: Session) -> None:
     """Rebuild built-in trees only; custom scheme nodes are preserved."""
-    from ..models import ClipTaxonomyTag
-
     builtin = list(ROOTS.keys())
-    db.query(MotionClip).update(
-        {
-            MotionClip.atomic_tag_id: None,
-            MotionClip.intent_tag_id: None,
-            MotionClip.style_tag_id: None,
-        },
-        synchronize_session=False,
-    )
-    db.flush()
-    db.query(ClipTaxonomyTag).filter(ClipTaxonomyTag.scheme.in_(builtin)).delete(
-        synchronize_session=False
-    )
     nodes = (
         db.query(TaxonomyNode)
         .filter(TaxonomyNode.scheme.in_(builtin))
@@ -769,10 +755,6 @@ def prune_style_production_daily(db: Session) -> None:
     for node in stale:
         if node.path in expected:
             continue
-        db.query(MotionClip).filter(MotionClip.style_tag_id == node.id).update(
-            {MotionClip.style_tag_id: root.id},
-            synchronize_session=False,
-        )
         db.delete(node)
     db.flush()
 
@@ -883,27 +865,5 @@ def map_folder_path_to_tags(folder_path: str, db: Session) -> dict[str, int | No
 
 
 def apply_folder_heuristic_to_clips(db: Session) -> None:
-    from .taxonomy_schemes import set_clip_taxonomy_tag
-
-    folders = {f.id: f for f in db.query(Folder).all()}
-    clips = db.query(MotionClip).all()
-    for clip in clips:
-        if clip.atomic_tag_id and clip.intent_tag_id and clip.style_tag_id:
-            continue
-        folder = folders.get(clip.folder_id) if clip.folder_id else None
-        if not folder:
-            continue
-        mapped = map_folder_path_to_tags(folder.path, db)
-        if not clip.atomic_tag_id and mapped["atomic_tag_id"]:
-            set_clip_taxonomy_tag(
-                db, clip, TaxonomyScheme.atomic.value, mapped["atomic_tag_id"]
-            )
-        if not clip.intent_tag_id and mapped["intent_tag_id"]:
-            set_clip_taxonomy_tag(
-                db, clip, TaxonomyScheme.intent.value, mapped["intent_tag_id"]
-            )
-        if not clip.style_tag_id and mapped["style_tag_id"]:
-            set_clip_taxonomy_tag(
-                db, clip, TaxonomyScheme.style.value, mapped["style_tag_id"]
-            )
-    db.flush()
+    """Kept so startup still calls a no-op. Clip records are no longer stored."""
+    return None

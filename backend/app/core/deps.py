@@ -4,12 +4,10 @@ from jwt import PyJWTError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Capability, MotionClip, User, UserRole
+from ..models import Capability, User, UserRole
 from ..models.enums import is_super_manager_role
 from ..services.permissions import (
     ensure_capability,
-    ensure_clip_capability,
-    folder_path_of_clip,
     is_admin,
     user_has_any_capability,
 )
@@ -109,17 +107,6 @@ def require_manage_data(
     if user_has_any_capability(db, user, Capability.manage_data):
         return user
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理数据权限")
-
-
-def get_clip_or_404(clip_id: int, db: Session) -> MotionClip:
-    clip = db.get(MotionClip, clip_id)
-    if not clip:
-        raise HTTPException(status_code=404, detail="条目不存在")
-    return clip
-
-
-def check_clip_perm(db: Session, user: User, clip: MotionClip, capability: Capability) -> str:
-    return ensure_clip_capability(db, user, capability, clip)
 
 
 def check_path_perm(db: Session, user: User, capability: Capability, folder_path: str) -> None:

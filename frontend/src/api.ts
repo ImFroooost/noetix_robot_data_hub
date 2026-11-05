@@ -112,59 +112,7 @@ export const api = {
     ),
   impersonationTargets: () =>
     request<import("./types").User[]>("/api/auth/impersonation-targets"),
-  search: (params: Record<string, string | number | boolean | undefined | null>) => {
-    const q = new URLSearchParams();
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
-    });
-    return request<import("./types").SearchResult>(`/api/clips/search?${q}`);
-  },
-  facets: () =>
-    request<{
-      categories: string[];
-      subcategories: string[];
-      human_formats: string[];
-      robot_models: string[];
-      qualities: string[];
-      stages: string[];
-    }>("/api/clips/facets"),
-  getClip: (id: number) => request<import("./types").Clip>(`/api/clips/${id}`),
-  createClip: (body: Record<string, unknown>) =>
-    request<import("./types").Clip>("/api/clips", { method: "POST", body: JSON.stringify(body) }),
-  updateClip: (id: number, body: Record<string, unknown>) =>
-    request<import("./types").Clip>(`/api/clips/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    }),
-  deleteClip: (id: number) => request<{ ok: boolean }>(`/api/clips/${id}`, { method: "DELETE" }),
-  updateHumanFile: (id: number, body: Record<string, unknown>) =>
-    request(`/api/clips/human-files/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  updateRobotFile: (id: number, body: Record<string, unknown>) =>
-    request(`/api/clips/robot-files/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  updateRealVideo: (id: number, body: Record<string, unknown>) =>
-    request(`/api/clips/real-videos/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  updateSharedText: (id: number, body: Record<string, unknown>) =>
-    request(`/api/clips/shared-texts/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  uploadHuman: (clipId: number, form: FormData) =>
-    request(`/api/clips/${clipId}/human-files`, { method: "POST", body: form }),
-  uploadRealVideo: (clipId: number, form: FormData) =>
-    request(`/api/clips/${clipId}/real-videos`, { method: "POST", body: form }),
-  uploadSharedText: (clipId: number, form: FormData) =>
-    request(`/api/clips/${clipId}/shared-texts`, { method: "POST", body: form }),
-  deleteClipFile: (kind: "human" | "robot" | "video" | "shared", id: number) =>
-    request<{ ok: boolean }>(`/api/files/${kind}/${id}`, { method: "DELETE" }),
-  importHumanZip: (form: FormData) =>
-    request<{
-      created_clip_ids: number[];
-      clips: { clip_id: number; summary: string; formats: string[] }[];
-      warnings: string[];
-      skipped: number;
-      folder_id: number | null;
-      folder_path: string;
-      folder_name: string;
-    }>("/api/import/human-zip", { method: "POST", body: form }),
-  uploadRobot: (clipId: number, form: FormData) =>
-    request(`/api/clips/${clipId}/robot-files`, { method: "POST", body: form }),
+
   listRobotModels: () => request<import("./types").RobotModel[]>("/api/robot-models"),
   createRobotModel: (form: FormData) =>
     request("/api/robot-models", { method: "POST", body: form }),
@@ -190,6 +138,10 @@ export const api = {
   modelAssetDownloadUrl: (id: number) => `/api/model-assets/${id}/download`,
 
   listUsers: () => request<import("./types").User[]>("/api/users"),
+  listAuditLogs: (q = "", offset = 0) =>
+    request<import("./types").AuditLogRow[]>(
+      `/api/audit?limit=200&offset=${offset}&q=${encodeURIComponent(q)}`
+    ),
   reportPresence: (body: { page: string; detail: string; idle: boolean }) =>
     request<{ ok: boolean }>("/api/presence", {
       method: "POST",
@@ -230,14 +182,6 @@ export const api = {
     }),
   deleteFolder: (id: number) =>
     request<{ ok: boolean }>(`/api/folders/${id}`, { method: "DELETE" }),
-  batchClips: (body: {
-    action: "move" | "delete";
-    clip_ids: number[];
-    folder_id?: number | null;
-  }) => request<{ ok: boolean; count?: number }>("/api/clips/batch", {
-    method: "POST",
-    body: JSON.stringify(body),
-  }),
 
   listTaxonomies: (scheme?: string) => {
     const q = scheme ? `?scheme=${encodeURIComponent(scheme)}` : "";
@@ -449,6 +393,10 @@ export const api = {
     `/api/storage/file?path=${encodeURIComponent(path)}${
       download ? "&download=true" : ""
     }`,
+  storageRetargetFrame: (path: string) =>
+    request<import("./types").RetargetFrame>(
+      `/api/storage/retarget-frame?path=${encodeURIComponent(path)}`
+    ),
   storageFileDetail: (path: string) =>
     request<import("./types").StorageFileDetail>(
       `/api/storage/file-detail?path=${encodeURIComponent(path)}`
@@ -535,6 +483,13 @@ export const api = {
     request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority", {
       quiet: true,
     }),
+  retargetStorageTree: () =>
+    request<import("./types").TaxonomyNode[]>("/api/repo/retarget/storage-tree"),
+  redoRetargetTier: (ruleId: string) =>
+    request<{ ok: boolean; rule_id: string; message: string }>(
+      `/api/repo/retarget/priority/${encodeURIComponent(ruleId)}/redo`,
+      { method: "POST" },
+    ),
   saveRetargetPriority: (rules: import("./pages/RetargetManagePage").PriorityRule[]) =>
     request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority", {
       method: "PUT",

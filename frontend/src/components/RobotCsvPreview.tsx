@@ -10,20 +10,18 @@ import {
   normalizeRobotVersion,
   robotDescriptionVersions,
 } from "./RobotStyleFields";
-import type { ModelInstance, StorageFile } from "../types";
+import type { ModelInstance, RetargetFrame, StorageFile } from "../types";
 import { parseCsvFps } from "../types";
-import { FrameFigure, ViewerSceneChrome } from "./ViewerSceneChrome";
-import {
-  cycleUpAxisMode,
-  detectUpAxisFromBox,
-  resolveUpAxis,
-  upAxisModeLabel,
-  upAxisToRotationX,
-  useUpAxisMode,
-  type UpAxis,
-} from "../viewerUpAxis";
+import { FbxSceneObjects, type RobotTrackFrame } from "./AnimationFormatPreview";
+import { usePreview } from "../preview/PreviewContext";
+import { DataOriginAxes, FrameFigure, ViewerSceneChrome } from "./ViewerSceneChrome";
+import { upAxisToRotationX } from "../viewerUpAxis";
+
+/** holosoma / MuJoCo robot CSVs are always Z-up: base xyz, quat xyzw, joints. */
+const ROBOT_CSV_ROTATION_X = upAxisToRotationX("z");
 
 const _robotBox = new THREE.Box3();
+const _robotSize = new THREE.Vector3();
 const _rootPos = new THREE.Vector3();
 const _rootDelta = new THREE.Vector3();
 
@@ -50,6 +48,44 @@ type RobotCsvFrame = {
   quat: [number, number, number, number];
   joints: number[];
 };
+
+function fileVersionToken(path: string) {
+  return path.match(/\.file_versions\/([^/]+)\//)?.[1] || "";
+}
+
+function humanSceneScore(file: StorageFile, stem: string, version: string) {
+  const path = file.path || "";
+  const name = (file.name || path).replace(/\.fbx$/i, "");
+  let score = 0;
+  if (name === stem || name.startsWith(`${stem}_`) || name.startsWith(`${stem}.`)) score += 4;
+  if (version && fileVersionToken(path) === version) score += 2;
+  if (!fileVersionToken(path)) score += 1;
+  if (path.includes("/merged/") || file.annotation?.motion_kind === "merged") score += 8;
+  return score;
+}
+
+/** 同一数据单元里的人体 FBX，优先用带场景物体的合并数据。 */
+export function humanSceneFbx(files: StorageFile[], csv: StorageFile): StorageFile | null {
+  const fbxs = files.filter((item) => {
+    const path = item.path || "";
+    const name = item.name || path;
+    const human = item.ontology === "human" || path.includes("/human/");
+    const motion = !item.modality || item.modality === "motion" || path.includes("/motion/");
+    const fbx = (item.format || "").toLowerCase() === "fbx" || name.toLowerCase().endsWith(".fbx");
+    return human && motion && fbx;
+  });
+  if (!fbxs.length) return null;
+  const stem = (csv.name || csv.path).replace(/\.csv$/i, "").replace(/_skeleton_.*$/i, "");
+  const version = fileVersionToken(csv.path || "");
+  return [...fbxs].sort(
+    (left, right) => humanSceneScore(right, stem, version) - humanSceneScore(left, stem, version)
+  )[0];
+}
+
+export function robotCsvHipsHint(name: string) {
+  const match = name.match(/skeleton[_\s]+(skeleton[_\s]*\d+)/i);
+  return match ? match[1].toLowerCase().replace(/\s+/g, "_") : null;
+}
 
 export function isRobotMotionCsv(file: StorageFile) {
   return (
@@ -121,10 +157,15 @@ function RobotCsvScene({
   rotationX = 0,
   viewNonce = 0,
   followRoot = false,
+  propsUrl = "",
+  hipsHint = null,
+  retargetFrame = null,
+  robotStyle = "",
   onReady,
   onError,
-  onDetectedUpAxis,
 }: {
+  retargetFrame?: RetargetFrame | null;
+  robotStyle?: string;
   csvUrl: string;
   urdfPath: string;
   packageRoot: string;
@@ -134,9 +175,10 @@ function RobotCsvScene({
   rotationX?: number;
   viewNonce?: number;
   followRoot?: boolean;
+  propsUrl?: string;
+  hipsHint?: string | null;
   onReady: (info: { duration: number; fps: number; jointCount: number; note: string }) => void;
   onError: (message: string) => void;
-  onDetectedUpAxis?: (up: UpAxis) => void;
 }) {
   const robotRef = useRef<URDFRobot | null>(null);
   const figureRef = useRef<THREE.Group>(null);
@@ -145,11 +187,17 @@ function RobotCsvScene({
   const fpsRef = useRef(30);
   const [robot, setRobot] = useState<URDFRobot | null>(null);
   const [center, setCenter] = useState<[number, number, number]>([0, 0, 0]);
+  const [alignPose, setAlignPose] = useState<{
+    position: [number, number, number];
+    quaternion: [number, number, number, number];
+  } | null>(null);
+  const [axisLength, setAxisLength] = useState(1.2);
+  const [robotTrack, setRobotTrack] = useState<RobotTrackFrame[]>([]);
+  const [propsNonce, setPropsNonce] = useState(0);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState("");
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
-  const onDetectedRef = useRef(onDetectedUpAxis);
   const followRef = useRef(followRoot);
   const lastRoot = useRef(new THREE.Vector3());
   const hasLastRoot = useRef(false);
@@ -159,7 +207,6 @@ function RobotCsvScene({
     | undefined;
   onReadyRef.current = onReady;
   onErrorRef.current = onError;
-  onDetectedRef.current = onDetectedUpAxis;
   followRef.current = followRoot;
 
   useEffect(() => {
@@ -167,13 +214,15 @@ function RobotCsvScene({
     setStatus("loading");
     setError("");
     setRobot(null);
+    setAlignPose(null);
+    setRobotTrack([]);
     robotRef.current = null;
     framesRef.current = [];
     hasLastRoot.current = false;
 
     const root = packageRoot.replace(/\/?$/, "/");
     Promise.all([
-      fetchAuth(csvUrl).then((res) => res.text()),
+      fetchAuth(csvUrl, { cache: "no-cache" }).then((res) => res.text()),
       fetchAuth(api.storageFileUrl(urdfPath)).then((res) => res.text()),
     ])
       .then(([csvText, urdfText]) => {
@@ -206,7 +255,9 @@ function RobotCsvScene({
         model.updateMatrixWorld(true);
         _robotBox.setFromObject(model);
         if (!_robotBox.isEmpty()) {
-          onDetectedRef.current?.(detectUpAxisFromBox(_robotBox));
+          _robotBox.getSize(_robotSize);
+          const span = Math.max(_robotSize.x, _robotSize.y, _robotSize.z);
+          setAxisLength(span > 0.05 ? span : 1.2);
         }
         const fps = fpsHint || parsed.fps || 30;
         const duration =
@@ -214,6 +265,11 @@ function RobotCsvScene({
             ? durationHint
             : parsed.frames.length / Math.max(fps, 1);
         setCenter(centerFromFrames(parsed.frames, rotationX));
+        setAlignPose({
+          position: parsed.frames[0].root,
+          quaternion: parsed.frames[0].quat,
+        });
+        setRobotTrack(parsed.frames);
 
         framesRef.current = parsed.frames;
         namesRef.current = jointNames;
@@ -281,12 +337,27 @@ function RobotCsvScene({
 
   return (
     <group ref={figureRef} position={center}>
-      <group rotation={[rotationX, 0, 0]}>{robot && <primitive object={robot} />}</group>
+      <group rotation={[rotationX, 0, 0]}>
+        <DataOriginAxes length={axisLength} />
+        {robot && <primitive object={robot} />}
+        {propsUrl ? (
+          <FbxSceneObjects
+            url={propsUrl}
+            time={time}
+            alignPose={alignPose}
+            hipsHint={hipsHint}
+            retargetFrame={retargetFrame}
+            robotStyle={robotStyle}
+            robotTrack={robotTrack}
+            onReady={() => setPropsNonce((value) => value + 1)}
+          />
+        ) : null}
+      </group>
       <FrameFigure
         objectRef={figureRef}
         ready={status === "ready"}
-        resetKey={`${csvUrl}:${rotationX}`}
-        nonce={viewNonce}
+        resetKey={`${csvUrl}:${rotationX}:${propsUrl}`}
+        nonce={viewNonce + propsNonce}
       />
       {status === "loading" && (
         <Html center style={{ pointerEvents: "none" }}>
@@ -303,6 +374,29 @@ function RobotCsvScene({
 }
 
 export function RobotCsvPreview({ file }: { file: StorageFile }) {
+  const preview = usePreview();
+  const sceneFbx = humanSceneFbx(
+    preview.filesForUnit(file.batch || "", file.unit_name || ""),
+    file
+  );
+  const propsUrl = sceneFbx ? api.storageFileUrl(sceneFbx.path) : "";
+  const hipsHint = robotCsvHipsHint(file.name || file.path || "");
+  const scenePath = sceneFbx?.path || "";
+  const [retargetFrame, setRetargetFrame] = useState<RetargetFrame | null>(null);
+  useEffect(() => {
+    setRetargetFrame(null);
+    if (!scenePath) return;
+    let cancelled = false;
+    api
+      .storageRetargetFrame(scenePath)
+      .then((frame) => {
+        if (!cancelled) setRetargetFrame(frame);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [scenePath]);
   const [instances, setInstances] = useState<ModelInstance[]>([]);
   const [modelsError, setModelsError] = useState("");
   const [time, setTime] = useState(0);
@@ -310,12 +404,11 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
   const [speed, setSpeed] = useState(1);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [note, setNote] = useState("");
-  const [upAxisMode, setUpAxisMode] = useUpAxisMode();
-  const [detectedUp, setDetectedUp] = useState<UpAxis>("z");
   const [viewNonce, setViewNonce] = useState(0);
   const [followRoot, setFollowRoot] = useState(true);
   const duration = mediaDuration || file.duration_sec || 1;
-  const rotationX = upAxisToRotationX(resolveUpAxis(upAxisMode, detectedUp));
+  const rotationX = ROBOT_CSV_ROTATION_X;
+  const contentStamp = `${file.modified_at || ""}:${file.size ?? ""}`;
   const style = String(file.robot_style || file.annotation?.robot_style || "");
   const instance = instances.find((item) => item.name === style);
   const versions = robotDescriptionVersions(instance);
@@ -354,12 +447,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
     setPlaying(true);
     setMediaDuration(0);
     setNote("");
-    setDetectedUp("z");
   }, [file.path, style, version]);
-
-  useEffect(() => {
-    setUpAxisMode("auto");
-  }, [file.path]);
 
   useEffect(() => {
     if (!playing) return;
@@ -412,7 +500,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
           >
             <ViewerSceneChrome />
             <RobotCsvScene
-              key={`${file.path}:${urdfFile.path}:${parseCsvFps(file.annotation?.fps ?? file.fps)}`}
+              key={`${file.path}:${contentStamp}:${urdfFile.path}:${parseCsvFps(file.annotation?.fps ?? file.fps)}`}
               csvUrl={api.storageFileUrl(file.path)}
               urdfPath={urdfFile.path}
               packageRoot={packageRoot}
@@ -422,9 +510,12 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
               rotationX={rotationX}
               viewNonce={viewNonce}
               followRoot={followRoot}
+              propsUrl={propsUrl}
+              hipsHint={hipsHint}
+              retargetFrame={retargetFrame}
+              robotStyle={style}
               onReady={handleReady}
               onError={() => undefined}
-              onDetectedUpAxis={setDetectedUp}
             />
             <OrbitControls makeDefault />
           </Canvas>
@@ -498,18 +589,12 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
         >
           跟随视角
         </button>
-        <button
-          type="button"
-          className="follow-root-toggle secondary"
-          title="切换坐标系方向：自动识别 / Y-up / Z-up"
-          disabled={missingStyle}
-          onClick={() => {
-            setUpAxisMode(cycleUpAxisMode(upAxisMode));
-            setViewNonce((n) => n + 1);
-          }}
+        <span
+          className="follow-root-toggle secondary is-static"
+          title="机器人动作 CSV 由 holosoma 按 MuJoCo 坐标系导出，固定为 Z-up（米），不需要切换"
         >
-          {upAxisModeLabel(upAxisMode, detectedUp)}
-        </button>
+          坐标系·Z-up
+        </span>
       </div>
       {note ? <div className="muted animation-format-note">{note}</div> : null}
     </div>

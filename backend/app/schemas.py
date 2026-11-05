@@ -196,7 +196,6 @@ class ClipCreate(BaseModel):
     action_name: str = ""
     brief: str = ""
     detail_def: str = ""
-    action_version: str = ""
     routine_label: str = ""
     duel_label: str = ""
     compute_level: str = ""
@@ -221,7 +220,6 @@ class ClipUpdate(BaseModel):
     action_name: str | None = None
     brief: str | None = None
     detail_def: str | None = None
-    action_version: str | None = None
     routine_label: str | None = None
     duel_label: str | None = None
     compute_level: str | None = None
@@ -362,7 +360,6 @@ class ClipOut(ORMModel):
     action_name: str = ""
     brief: str = ""
     detail_def: str = ""
-    action_version: str = ""
     routine_label: str = ""
     duel_label: str = ""
     compute_level: str = ""
@@ -405,7 +402,6 @@ class ClipListItem(ORMModel):
     description: str
     action_code: str = ""
     action_name: str = ""
-    action_version: str = ""
     tags: list[str]
     duration_sec: float | None
     sort_order: int = 0
@@ -561,6 +557,7 @@ class FolderEnsureIn(BaseModel):
 class AuditLogOut(ORMModel):
     id: int
     user_id: int | None
+    username: str | None = None
     action: str
     entity_type: str
     entity_id: int | None

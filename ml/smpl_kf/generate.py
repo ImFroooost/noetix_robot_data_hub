@@ -73,6 +73,8 @@ def generate_motion(
     steps: int,
     device: str,
     foot_lock: bool = True,
+    cfg_scale: float = 2.0,
+    settle: bool = True,
 ) -> np.ndarray:
     """10 秒以内一次生成。更长的动作分窗，下一窗把上一窗最后一段当作已知帧接着生成。"""
     key_idx = np.asarray(key_idx, np.int64)
@@ -101,20 +103,20 @@ def generate_motion(
             torch.from_numpy(mask)[None].to(device),
             torch.from_numpy(valid)[None].to(device),
             steps,
-            soft_tail=min(5, max(steps - 1, 0)),
-            soft_strength=0.5,
-            cfg_scale=2.0,
+            cfg_scale=cfg_scale,
         )
         decoded = decode_motion(pred.float().cpu().numpy()[0], origin)
         fresh = ~known[start : start + count]
         world[start : start + count][fresh] = decoded[fresh]
         known[start : start + count] = True
-    world = settle_rotations(world, key_idx)
+    if settle:
+        world = settle_rotations(world, key_idx)
     if foot_lock:
         pos, _world = fk_local(world[:, :ROT_DIM], world[:, ROT_DIM:])
         world = foot_lock_legacy(world, foot_contacts(pos), pinned=key_idx)
-        # 锁定只小步改腿，这里再把仍然超过 30° 的接缝摊开，关键帧继续钉住。
-        world = settle_rotations(world, key_idx)
+        if settle:
+            # 锁定只小步改腿，这里再把仍然超过 30° 的接缝摊开，关键帧继续钉住。
+            world = settle_rotations(world, key_idx)
     return world.astype(np.float32)
 
 

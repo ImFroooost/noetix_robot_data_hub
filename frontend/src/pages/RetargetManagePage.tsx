@@ -55,6 +55,7 @@ export type RetargetPriority = {
   defaults: PriorityRule[];
   presets?: PriorityPreset[];
   pins?: RetargetPin[];
+  redo?: string[];
   updated_at?: string | null;
 };
 
@@ -155,6 +156,11 @@ function publishedRuleIds(queues: RetargetQueue[]) {
   return queues.filter((queue) => queue.key !== "pinned" && queue.key !== "unlisted").map((queue) => queue.key);
 }
 
+function queueCountText(queue: RetargetQueue) {
+  const failed = queue.failed ? `，失败 ${queue.failed}` : "";
+  return `已完成 ${queue.done} / 共 ${queue.total}${failed}`;
+}
+
 function queueRemaining(queue: RetargetQueue) {
   if (typeof queue.remaining === "number") return queue.remaining;
   return Math.max(0, queue.total - queue.done - (queue.failed || 0));
@@ -163,6 +169,8 @@ function queueRemaining(queue: RetargetQueue) {
 function queueTimeText(queue: RetargetQueue) {
   const remaining = queueRemaining(queue);
   if (queue.total === 0) return "这一档没有待处理的数据";
+  if (remaining === 0 && queue.failed > 0 && queue.done === 0) return "这一档都失败了，可以点本级全部重做再跑一遍";
+  if (remaining === 0 && queue.failed > 0) return `成功的已经跑完，失败 ${queue.failed} 条`;
   if (remaining === 0) return "这一档已经跑完";
   const band = queue.eta_seconds;
   const after = queue.eta_after_seconds;
@@ -208,14 +216,22 @@ function withPicks(rule: PriorityRule, kind: "include" | "exclude", picks: Taxon
   };
 }
 
-function ruleTitle(rule: PriorityRule, earlier: Set<string>) {
+function ruleTitle(rule: PriorityRule, earlier: Set<string>, rules: PriorityRule[] = []) {
   const robots = rule.robots.join(" → ") || "未选机器人";
   if (rule.data_mode === "targets") {
     const data = (rule.targets || []).map((item) => pinLabel(item)).join("、") || "未选数据";
     return `${data} · ${robots}`;
   }
   if (rule.data_mode === "rest") {
-    const untouched = rule.robots.length > 0 && rule.robots.every((robot) => !earlier.has(robot));
+    const carved = rules.some(
+      (other) =>
+        other.id !== rule.id &&
+        other.enabled &&
+        other.data_mode !== "rest" &&
+        other.robots.some((robot) => rule.robots.includes(robot))
+    );
+    const untouched =
+      !carved && rule.robots.length > 0 && rule.robots.every((robot) => !earlier.has(robot));
     return `${robots} · ${untouched ? "全部数据" : "其余数据"}`;
   }
   const includePicks = rulePicks(rule, "include");
@@ -233,39 +249,59 @@ function sameRuleOrder(rules: PriorityRule[], queues: RetargetQueue[]) {
   return enabled.length > 0 && enabled.length === published.length && enabled.every((id, index) => id === published[index]);
 }
 
+const REDO_PENDING = "已安排全部重做。当前这一波结束后重新扫描，进度从 0 开始，新的 CSV 写好后覆盖原来的文件。";
+
 function QueueProgress({
   queue,
   title,
   rank,
+  onRedo,
+  redoBusy,
+  redoPending,
 }: {
   queue: RetargetQueue;
   title: string;
   rank: string;
+  onRedo?: (ruleId: string, title: string) => void;
+  redoBusy?: string;
+  redoPending?: boolean;
 }) {
-  const queueDone = queue.done + queue.failed;
-  const queuePercent = queue.total ? Math.min(100, (queueDone / queue.total) * 100) : 0;
+  const donePercent = queue.total ? Math.min(100, (queue.done / queue.total) * 100) : 0;
+  const failedPercent = queue.total ? Math.min(100 - donePercent, (queue.failed / queue.total) * 100) : 0;
+  const busy = redoBusy === queue.key;
+  const waiting = !!redoPending && queue.total === 0;
   return (
     <li className={queue.active ? "is-active" : undefined}>
-      <div className="row" style={{ justifyContent: "space-between" }}>
+      <div className="row" style={{ justifyContent: "space-between", gap: "0.5rem" }}>
         <strong>
           {rank}
           {queue.active ? " · 当前" : ""}
         </strong>
-        <span>
-          {queue.done} / {queue.total}
-          {queue.failed ? `，失败 ${queue.failed}` : ""}
+        <span className="retarget-queue-actions">
+          {onRedo ? (
+            <button
+              type="button"
+              className="secondary retarget-mini"
+              disabled={!!redoBusy}
+              onClick={() => onRedo(queue.key, title)}
+            >
+              {busy ? "正在安排" : "本级全部重做"}
+            </button>
+          ) : null}
+          <span>{queueCountText(queue)}</span>
         </span>
       </div>
       <div>{title}</div>
-      <div className="muted">{queueTimeText(queue)}</div>
+      <div className="muted">{waiting ? REDO_PENDING : queueTimeText(queue)}</div>
       <div className="retarget-bar">
-        <span className="retarget-bar-done" style={{ width: `${queuePercent}%` }} />
-        {queue.failed ? (
-          <span
-            className="retarget-bar-failed"
-            style={{ width: `${Math.min(100 - queuePercent, (queue.failed / queue.total) * 100)}%` }}
-          />
-        ) : null}
+        {waiting ? null : (
+          <>
+            <span className="retarget-bar-done" style={{ width: `${donePercent}%` }} />
+            {failedPercent > 0 ? (
+              <span className="retarget-bar-failed" style={{ width: `${failedPercent}%` }} />
+            ) : null}
+          </>
+        )}
       </div>
     </li>
   );
@@ -275,10 +311,16 @@ function PriorityProgress({
   rules,
   queues,
   countsReady,
+  onRedo,
+  redoBusy,
+  redoIds,
 }: {
   rules: PriorityRule[];
   queues: RetargetQueue[];
   countsReady: boolean;
+  onRedo: (ruleId: string, title: string) => void;
+  redoBusy: string;
+  redoIds: ReadonlySet<string>;
 }) {
   const byKey = new Map(queues.map((queue) => [queue.key, queue]));
   const unlisted = byKey.get("unlisted");
@@ -292,23 +334,54 @@ function PriorityProgress({
       <ol className="retarget-queues">
         {rules.map((rule, index) => {
           const earlier = new Set(rules.slice(0, index).flatMap((item) => (item.enabled ? item.robots : [])));
-          const title = rule.enabled ? ruleTitle(rule, earlier) : "已停用，不会参与排序";
+          const title = rule.enabled ? ruleTitle(rule, earlier, rules) : "已停用，不会参与排序";
           const queue = countsReady && rule.enabled ? byKey.get(rule.id) : undefined;
           if (queue) {
-            return <QueueProgress key={rule.id} queue={queue} title={title} rank={`第 ${index + 1} 档`} />;
+            return (
+              <QueueProgress
+                key={rule.id}
+                queue={queue}
+                title={title}
+                rank={`第 ${index + 1} 档`}
+                onRedo={onRedo}
+                redoBusy={redoBusy}
+                redoPending={redoIds.has(rule.id)}
+              />
+            );
           }
+          const pending = redoIds.has(rule.id);
           return (
             <li key={rule.id}>
-              <div className="row" style={{ justifyContent: "space-between" }}>
+              <div className="row" style={{ justifyContent: "space-between", gap: "0.5rem" }}>
                 <strong>第 {index + 1} 档</strong>
-                <span className="muted">{rule.enabled ? "统计中" : "已停用"}</span>
+                <span className="retarget-queue-actions">
+                  {rule.enabled ? (
+                    <button
+                      type="button"
+                      className="secondary retarget-mini"
+                      disabled={!!redoBusy}
+                      onClick={() => onRedo(rule.id, title)}
+                    >
+                      {redoBusy === rule.id ? "正在安排" : "本级全部重做"}
+                    </button>
+                  ) : null}
+                  <span className="muted">{pending ? "排队重做" : rule.enabled ? "统计中" : "已停用"}</span>
+                </span>
               </div>
               <div>{title}</div>
+              {pending ? <div className="muted">{REDO_PENDING}</div> : null}
             </li>
           );
         })}
         {countsReady && unlisted && unlisted.total > 0 ? (
-          <QueueProgress queue={unlisted} title={unlisted.title} rank={rankLabel(unlisted.rank)} />
+          <QueueProgress
+            queue={unlisted}
+            title={unlisted.title}
+            rank={rankLabel(unlisted.rank)}
+            onRedo={onRedo}
+            redoBusy={redoBusy}
+            redoPending={redoIds.has(unlisted.key)}
+          />
         ) : null}
       </ol>
     </>
@@ -449,6 +522,15 @@ function CheckTree({
   return <div className="facet-tree">{top.map((node) => renderNode(node, 0))}</div>;
 }
 
+const FOLDER_SCHEME: TaxonomySchemeDef = {
+  key: "folder",
+  name: "存储结构",
+  code_prefix: "",
+  sort_order: -1,
+  builtin: true,
+  description: "",
+};
+
 function SchemeFacets({
   schemes,
   nodesByScheme,
@@ -496,10 +578,16 @@ function SchemeFacets({
           const names = picks.filter((pick) => pick.scheme === scheme.key).map((pick) => pick.name);
           const open = openKey === scheme.key;
           const summary = names.length === 0 ? "" : names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`;
-          const checked = namesToIds(nodes, names);
+          const checked =
+            scheme.key === "folder"
+              ? nodes.filter((node) => names.includes(node.path)).map((node) => node.id)
+              : namesToIds(nodes, names);
           const rankById = new Map<number, number>();
           names.forEach((name) => {
-            const node = nodes.find((item) => item.name === name);
+            const node =
+              scheme.key === "folder"
+                ? nodes.find((item) => item.path === name)
+                : nodes.find((item) => item.name === name);
             const rank = ranks.get(`${scheme.key}:${name}`);
             if (node && rank) rankById.set(node.id, rank);
           });
@@ -523,7 +611,9 @@ function SchemeFacets({
                     onToggle={(id) => {
                       const nextIds = toggleTaxonomy(id, nodes, checked);
                       const nextNames = nextIds
-                        .map((nodeId) => nodes.find((node) => node.id === nodeId)?.name || "")
+                        .map((nodeId) => nodes.find((node) => node.id === nodeId))
+                        .filter((node): node is TaxonomyNode => !!node)
+                        .map((node) => (scheme.key === "folder" ? node.path : node.name))
                         .filter(Boolean);
                       onChange(mergeSchemePicks(picks, scheme.key, nextNames));
                     }}
@@ -554,6 +644,8 @@ export function RetargetManagePage() {
   const [priorityNote, setPriorityNote] = useState("");
   const [saving, setSaving] = useState(false);
   const [controlBusy, setControlBusy] = useState(false);
+  const [redoBusy, setRedoBusy] = useState("");
+  const [redoIds, setRedoIds] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const rulesRef = useRef(rules);
   const savedRef = useRef(savedRules);
@@ -580,6 +672,7 @@ export function RetargetManagePage() {
       setRobots(cfg.robots || []);
       setPresets(cfg.presets || []);
       setPins(cfg.pins || []);
+      setRedoIds(cfg.redo || []);
       if (!collapsedInit.current) {
         collapsedInit.current = true;
         setCollapsed(new Set(next.map((rule) => rule.id)));
@@ -621,6 +714,20 @@ export function RetargetManagePage() {
   }, [isAdmin]);
 
   useEffect(() => {
+    if (!isAdmin) return;
+    let alive = true;
+    api
+      .retargetStorageTree()
+      .then((nodes) => {
+        if (alive) setNodesByScheme((prev) => ({ ...prev, folder: nodes }));
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [isAdmin]);
+
+  useEffect(() => {
     for (const scheme of schemes) {
       if (!scheme.key || nodesByScheme[scheme.key] || loadingSchemes.current.has(scheme.key)) continue;
       loadingSchemes.current.add(scheme.key);
@@ -635,6 +742,26 @@ export function RetargetManagePage() {
     }
   }, [schemes, nodesByScheme]);
 
+  const redoTier = (ruleId: string, title: string) => {
+    const ok = window.confirm(
+      `确定把「${title}」全部重新重定向吗？\n已有的 CSV 会在新结果写好后被覆盖，在此之前旧文件仍然保留。这一档的进度会从 0 重新计算。`,
+    );
+    if (!ok) return;
+    setRedoBusy(ruleId);
+    setPriorityError("");
+    api
+      .redoRetargetTier(ruleId)
+      .then((result) => {
+        setPriorityNote(result.message);
+        setRedoIds((prev) => (prev.includes(ruleId) ? prev : [...prev, ruleId]));
+      })
+      .catch((err: Error) => {
+        setPriorityError(err.message || "安排重做失败");
+      })
+      .finally(() => setRedoBusy(""));
+  };
+
+  const facetSchemes = [FOLDER_SCHEME, ...schemes];
   const dirty = JSON.stringify(rules) !== JSON.stringify(savedRules);
 
   const toggleRule = (id: string) => {
@@ -901,13 +1028,30 @@ export function RetargetManagePage() {
             : data?.seconds_per_job
               ? "本轮还没有新的完成速度，每档时间先按以往的速度估计，这一波结束后会改成实测。"
               : "每档时间会在扫描完成、并有速度样本后显示。"}
+          「本级全部重做」会把这一档已完成和失败的任务从头再跑，新的 CSV 写好后覆盖原来的文件。
         </p>
+        {priorityNote ? <div className="muted">{priorityNote}</div> : null}
+        {priorityError ? <div className="error">{priorityError}</div> : null}
         {rules.length ? (
-          <PriorityProgress rules={rules} queues={queues} countsReady={!dirty && sameRuleOrder(rules, queues)} />
+          <PriorityProgress
+            rules={rules}
+            queues={queues}
+            countsReady={!dirty && sameRuleOrder(rules, queues)}
+            onRedo={redoTier}
+            redoBusy={redoBusy}
+            redoIds={new Set(redoIds)}
+          />
         ) : queues.length ? (
           <ol className="retarget-queues">
             {queues.filter((queue) => queue.key !== "pinned").map((queue) => (
-              <QueueProgress key={queue.key} queue={queue} title={queue.title} rank={rankLabel(queue.rank)} />
+              <QueueProgress
+                key={queue.key}
+                queue={queue}
+                title={queue.title}
+                rank={rankLabel(queue.rank)}
+                onRedo={redoTier}
+                redoBusy={redoBusy}
+              />
             ))}
           </ol>
         ) : (
@@ -918,7 +1062,7 @@ export function RetargetManagePage() {
       <section className="card stack">
         <h2>调整优先级</h2>
         <p className="muted" style={{ margin: 0 }}>
-          每条规则同时指定机器人和数据范围，排在上面的先做。同一条规则里，机器人、包含的分类都按勾选顺序分先后：先点的先做，取消后再勾会排到最后。排除的分类不参与排序，会留到后面的规则。选其余数据时，会接住这些机器人里前面规则没选中的动作，机器人之间仍按勾选顺序。保存后，当前这一波结束就会按新顺序重新扫描。
+          每条规则同时指定机器人和数据范围，排在上面的先做。同一条规则里，机器人、包含的分类都按勾选顺序分先后：先点的先做，取消后再勾会排到最后。排除的分类不参与排序，会留到后面的规则。其余数据是这些机器人里没有被任何一档指定数据或指定分类点名的动作，那些档可以排在其余数据的上面或下面。保存后，当前这一波结束就会按新顺序重新扫描。
         </p>
         {priorityError ? <div className="error">{priorityError}</div> : null}
         {priorityNote ? <div className="muted">{priorityNote}</div> : null}
@@ -930,7 +1074,7 @@ export function RetargetManagePage() {
               <div className="retarget-rule-head" onClick={() => toggleRule(rule.id)}>
                 <div className="retarget-rule-summary">
                   <strong>第 {index + 1} 档</strong>
-                  <div className="muted">{rule.enabled ? ruleTitle(rule, earlier) : "已停用，不会参与排序"}</div>
+                  <div className="muted">{rule.enabled ? ruleTitle(rule, earlier, rules) : "已停用，不会参与排序"}</div>
                 </div>
                 <div className="row" onClick={(event) => event.stopPropagation()}>
                   <button type="button" className="secondary retarget-mini" disabled={index === 0} onClick={() => moveRule(index, -1)}>
@@ -1034,7 +1178,7 @@ export function RetargetManagePage() {
                     <div className="muted">包含这些分类。勾选父节点会带上全部下级，先勾的先做。多个维度要同时满足。</div>
                     <SchemeFacets
                       ranked
-                      schemes={schemes}
+                      schemes={facetSchemes}
                       nodesByScheme={nodesByScheme}
                       picks={rulePicks(rule, "include")}
                       onChange={(include_picks) => updateRule(rule.id, withPicks(rule, "include", include_picks))}
@@ -1043,7 +1187,7 @@ export function RetargetManagePage() {
                   <div>
                     <div className="muted">排除这些分类。勾选父节点会排除它的全部下级。</div>
                     <SchemeFacets
-                      schemes={schemes}
+                      schemes={facetSchemes}
                       nodesByScheme={nodesByScheme}
                       picks={rulePicks(rule, "exclude")}
                       onChange={(exclude_picks) => updateRule(rule.id, withPicks(rule, "exclude", exclude_picks))}
@@ -1051,7 +1195,7 @@ export function RetargetManagePage() {
                   </div>
                 </>
               ) : (
-                <div className="muted">这些机器人里，没有被更靠前的规则选中的动作会进到这一档。</div>
+                <div className="muted">这一档是这些机器人里、其他档没有点名的动作。指定数据或指定分类可以放在它下面，那些动作不会算进其余数据。</div>
               )}
                 </>
               )}
@@ -1124,7 +1268,7 @@ export function RetargetManagePage() {
           </button>
         </div>
         <p className="muted" style={{ margin: 0 }}>
-          没有被任何规则选中的机器人仍会重定向，排在所有规则后面。同一档里，开源数据和其他数据集会稍晚一些，小批次先做。
+          noetix_e2v2_1015、unitree_g1、noetix_e2 没被规则选中时，仍会排在最后继续重定向。新加入的机器人要在某一档勾选并保存后才会开始。同一档里，开源数据和其他数据集会稍晚一些，小批次先做。
         </p>
       </section>
 

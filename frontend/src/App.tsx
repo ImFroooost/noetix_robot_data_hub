@@ -5,6 +5,7 @@ import { LoginPage } from "./pages/LoginPage";
 import { RetargetManagePage } from "./pages/RetargetManagePage";
 import { TaxonomyManagePage } from "./pages/TaxonomyManagePage";
 import { UsersPage } from "./pages/UsersPage";
+import { AuditPage } from "./pages/AuditPage";
 import { RepositoryModelsPage } from "./pages/RepositoryModelsPage";
 import { StorageWorkspace } from "./components/StorageWorkspace";
 
@@ -41,6 +42,7 @@ export default function App() {
         <Route path="retarget" element={<RetargetManagePage />} />
         <Route path="robots" element={<RepositoryModelsPage />} />
         <Route path="users" element={<UsersPage />} />
+        <Route path="audit" element={<AuditPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

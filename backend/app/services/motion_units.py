@@ -1,13 +1,8 @@
-"""Fold a mocap folder into one data unit per clip.
+"""Fold an upload into one data unit per clip.
 
-Capture folders keep the same motion in ``bvh/``, ``fbx/``, ``npz/`` and so on.
-BVH names often add an actor and a ``_Skeleton`` suffix. A hub batch stores
-each clip once per format, under the shared clip name, the way
-``human/motion/<format>/<batch>/`` already does.
-
-Directories that only sort files by format, and a single wrapper around those
-directories, are not part of the unit. A real content tree such as
-``CMU/102/`` stays in the unit name.
+``plan_clip_units`` ignores directories. Each extension is stored in its own
+format directory, and files that share a clip name share one data unit.
+``plan_followed_paths`` keeps the uploaded directories.
 """
 
 from __future__ import annotations
@@ -119,6 +114,19 @@ def _content_dirs(rel: str, wrappers: set[tuple[str, ...]]) -> tuple[str, ...]:
     return tuple(kept)
 
 
+def _redundant_clip_dir(dirname: str, clip: str) -> bool:
+    """A folder that only renames one clip, plus an optional short take number, is not a content tree."""
+    if not dirname or not clip or not any(char.isalpha() for char in dirname):
+        return False
+    if clip == dirname:
+        return True
+    prefix = dirname + "_"
+    if not clip.startswith(prefix):
+        return False
+    extra = clip[len(prefix) :]
+    return extra.isdigit() and 1 <= len(extra) <= 4
+
+
 def _joinable(extra: str, longer_exts: set[str], shorter_exts: set[str]) -> bool:
     if not extra or "_" in extra:
         return False
@@ -199,45 +207,23 @@ def plan_followed_paths(
 
 
 def plan_clip_units(rel_paths: list[str]) -> dict[str, dict[str, str]]:
-    """Plan how each uploaded relative path is stored.
+    """Ignore every directory and group files by clip name.
 
-    ``skip`` is set for zip archives and ``temp/`` files. Otherwise
-    ``unit_name`` is the data-unit name, ``sub_path`` is empty when the
-    folder was only a format layout, and ``stored_name`` is the filename
-    written into the batch.
+    Used when the upload does not follow paths. Format stays out of the unit
+    path; storage writes each extension into its own format directory, and
+    files that share a clip name share one data unit.
     """
     rels = [_posix(rel) for rel in rel_paths if _posix(rel)]
-    wrappers = _wrapper_prefixes(rels)
-    located: list[tuple[str, tuple[str, ...], str, str]] = []
-    by_place: dict[tuple[str, ...], dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    keys: dict[str, set[str]] = defaultdict(set)
+    located: list[tuple[str, str]] = []
     for rel in rels:
         if _skip_reason(rel):
             continue
         name = PurePosixPath(rel).name
-        place = _content_dirs(rel, wrappers)
-        # The selected folder name is the batch, not part of the clip.
-        if place and all(
-            _content_dirs(other, wrappers)[:1] == place[:1]
-            for other in rels
-            if not _skip_reason(other)
-        ):
-            place = place[1:]
         key = clip_stem(name)
-        ext = _ext_key(name)
-        located.append((rel, place, key, ext))
-        by_place[place][key].add(ext)
-
-    # One shared directory left means a zip-extract wrapper, not a content tree.
-    nonempty = {place for place in by_place if place}
-    if len(nonempty) == 1:
-        relocated: list[tuple[str, tuple[str, ...], str, str]] = []
-        by_place = defaultdict(lambda: defaultdict(set))
-        for rel, _place, key, ext in located:
-            relocated.append((rel, (), key, ext))
-            by_place[()][key].add(ext)
-        located = relocated
-
-    canon_by_place = {place: _merge_actor_suffixes(keys) for place, keys in by_place.items()}
+        located.append((rel, key))
+        keys[key].add(_ext_key(name))
+    canon = _merge_actor_suffixes(keys)
     used: dict[tuple[str, str], int] = {}
     plan: dict[str, dict[str, str]] = {}
     for rel in rels:
@@ -246,20 +232,16 @@ def plan_clip_units(rel_paths: list[str]) -> dict[str, dict[str, str]]:
             plan[rel] = {"unit_name": "", "sub_path": "", "stored_name": "", "skip": reason}
             continue
         name = PurePosixPath(rel).name
-        place, key, _ext = next(item[1:] for item in located if item[0] == rel)
-        key = canon_by_place.get(place, {}).get(key, key)
+        key = next(item[1] for item in located if item[0] == rel)
+        clip = canon.get(key, key)
         suffix = _suffix(name)
-        sub_path = "/".join(place)
-        clip = key
-        unit = f"{sub_path.replace('/', '_')}_{clip}" if sub_path else clip
-        slot = (sub_path, clip, suffix.lower())
+        slot = (clip, suffix.lower())
         used[slot] = used.get(slot, 0) + 1
         if used[slot] > 1:
             clip = f"{clip}_{used[slot]}"
-            unit = f"{sub_path.replace('/', '_')}_{clip}" if sub_path else clip
         plan[rel] = {
-            "unit_name": unit,
-            "sub_path": sub_path,
+            "unit_name": clip,
+            "sub_path": "",
             "stored_name": f"{clip}{suffix}",
             "skip": "",
         }

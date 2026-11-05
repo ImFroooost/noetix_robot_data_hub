@@ -293,6 +293,8 @@ export interface StorageFile {
   channel: string;
   format: string;
   batch: string;
+  file_version?: string;
+  file_version_order?: number;
   robot_style?: string;
   robot_acquire_method?: string;
   uploader: StorageUploader | null;
@@ -310,6 +312,25 @@ export interface StorageFile {
 }
 
 export type MotionKind = "skeleton" | "object" | "merged";
+
+/** holosoma 把人体 FBX 放进机器人 CSV 世界时用的变换，见 backend/scripts/retarget_frames.py。 */
+export interface RetargetFrameSkeleton {
+  skeleton: string;
+  preserve_world: boolean;
+  /** 3x4，FBX 厘米世界坐标到重定向前的米制坐标。 */
+  affine: number[][];
+  floor_z: number;
+  height: number;
+  hips0: [number, number, number];
+  /** 30 Hz，地面和机器人缩放之前的髋部水平位置与面朝方向（弧度）。 */
+  track?: { hips_xy: [number, number][]; yaw: number[] };
+}
+
+export interface RetargetFrame {
+  path: string;
+  skeletons: RetargetFrameSkeleton[];
+  robot_heights: Record<string, number>;
+}
 
 export interface StorageAnnotation {
   quality?: string;
@@ -403,6 +424,17 @@ export interface StorageFileDetail extends StorageFile {
   batch_annotation?: StorageAnnotation;
 }
 
+export interface AuditLogRow {
+  id: number;
+  user_id: number | null;
+  username: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: number | null;
+  detail: Record<string, unknown>;
+  created_at: string;
+}
+
 export interface StorageUploader {
   id: number;
   username: string;
@@ -431,6 +463,7 @@ export interface StorageBatch {
   unit_count: number;
   file_count: number;
   units: StorageUnit[];
+  file_versions?: { name: string; order: number; created_at?: string }[];
   meta: Record<string, unknown>;
   uploaders: StorageUploader[];
   created_at?: string;
@@ -562,7 +595,6 @@ export interface Clip {
   action_name?: string;
   brief?: string;
   detail_def?: string;
-  action_version?: string;
   routine_label?: string;
   duel_label?: string;
   compute_level?: string;
@@ -598,7 +630,6 @@ export interface ClipListItem {
   description: string;
   action_code?: string;
   action_name?: string;
-  action_version?: string;
   tags: string[];
   duration_sec: number | null;
   sort_order?: number;

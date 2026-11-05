@@ -26,7 +26,15 @@ from typing import Any, BinaryIO
 
 from ..config import settings
 from .media_probe import probe_file, public_media
-from .unit_names import cluster_unit_names, normalize_unit_stem, stems_same_unit
+from .unit_names import (
+    FILE_VERSION_DIR,
+    ORIGINAL_FILE_VERSION,
+    cluster_unit_names,
+    file_version_from_path,
+    normalize_unit_stem,
+    split_file_version,
+    stems_same_unit,
+)
 from .zip_names import decode_zip_filename
 
 ProgressFn = Callable[[str, int, str], None]
@@ -38,6 +46,7 @@ MODALITIES = ("tpv_video", "fpv_video", "motion", "text", "audio", "log")
 FPV_CHANNELS = ("rgb", "depth")
 ROBOT_ACQUIRE_METHODS = ("omniretarget", "umr", "gmr")
 DEFAULT_ROBOT_ACQUIRE_METHOD = "omniretarget"
+MOTION_KINDS = ("skeleton", "object", "merged")
 MODEL_KINDS = {
     "human": ("fbx", "bvh", "smpl", "blend"),
     "robot": ("standard_description", "fbx", "blend"),
@@ -200,6 +209,23 @@ def safe_name(value: str, *, label: str = "名称") -> str:
     if not cleaned or cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
         raise ValueError(f"{label}无效")
     return cleaned
+
+
+def clean_motion_kind(value: str) -> str:
+    kind = str(value or "").strip().lower()
+    if kind in MOTION_KINDS:
+        return kind
+    return "skeleton"
+
+
+def clean_file_version(name: str) -> str:
+    """Return a storage version name. Empty and 「原版」 stay the original files."""
+    text = str(name or "").strip()
+    if not text or text == ORIGINAL_FILE_VERSION:
+        return ORIGINAL_FILE_VERSION
+    if text == FILE_VERSION_DIR or text.startswith(".") or len(text) > 80:
+        raise ValueError("文件版本名无效")
+    return preserved_segment(text, label="文件版本")
 
 
 def preserved_segment(value: str, *, label: str = "名称") -> str:
@@ -452,8 +478,25 @@ def parent_taxonomy_ids(
     return batch_tags, unit_tags
 
 
+def _ensure_path_motion_kind(record: dict[str, Any]) -> None:
+    """Keep the motion sub-kind on the file when the directory already says it."""
+    if str(record.get("modality") or "") != "motion":
+        return
+    kind = str(record.get("motion_kind") or "").strip().lower()
+    if kind not in MOTION_KINDS:
+        return
+    annotation = record.get("annotation")
+    if not isinstance(annotation, dict):
+        annotation = {}
+        record["annotation"] = annotation
+    stored = str(annotation.get("motion_kind") or "").strip().lower()
+    if stored not in MOTION_KINDS:
+        annotation["motion_kind"] = kind
+
+
 def _attach_own_file_tags(record: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
     record.update(_tag_fields((metadata.get("files") or {}).get(record["path"])))
+    _ensure_path_motion_kind(record)
     return record
 
 
@@ -700,6 +743,12 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
             idx += 1
         else:
             robot_acquire_method = DEFAULT_ROBOT_ACQUIRE_METHOD
+    motion_kind = ""
+    if modality == "motion":
+        if idx >= len(parts) or parts[idx] not in MOTION_KINDS:
+            return None
+        motion_kind = parts[idx]
+        idx += 1
     if modality == "fpv_video":
         if len(parts) < idx + 3 or parts[idx] not in FPV_CHANNELS:
             return None
@@ -710,9 +759,9 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
             return None
         channel, fmt, batch = "", parts[idx], parts[idx + 1]
         rest_start = idx + 2
-    # Everything after batch is sub_path + filename
-    remaining = parts[rest_start:]
-    if len(remaining) < 1:
+    # Everything after batch is an optional file version, then sub_path + filename.
+    file_version, remaining = split_file_version(parts[rest_start:])
+    if not remaining:
         return None
     sub_path = ""
     if len(remaining) > 1:
@@ -732,10 +781,82 @@ def _parse_data_file(path: Path, base: Path) -> dict[str, Any] | None:
         "robot_style": robot_style,
         "unit_name": unit_name,
         "sub_path": sub_path,
+        "file_version": file_version or ORIGINAL_FILE_VERSION,
     }
+    if motion_kind:
+        parsed["motion_kind"] = motion_kind
     if robot_acquire_method:
         parsed["robot_acquire_method"] = robot_acquire_method
     return _file_record(path, base, parsed)
+
+
+def _version_catalog(row: dict[str, Any] | None, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ordered file versions for one batch. 「原版」 is always first."""
+    versions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in (row or {}).get("file_versions") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        versions.append(
+            {
+                "name": name,
+                "order": int(item.get("order") or 0),
+                "created_at": str(item.get("created_at") or ""),
+            }
+        )
+    if ORIGINAL_FILE_VERSION not in seen:
+        versions.insert(
+            0,
+            {
+                "name": ORIGINAL_FILE_VERSION,
+                "order": 0,
+                "created_at": str((row or {}).get("created_at") or ""),
+            },
+        )
+        seen.add(ORIGINAL_FILE_VERSION)
+    extra = max((int(item["order"]) for item in versions), default=0)
+    for rec in files:
+        name = file_version_from_path(str(rec.get("path") or ""))
+        if name == ORIGINAL_FILE_VERSION:
+            stored = str(rec.get("file_version") or "").strip()
+            if stored:
+                name = stored
+        if not name or name in seen:
+            continue
+        extra += 1
+        versions.append({"name": name, "order": extra, "created_at": ""})
+        seen.add(name)
+    versions.sort(key=lambda item: (int(item["order"]), str(item["name"])))
+    return versions
+
+
+def _apply_file_versions(
+    files: list[dict[str, Any]], metadata: dict[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """Stamp file_version from the path and attach each batch's version list."""
+    by_batch: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for rec in files:
+        by_batch[str(rec.get("batch") or "")].append(rec)
+    listed: dict[str, list[dict[str, Any]]] = {}
+    batch_rows = metadata.get("batches") or {}
+    for batch in set(by_batch) | set(batch_rows):
+        row = batch_rows.get(batch) if isinstance(batch_rows.get(batch), dict) else {}
+        versions = _version_catalog(row, by_batch.get(batch, []))
+        listed[batch] = versions
+        orders = {str(item["name"]): int(item["order"]) for item in versions}
+        for rec in by_batch.get(batch, []):
+            name = file_version_from_path(str(rec.get("path") or ""))
+            if name == ORIGINAL_FILE_VERSION:
+                stored = str(rec.get("file_version") or "").strip()
+                if stored:
+                    name = stored
+            rec["file_version"] = name or ORIGINAL_FILE_VERSION
+            rec["file_version_order"] = int(orders.get(rec["file_version"], 0))
+    return listed
 
 
 def _assemble_data_index(
@@ -757,6 +878,7 @@ def _assemble_data_index(
             copied.append(item)
         files = copied
 
+    version_lists = _apply_file_versions(files, metadata)
     stems_by_batch: dict[str, list[str]] = defaultdict(list)
     for rec in files:
         stems_by_batch[rec["batch"]].append(rec["unit_name"])
@@ -824,6 +946,9 @@ def _assemble_data_index(
             "unit_count": len(units_by_batch.get(name, [])),
             "file_count": sum(u["file_count"] for u in units_by_batch.get(name, [])),
             "units": units_by_batch.get(name, []),
+            "file_versions": version_lists.get(name) or _version_catalog(
+                (metadata.get("batches") or {}).get(name), []
+            ),
             "meta": dict((metadata.get("batches") or {}).get(name) or {}),
             **_tag_fields((metadata.get("batches") or {}).get(name)),
             "uploaders": list(
@@ -1508,8 +1633,10 @@ def _overlay_metadata(
         own = _tag_fields((metadata.get("files") or {}).get(item.get("path")))
         item["annotation"] = own["annotation"]
         item["taxonomy_tag_ids"] = _as_tag_ids(own["taxonomy_tag_ids"])
+        _ensure_path_motion_kind(item)
         apply_csv_fps(item)
         files.append(item)
+    version_lists = _apply_file_versions(files, metadata)
     file_by_path = {item["path"]: item for item in files if item.get("path")}
 
     units: list[dict[str, Any]] = []
@@ -1571,6 +1698,7 @@ def _overlay_metadata(
                 "unit_count": len(batch_units),
                 "file_count": sum(unit["file_count"] for unit in batch_units),
                 "units": batch_units,
+                "file_versions": version_lists.get(name) or _version_catalog(row, []),
                 "meta": dict(row.get("meta") or source.get("meta") or {}),
                 **_tag_fields(row or source),
                 "uploaders": list(
@@ -1883,6 +2011,54 @@ def rebuild_catalog() -> dict[str, Any]:
         raise
 
 
+def register_file_version(batch: str, name: str) -> dict[str, Any]:
+    """Remember a named file version on an existing batch. 「原版」 stays order 0."""
+    batch = safe_name(batch, label="数据批次名")
+    version = clean_file_version(name)
+    if version == ORIGINAL_FILE_VERSION:
+        return {"name": version, "order": 0}
+    created: dict[str, Any] = {"name": version, "order": 0}
+
+    def mutate(data: dict[str, Any]) -> None:
+        row = data.setdefault("batches", {}).setdefault(batch, {"created_at": _now()})
+        versions = row.get("file_versions")
+        if not isinstance(versions, list):
+            versions = []
+            row["file_versions"] = versions
+        if not any(
+            isinstance(item, dict) and item.get("name") == ORIGINAL_FILE_VERSION
+            for item in versions
+        ):
+            versions.insert(
+                0,
+                {
+                    "name": ORIGINAL_FILE_VERSION,
+                    "order": 0,
+                    "created_at": row.get("created_at") or _now(),
+                },
+            )
+        found = next(
+            (
+                item
+                for item in versions
+                if isinstance(item, dict) and item.get("name") == version
+            ),
+            None,
+        )
+        if found:
+            created.clear()
+            created.update(found)
+            return
+        order = max(int(item.get("order") or 0) for item in versions if isinstance(item, dict)) + 1
+        entry = {"name": version, "order": order, "created_at": _now()}
+        versions.append(entry)
+        created.clear()
+        created.update(entry)
+
+    update_metadata(mutate)
+    return created
+
+
 def create_batch(name: str) -> dict[str, Any]:
     name = safe_name(name, label="数据批次名")
 
@@ -2143,6 +2319,66 @@ def update_batch_metadata(
     return found
 
 
+def _rename_stored_path(data: dict[str, Any], old: str, new: str) -> None:
+    """Point metadata rows at a file after it moves on disk."""
+    if old == new:
+        return
+    for key in ("files", "file_uploaders", "file_media"):
+        bucket = data.get(key)
+        if isinstance(bucket, dict) and old in bucket:
+            bucket[new] = bucket.pop(old)
+    for session in data.get("upload_sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        session["paths"] = [new if path == old else path for path in (session.get("paths") or [])]
+
+
+def _move_motion_file(record: dict[str, Any], kind: str) -> str:
+    dest = data_destination(
+        ontology=str(record.get("ontology") or ""),
+        modality="motion",
+        channel=str(record.get("channel") or ""),
+        fmt=str(record.get("format") or ""),
+        batch=str(record.get("batch") or ""),
+        filename=str(record.get("name") or ""),
+        robot_style=str(record.get("robot_style") or ""),
+        robot_acquire_method=str(record.get("robot_acquire_method") or ""),
+        sub_path=str(record.get("sub_path") or ""),
+        file_version=str(record.get("file_version") or ""),
+        motion_kind=kind,
+    )
+    new_rel = dest.relative_to(root()).as_posix()
+    old_rel = str(record.get("path") or "")
+    if new_rel == old_rel:
+        return old_rel
+    src = resolve_repo_file(old_rel)
+    if dest.exists():
+        raise ValueError(f"目标路径已有文件：{new_rel}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(src, dest)
+
+    def mutate(data):
+        _rename_stored_path(data, old_rel, new_rel)
+
+    update_metadata(mutate)
+    refresh_catalog_paths([old_rel, new_rel])
+    return new_rel
+
+
+def _maybe_move_motion_kind(rel_path: str, annotation: dict[str, Any] | None) -> str:
+    if not annotation or "motion_kind" not in annotation:
+        return rel_path
+    kind = str(annotation.get("motion_kind") or "").strip().lower()
+    if kind not in MOTION_KINDS:
+        return rel_path
+    record = inspect_data_file(rel_path)
+    if not record or record.get("modality") != "motion":
+        return rel_path
+    if record.get("motion_kind") == kind:
+        return rel_path
+    return _move_motion_file(record, kind)
+
+
 def update_files_annotation(paths: list[str], annotation: dict[str, Any]) -> None:
     if not paths or not annotation:
         return
@@ -2154,6 +2390,9 @@ def update_files_annotation(paths: list[str], annotation: dict[str, Any]) -> Non
             _merge_tag_updates(row, annotation=annotation)
 
     update_metadata(mutate)
+    if "motion_kind" in annotation:
+        for path in paths:
+            _maybe_move_motion_kind(path, annotation)
 
 
 def update_file_metadata(
@@ -2176,9 +2415,10 @@ def update_file_metadata(
         )
 
     update_metadata(mutate)
-    updated = inspect_data_file(rel_path)
+    moved = _maybe_move_motion_kind(record["path"], annotation)
+    updated = inspect_data_file(moved)
     if updated is None:
-        raise FileNotFoundError(rel_path)
+        raise FileNotFoundError(moved)
     return updated
 
 
@@ -2193,6 +2433,8 @@ def data_destination(
     robot_style: str = "",
     robot_acquire_method: str = "",
     sub_path: str = "",
+    file_version: str = "",
+    motion_kind: str = "",
 ) -> Path:
     if ontology not in ONTOLOGIES:
         raise ValueError("本体须为 human 或 robot")
@@ -2214,8 +2456,17 @@ def data_destination(
         if method not in ROBOT_ACQUIRE_METHODS:
             raise ValueError("机器人数据获取方式须为 omniretarget、umr 或 gmr")
         parts.append(method)
+    if modality == "motion":
+        kind = str(motion_kind or "").strip().lower()
+        if kind not in MOTION_KINDS:
+            kind = "skeleton"
+        parts.append(kind)
     parts.append(fmt)
     parts.append(batch)
+    version = clean_file_version(file_version)
+    if version != ORIGINAL_FILE_VERSION:
+        parts.append(FILE_VERSION_DIR)
+        parts.append(version)
     if sub_path:
         for seg in sub_path.replace("\\", "/").split("/"):
             if not seg or seg == ".":
@@ -2544,6 +2795,8 @@ def save_data_file(
     robot_style: str = "",
     robot_acquire_method: str = "",
     sub_path: str = "",
+    file_version: str = "",
+    motion_kind: str = "",
     preserve_tree: bool = False,
 ) -> dict[str, Any]:
     if preserve_tree:
@@ -2570,6 +2823,8 @@ def save_data_file(
         robot_style=robot_style,
         robot_acquire_method=robot_acquire_method,
         sub_path=sub_path,
+        file_version=file_version,
+        motion_kind=motion_kind,
     )
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and not replace:
@@ -2888,6 +3143,33 @@ def _file_robot_style(record: dict[str, Any], unit: dict[str, Any] | None = None
     return ""
 
 
+def _archive_motion_kind(record: dict[str, Any]) -> str:
+    kind = str(((record.get("annotation") or {}).get("motion_kind") or "")).strip().lower()
+    if kind in {"skeleton", "object", "merged"}:
+        return kind
+    return "skeleton"
+
+
+def _archive_kind_matches(record: dict[str, Any], kinds: list[tuple]) -> bool:
+    rec_fmt = str(record.get("format") or "").lower()
+    rec_motion = (
+        _archive_motion_kind(record)
+        if str(record.get("modality") or "") == "motion"
+        else ""
+    )
+    for item in kinds:
+        if (record.get("ontology"), record.get("modality")) != (item[0], item[1]):
+            continue
+        fmt = str(item[2] or "").lower() if len(item) > 2 and item[2] else ""
+        if fmt and fmt != rec_fmt:
+            continue
+        motion = str(item[3] or "").strip().lower() if len(item) > 3 and item[3] else ""
+        if motion and str(record.get("modality") or "") == "motion" and motion != rec_motion:
+            continue
+        return True
+    return False
+
+
 def collect_archive_entries(
     *,
     batches: list[str] | None = None,
@@ -2902,15 +3184,7 @@ def collect_archive_entries(
         unit_key(preserved_segment(batch, label="数据批次名"), preserved_segment(name, label="数据单元名"))
         for batch, name in units or []
     }
-    wanted_any: set[tuple[str, str]] = set()
-    wanted_formats: set[tuple[str, str, str]] = set()
-    for item in kinds or []:
-        ontology, modality = item[0], item[1]
-        fmt = str(item[2] or "").lower() if len(item) > 2 else ""
-        if fmt:
-            wanted_formats.add((ontology, modality, fmt))
-        else:
-            wanted_any.add((ontology, modality))
+    wanted_kinds = list(kinds or [])
     wanted_robot_styles = (
         None if robot_styles is None else {str(style) for style in robot_styles}
     )
@@ -2924,11 +3198,8 @@ def collect_archive_entries(
         key = unit_key(rec["batch"], rec["unit_name"])
         if rec["batch"] not in wanted_batches and key not in wanted_units:
             continue
-        if wanted_any or wanted_formats:
-            rec_fmt = str(rec.get("format") or "").lower()
-            kind = (rec["ontology"], rec["modality"])
-            if kind not in wanted_any and (*kind, rec_fmt) not in wanted_formats:
-                continue
+        if wanted_kinds and not _archive_kind_matches(rec, wanted_kinds):
+            continue
         if wanted_robot_styles is not None and rec.get("ontology") == "robot":
             style = _file_robot_style(rec, unit_by_key.get(key))
             if style not in wanted_robot_styles:
@@ -2983,6 +3254,21 @@ def _unwrap_single_directory(path: Path) -> Path:
             current = children[0]
             continue
         return current
+
+
+def _checked_default_description(source_dir: Path, chosen: str) -> str:
+    rel = chosen.replace("\\", "/").strip().lstrip("/")
+    if not rel or ".." in Path(rel).parts:
+        raise ValueError("请选择默认描述文件")
+    path = (source_dir / rel).resolve()
+    root_dir = source_dir.resolve()
+    if path != root_dir and root_dir not in path.parents:
+        raise ValueError("默认描述文件不在上传内容中")
+    if not path.is_file():
+        raise ValueError("默认描述文件不在上传内容中")
+    if path.suffix.lower() not in {".urdf", ".xacro", ".xml"}:
+        raise ValueError("默认描述文件须为 URDF、Xacro 或 MJCF XML")
+    return path.relative_to(root_dir).as_posix()
 
 
 def validate_standard_description(path: Path) -> dict[str, int]:
@@ -3071,6 +3357,7 @@ def save_model_upload(
     instance: str,
     kind: str,
     filename: str,
+    default_description_file: str = "",
 ) -> dict[str, Any]:
     if ontology not in ONTOLOGIES:
         raise ValueError("模型类型须为 human 或 robot")
@@ -3080,13 +3367,17 @@ def save_model_upload(
     destination = root() / "3d_model" / ontology / kind / instance
     if kind == "standard_description":
         if Path(filename).suffix.lower() != ".zip":
-            raise ValueError("standard_description 请上传包含 meshes/mjcf/urdf 的 zip 文件夹")
+            raise ValueError("standard_description 请上传包含 meshes 与 urdf 的 zip 文件夹")
         with tempfile.TemporaryDirectory(
             prefix="standard_description_", dir=root() / "index"
         ) as temp_name:
             temp = Path(temp_name)
             _safe_extract_zip(source, temp)
             source_dir = _unwrap_single_directory(temp)
+            default_rel = _checked_default_description(source_dir, default_description_file)
+            from .robot_retarget_profile import fill_missing_mjcf
+
+            generated_files = fill_missing_mjcf(source_dir, default_rel)
             counts = validate_standard_description(source_dir)
             create_model_instance(ontology, instance)
             if destination.exists():
@@ -3094,11 +3385,27 @@ def save_model_upload(
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(source_dir, destination)
         reindex_model_instance(ontology, instance)
+        update_model_instance_meta(
+            ontology, instance, {"default_description_file": default_rel}
+        )
+        ready = False
+        profile_error = ""
+        if default_rel.lower().endswith((".urdf", ".xacro")):
+            try:
+                from .robot_retarget_profile import write_uploaded_profile
+
+                ready, profile_error = write_uploaded_profile(root(), instance, default_rel)
+            except Exception as exc:
+                ready, profile_error = False, str(exc)
         return {
             "ontology": ontology,
             "instance": instance,
             "kind": kind,
             "validation": counts,
+            "default_description_file": default_rel,
+            "generated_files": generated_files,
+            "retarget_profile_ready": ready,
+            "retarget_profile_error": profile_error,
         }
     create_model_instance(ontology, instance)
     destination.mkdir(parents=True, exist_ok=True)

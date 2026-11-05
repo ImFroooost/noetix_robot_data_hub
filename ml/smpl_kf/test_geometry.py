@@ -134,7 +134,8 @@ def test_key_frame_sampling():
         counts.append(len(keys))
     counts = np.asarray(counts)
     check(0.04 < float(np.mean(counts == 0)) < 0.18, "不给关键帧的比例不对")
-    check(float(np.mean(counts >= 5)) > 0.35, "每 0.5–1 秒一帧的比例不够")
+    check(float(np.mean(counts >= 4)) > 0.3, "密集关键帧的比例不够")
+    check(float(np.mean((counts >= 1) & (counts <= 4))) > 0.25, "稀疏关键帧太少")
 
 
 def test_motion_encode_decode_and_keys():
@@ -186,6 +187,22 @@ def test_dataset_batch():
         check(60 <= x.shape[1] <= 120, "批次长度不在范围内")
         check(bool(torch_all_finite(x)), "批次里有 NaN")
         check(float((mask * (1 - valid)).abs().sum()) == 0, "填充帧上有约束")
+
+
+def test_glitch_marking():
+    from smpl_kf.clean import BAD_PAD, bad_frames
+
+    frames = 120
+    aa = np.zeros((frames, AA_DIM), np.float32)
+    aa[:, 16 * 3 + 2] = np.linspace(0.0, 0.8, frames)
+    trans = np.stack((np.linspace(0, 2, frames), np.full(frames, 0.9), np.zeros(frames)), axis=1).astype(np.float32)
+    feat = motion_to_feat(aa, trans)
+    check(not bad_frames(feat).any(), "平滑动作被标成了跳变")
+    glitch = np.array(aa, copy=True)
+    glitch[60:65, 16 * 3 : 16 * 3 + 3] = [0.0, 0.0, 2.8]
+    bad = bad_frames(motion_to_feat(glitch, trans))
+    check(bool(bad[60:65].all()), "跳出去的那几帧没标上")
+    check(not bad[: 59 - BAD_PAD].any() and not bad[66 + BAD_PAD :].any(), "标记超出了跳变附近")
 
 
 def torch_all_finite(tensor) -> bool:
@@ -341,6 +358,7 @@ def main():
     test_motion_encode_decode_and_keys()
     test_mirror_and_resample()
     test_dataset_batch()
+    test_glitch_marking()
     test_windows_cover_the_span()
     test_interpolate_and_metrics()
     test_align_z_up_and_restore()

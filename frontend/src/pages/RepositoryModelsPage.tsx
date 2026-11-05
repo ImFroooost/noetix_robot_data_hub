@@ -3,10 +3,10 @@ import { api, downloadAuth } from "../api";
 import { useAuth } from "../auth";
 import { FolderDropZone } from "../components/FolderDropZone";
 import { ModelFilePreview, modelPreviewKind } from "../components/ModelFilePreview";
-import type { ModelInstance, ModelRepositoryOverview } from "../types";
+import { ROLE_CAPABILITIES, type ModelInstance, type ModelRepositoryOverview } from "../types";
 import { INDEX_UPDATED_EVENT } from "../storageOverviewCache";
 import { useUndo } from "../undo/UndoContext";
-import { zipRelFiles, type RelFile } from "../utils/folderUpload";
+import { descriptionCandidates, listZipEntryNames, zipRelFiles, type RelFile } from "../utils/folderUpload";
 
 function defaultDescriptionFile(instance: ModelInstance | null) {
   if (!instance) return null;
@@ -40,6 +40,9 @@ export function RepositoryModelsPage() {
   const [folderFiles, setFolderFiles] = useState<RelFile[]>([]);
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [zipFile, setZipFile] = useState<File | null>(null);
+  const [defaultOptions, setDefaultOptions] = useState<string[]>([]);
+  const [defaultFile, setDefaultFile] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -95,6 +98,9 @@ export function RepositoryModelsPage() {
     setSelectedKey(data?.instances.find((item) => item.ontology === next)?.key || null);
     setFile(null);
     setFolderFiles([]);
+    setZipFile(null);
+    setDefaultOptions([]);
+    setDefaultFile("");
     setPreviewId(null);
   };
 
@@ -120,6 +126,38 @@ export function RepositoryModelsPage() {
     }
   };
 
+  useEffect(() => {
+    if (kind !== "standard_description") return;
+    let cancel = false;
+    const loadOptions = async () => {
+      try {
+        const paths = folderFiles.length
+          ? folderFiles.map((item) => item.path)
+          : zipFile
+            ? await listZipEntryNames(zipFile)
+            : [];
+        if (cancel) return;
+        const options = descriptionCandidates(paths);
+        setDefaultOptions(options);
+        setDefaultFile((current) =>
+          options.includes(current) ? current : options.length === 1 ? options[0] : ""
+        );
+        if ((folderFiles.length || zipFile) && !options.length) {
+          setError("没有找到 URDF 或 XML，无法选择默认描述文件");
+        }
+      } catch (err) {
+        if (cancel) return;
+        setDefaultOptions([]);
+        setDefaultFile("");
+        setError(err instanceof Error ? err.message : "读取压缩包失败");
+      }
+    };
+    void loadOptions();
+    return () => {
+      cancel = true;
+    };
+  }, [folderFiles, zipFile, kind]);
+
   const upload = async () => {
     if (!selected || !kind) {
       setError("请先选择或创建模型实例");
@@ -130,11 +168,18 @@ export function RepositoryModelsPage() {
     setMessage("");
     try {
       let uploadFile = file;
-      if (kind === "standard_description" && folderFiles.length) {
-        const blob = await zipRelFiles(folderFiles);
-        uploadFile = new File([blob], `${selected.name}_standard_description.zip`, {
-          type: "application/zip",
-        });
+      if (kind === "standard_description") {
+        if (!defaultFile) {
+          setError("请选择默认描述文件");
+          return;
+        }
+        if (zipFile) uploadFile = zipFile;
+        else if (folderFiles.length) {
+          const blob = await zipRelFiles(folderFiles);
+          uploadFile = new File([blob], `${selected.name}_standard_description.zip`, {
+            type: "application/zip",
+          });
+        }
       }
       if (!uploadFile) {
         setError(
@@ -149,6 +194,7 @@ export function RepositoryModelsPage() {
       form.set("instance", selected.name);
       form.set("kind", kind);
       form.set("file", uploadFile);
+      if (kind === "standard_description") form.set("default_description_file", defaultFile);
       let uploadedPath = "";
       await execute({
         label: `上传模型到 ${selected.name}`,
@@ -156,14 +202,29 @@ export function RepositoryModelsPage() {
           const result = (await api.storageUploadModel(form)) as {
             validation?: Record<string, number>;
             path?: string;
+            default_description_file?: string;
+            generated_files?: string[];
+            retarget_profile_ready?: boolean;
+            retarget_profile_error?: string;
           };
           uploadedPath = result.path || "";
           await load();
           setFile(null);
           setFolderFiles([]);
+          setZipFile(null);
+          setDefaultOptions([]);
+          setDefaultFile("");
+          const generatedNote = result.generated_files?.length
+            ? `。已自动生成 ${result.generated_files.join("、")}`
+            : "";
+          const profileNote = result.retarget_profile_error
+            ? `。重定向配置未生成：${result.retarget_profile_error}`
+            : result.retarget_profile_ready
+              ? "。已生成重定向配置，在重定向优先级里勾选该机器人后即可运行"
+              : "";
           setMessage(
             result.validation
-              ? `标准描述结构校验通过：meshes ${result.validation.meshes}，mjcf ${result.validation.mjcf}，urdf ${result.validation.urdf}`
+              ? `标准描述已上传，默认文件为 ${result.default_description_file || defaultFile}${generatedNote}${profileNote}`
               : "模型文件已上传"
           );
         },
@@ -295,7 +356,7 @@ export function RepositoryModelsPage() {
                 <section className="card stack storage-model-files">
                   <h3 style={{ margin: 0 }}>{KIND_LABEL[kind] || kind}</h3>
                   <p className="muted" style={{ margin: 0 }}>
-                    点击文件即可在右侧预览网格、URDF、MJCF、FBX 或 BVH
+                    点击文件即可在右侧查看。描述文件可以在「可视化」和「代码」之间切换。
                   </p>
                   {selected.files
                     .filter((item) => item.kind === kind)
@@ -329,13 +390,17 @@ export function RepositoryModelsPage() {
                             onClick={async (event) => {
                               event.stopPropagation();
                               try {
-                                await api.storageUpdateModelInstance(
+                                const updated = (await api.storageUpdateModelInstance(
                                   selected.ontology,
                                   selected.name,
                                   { default_description_file: item.relative_path }
-                                );
+                                )) as { retarget_profile_error?: string };
                                 await load();
-                                setMessage(`已将 ${item.name} 设为默认描述文件`);
+                                setMessage(
+                                  updated.retarget_profile_error
+                                    ? `已将 ${item.name} 设为默认描述文件。重定向配置未生成：${updated.retarget_profile_error}`
+                                    : `已将 ${item.name} 设为默认描述文件`
+                                );
                               } catch (e) {
                                 setError(e instanceof Error ? e.message : "设置失败");
                               }
@@ -403,16 +468,15 @@ export function RepositoryModelsPage() {
                   )}
                 </section>
                 <section className="card stack storage-model-preview">
-                  <h3 style={{ margin: 0 }}>可视化</h3>
                   {previewFile && selected ? (
-                    <>
-                      <span className="muted">{previewFile.relative_path}</span>
-                      <ModelFilePreview file={previewFile} instance={selected} />
-                    </>
+                    <ModelFilePreview file={previewFile} instance={selected} />
                   ) : (
-                    <div className="storage-preview-empty">
-                      请在左侧选择一个模型文件进行可视化
-                    </div>
+                    <>
+                      <h3 style={{ margin: 0 }}>可视化</h3>
+                      <div className="storage-preview-empty">
+                        请在左侧选择一个模型文件进行可视化
+                      </div>
+                    </>
                   )}
                 </section>
               </div>
@@ -423,21 +487,38 @@ export function RepositoryModelsPage() {
                   {kind === "standard_description" ? (
                     <>
                       <div className="storage-standard-help">
-                        必须严格包含以下三级目录，系统会在写入前检查：
-                        <pre>{`${selected.name}/\n├── meshes/   （网格文件）\n├── mjcf/     （至少一个 XML）\n└── urdf/     （至少一个 URDF）`}</pre>
+                        需包含 meshes 和 urdf。mjcf 若缺失或为空，会按所选 URDF 自动生成并保存：
+                        <pre>{`${selected.name}/\n├── meshes/   （网格文件）\n├── mjcf/     （可留空，将按 URDF 自动生成）\n└── urdf/     （至少一个 URDF）`}</pre>
                       </div>
                       <FolderDropZone
-                        onFiles={setFolderFiles}
+                        allowZip
+                        onFiles={(files) => {
+                          setZipFile(null);
+                          setFolderFiles(files);
+                          setError("");
+                        }}
+                        onZip={(zip) => {
+                          setFolderFiles([]);
+                          setZipFile(zip);
+                          setError("");
+                        }}
                         disabled={busy}
-                        hint="拖入或选择 standard_description 文件夹"
+                        hint="需包含 meshes 和 urdf，mjcf 可自动生成"
                       />
                       <label>
-                        或上传 zip
-                        <input
-                          type="file"
-                          accept=".zip,application/zip"
-                          onChange={(e) => setFile(e.target.files?.[0] || null)}
-                        />
+                        默认描述文件
+                        <select
+                          value={defaultFile}
+                          onChange={(event) => setDefaultFile(event.target.value)}
+                          disabled={busy || !defaultOptions.length}
+                        >
+                          <option value="">请选择 URDF 或 MJCF</option>
+                          {defaultOptions.map((item) => (
+                            <option key={item} value={item}>
+                              {item}
+                            </option>
+                          ))}
+                        </select>
                       </label>
                     </>
                   ) : (
@@ -449,7 +530,11 @@ export function RepositoryModelsPage() {
                       />
                     </label>
                   )}
-                  <button type="button" disabled={busy} onClick={() => void upload()}>
+                  <button
+                    type="button"
+                    disabled={busy || (kind === "standard_description" && !defaultFile)}
+                    onClick={() => void upload()}
+                  >
                     {busy ? "检查并上传中…" : "检查结构并上传"}
                   </button>
                 </section>

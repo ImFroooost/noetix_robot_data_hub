@@ -162,6 +162,8 @@ export function TaxonomyTagPicker({
   onNodesReload,
   disabled,
   inherited,
+  placeholders,
+  readOnly,
 }: {
   schemes: TaxonomySchemeDef[];
   nodes: TaxonomyNode[];
@@ -171,6 +173,8 @@ export function TaxonomyTagPicker({
   onNodesReload?: () => Promise<void> | void;
   disabled?: boolean;
   inherited?: Record<string, string>;
+  placeholders?: Record<string, string>;
+  readOnly?: boolean;
 }) {
   const history = useUndoOptional();
   const [openKey, setOpenKey] = useState<string | null>(null);
@@ -248,16 +252,22 @@ export function TaxonomyTagPicker({
         const open = openKey === scheme.key;
         const ownSummary = summaryOf(picked, schemeNodes);
         const inheritedText = !ownSummary ? inherited?.[scheme.key] || "" : "";
-        const summary = ownSummary || (inheritedText ? `沿用 ${inheritedText}` : "");
+        const placeholderText =
+          !ownSummary && !inheritedText ? placeholders?.[scheme.key] || "" : "";
+        const summary =
+          ownSummary || (inheritedText ? `沿用 ${inheritedText}` : placeholderText);
         return (
           <TagChip
             key={scheme.key}
             label={taxonomySchemeLabel(scheme.key, schemes)}
             summary={summary}
             picked={picked.length > 0}
-            open={open}
+            mixed={!!placeholderText}
+            open={open && !readOnly}
             disabled={disabled}
+            readOnly={readOnly}
             onToggle={() => {
+              if (readOnly) return;
               setLocalError("");
               setOpenKey((current) => (current === scheme.key ? null : scheme.key));
             }}
@@ -286,16 +296,20 @@ function TagChip({
   label,
   summary,
   picked,
+  mixed,
   open,
   disabled,
+  readOnly,
   onToggle,
   children,
 }: {
   label: string;
   summary: string;
   picked: boolean;
+  mixed?: boolean;
   open: boolean;
   disabled?: boolean;
+  readOnly?: boolean;
   onToggle: () => void;
   children: ReactNode;
 }) {
@@ -334,13 +348,13 @@ function TagChip({
       <button
         ref={anchorRef}
         type="button"
-        className={`facet-chip${open ? " is-open" : ""}${picked ? " is-picked" : ""}`}
+        className={`facet-chip${open ? " is-open" : ""}${picked ? " is-picked" : ""}${mixed ? " is-mixed" : ""}${readOnly ? " is-readonly" : ""}`}
         disabled={disabled}
         onClick={onToggle}
       >
         <span>{label}</span>
         {summary && <span className="facet-summary">{summary}</span>}
-        <span className="facet-chevron">{open ? "▴" : "▾"}</span>
+        {!readOnly && <span className="facet-chevron">{open ? "▴" : "▾"}</span>}
       </button>
       {open && box && (
         <div
