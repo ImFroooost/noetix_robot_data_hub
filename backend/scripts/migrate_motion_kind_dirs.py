@@ -21,7 +21,7 @@ from app.services.unit_names import normalize_unit_stem, split_file_version  # n
 HUB = ROOT / "data" / "hub_repo"
 KINDS = ("skeleton", "object", "merged")
 KIND_SET = set(KINDS)
-ACQUIRE = {"omniretarget", "umr", "gmr"}
+ACQUIRE = {"omniretarget", "umr", "gmr", "frax"}
 PATH_RE = re.compile(
     r'"(data/(?:human/motion|robot/[^"]+/motion)/[^"]*)"'
 )

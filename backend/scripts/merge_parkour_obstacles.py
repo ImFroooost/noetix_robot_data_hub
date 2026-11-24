@@ -184,8 +184,10 @@ def convert_file(src: Path, dst: Path, size: tuple[float, float, float], track) 
 
 
 def main() -> None:
-    fbx_dir = HUB / "data" / "human" / "motion" / "fbx" / BATCH
-    csv_dir = HUB / "data" / "human" / "motion" / "csv" / BATCH
+    fbx_dir = HUB / "data" / "human" / "motion" / "skeleton" / "fbx" / BATCH
+    csv_dir = HUB / "data" / "human" / "motion" / "skeleton" / "csv" / BATCH
+    out_dir = HUB / "data" / "human" / "motion" / "merged" / "fbx" / BATCH
+    out_dir.mkdir(parents=True, exist_ok=True)
     stems = []
     for path in sorted(fbx_dir.glob("*.fbx")):
         if path.stem.endswith("_merged"):
@@ -202,7 +204,7 @@ def main() -> None:
         assert size is not None
         src = fbx_dir / f"{stem}.fbx"
         csv_path = csv_dir / f"{stem}.csv"
-        dst = fbx_dir / f"{stem}_merged.fbx"
+        dst = out_dir / f"{stem}.fbx"
         if not csv_path.is_file():
             print(f"缺少 csv {stem}", flush=True)
             continue

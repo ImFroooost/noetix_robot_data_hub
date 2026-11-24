@@ -10,7 +10,9 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
 import { api, fetchJsonAuth } from "../api";
 import { fetchAuth, fetchRepoMesh, normalizeRepoPath } from "../utils/repoMesh";
+import { isFbxFileName } from "../utils/zstdFbx";
 import { AnimationFormatPreview } from "./AnimationFormatPreview";
+import { NameToggleButtons, SceneNameLabels, useNameFlags } from "./NameLabels";
 import { ViewerSceneChrome } from "./ViewerSceneChrome";
 import type { ModelInstance, ModelInstanceFile } from "../types";
 
@@ -43,7 +45,7 @@ export function modelPreviewKind(file: {
   if (ext === "ply") return "ply";
   if (ext === "dae") return "dae";
   if (ext === "gltf" || ext === "glb") return "gltf";
-  if (ext === "fbx") return "fbx";
+  if (ext === "fbx" || isFbxFileName(file.name)) return "fbx";
   if (ext === "bvh") return "bvh";
   if (ext === "urdf") return "urdf";
   if (ext === "mjcf" || rel.includes("/mjcf/") || rel.startsWith("mjcf/")) return "mjcf";
@@ -183,9 +185,11 @@ function FittedModel({
   rotateZUp: boolean;
 }) {
   const wrapped = useMemo(() => wrapForView(object, rotateZUp), [object, rotateZUp]);
+  const [names] = useNameFlags();
   return (
     <>
       <primitive object={wrapped} />
+      <SceneNameLabels root={wrapped} names={names} />
       <FrameToObject object={wrapped} />
     </>
   );
@@ -594,6 +598,9 @@ function ModelPreviewCanvas({
         {children}
         <OrbitControls makeDefault />
       </Canvas>
+      <div className="playback-controls animation-format-controls">
+        <NameToggleButtons />
+      </div>
     </div>
   );
 }

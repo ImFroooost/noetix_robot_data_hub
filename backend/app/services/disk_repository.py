@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
 import time
 import uuid
@@ -25,6 +27,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from ..config import settings
+from .file_lock import locked
 from .media_probe import probe_file, public_media
 from .unit_names import (
     FILE_VERSION_DIR,
@@ -44,7 +47,7 @@ DEFAULT_CSV_FPS = 30.0
 ONTOLOGIES = ("human", "robot")
 MODALITIES = ("tpv_video", "fpv_video", "motion", "text", "audio", "log")
 FPV_CHANNELS = ("rgb", "depth")
-ROBOT_ACQUIRE_METHODS = ("omniretarget", "umr", "gmr")
+ROBOT_ACQUIRE_METHODS = ("omniretarget", "umr", "gmr", "frax")
 DEFAULT_ROBOT_ACQUIRE_METHOD = "omniretarget"
 MOTION_KINDS = ("skeleton", "object", "merged")
 MODEL_KINDS = {
@@ -257,13 +260,18 @@ def _write_json(path: Path, data: dict[str, Any], *, compact: bool = False) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(data)
     payload["updated_at"] = _now()
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Unique name: the retarget loop writes the same catalog, and a shared
+    # ``repository.json.tmp`` makes one replace delete the other's temp file.
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     if compact:
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     else:
         text = json.dumps(payload, ensure_ascii=False, indent=2)
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _invalidate_overlay_cache() -> None:
@@ -319,11 +327,15 @@ def read_metadata() -> dict[str, Any]:
 
 
 def update_metadata(mutator) -> dict[str, Any]:
-    with _INDEX_LOCK:
+    # The file lock also covers the retarget loop on the host, which rewrites
+    # the same file. read_metadata() re-reads when the file changed on disk, so
+    # the change is applied to the newest copy.
+    with _INDEX_LOCK, locked(metadata_path()):
         data = read_metadata()
         mutator(data)
         data["version"] = int(data.get("version") or 1) + 1
-        _write_json(metadata_path(), data)
+        # Compact: the file is over 100 MB and is rewritten on every save.
+        _write_json(metadata_path(), data, compact=True)
         global _metadata_cache, _metadata_mtime, _browse_force_sync, _local_write_gen
         _metadata_cache = None
         _metadata_mtime = None
@@ -1147,12 +1159,15 @@ def _write_catalog_delta_unlocked(delta: dict[str, Any]) -> None:
             pass
         return
     payload = {"version": 1, "updated_at": _now(), **{key: delta.get(key) or [] for key in _DELTA_LIST_KEYS}}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _clear_catalog_delta_unlocked() -> None:
@@ -1620,6 +1635,86 @@ def _copy_file_row(rec: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _union_tag_ids(left: Any, right: Any) -> dict[str, Any]:
+    combined: dict[str, list[Any]] = {}
+    for source in (left or {}, right or {}):
+        if not isinstance(source, dict):
+            continue
+        for scheme, value in source.items():
+            values = value if isinstance(value, list) else [value]
+            bucket = combined.setdefault(str(scheme), [])
+            for item in values:
+                if item not in bucket:
+                    bucket.append(item)
+    return {
+        scheme: values[0] if len(values) == 1 else values
+        for scheme, values in combined.items()
+        if values
+    }
+
+
+def _merge_equivalent_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join units whose names differ only by spaces and underscores."""
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for unit in units:
+        batch = str(unit.get("batch") or "")
+        raw_name = str(unit.get("name") or "")
+        canon = normalize_unit_stem(raw_name) or raw_name
+        key = (batch, canon)
+        aliases = [
+            name
+            for name in [canon, raw_name, *(unit.get("alias_names") or [])]
+            if name
+        ]
+        if key not in grouped:
+            item = dict(unit)
+            item["name"] = canon
+            item["key"] = unit_key(batch, canon)
+            item["alias_names"] = list(dict.fromkeys(aliases))
+            item["files"] = list(unit.get("files") or [])
+            grouped[key] = item
+            order.append(key)
+            continue
+        dest = grouped[key]
+        seen = {rec.get("path") for rec in dest["files"]}
+        for rec in unit.get("files") or []:
+            path = rec.get("path")
+            if path in seen:
+                continue
+            dest["files"].append(rec)
+            seen.add(path)
+        dest["alias_names"] = list(
+            dict.fromkeys([*(dest.get("alias_names") or []), *aliases])
+        )
+        dest["taxonomy_tag_ids"] = _union_tag_ids(
+            dest.get("taxonomy_tag_ids"), unit.get("taxonomy_tag_ids")
+        )
+        annotation = dict(dest.get("annotation") or {})
+        for field, value in (unit.get("annotation") or {}).items():
+            if annotation.get(field) in (None, "", {}, []):
+                annotation[field] = value
+        dest["annotation"] = annotation
+        meta = dict(dest.get("meta") or {})
+        for field, value in (unit.get("meta") or {}).items():
+            if field not in meta or meta[field] in (None, "", {}, []):
+                meta[field] = value
+        if meta:
+            dest["meta"] = meta
+        uploaders = {
+            (item.get("id"), item.get("username")): item
+            for item in [*(dest.get("uploaders") or []), *(unit.get("uploaders") or [])]
+            if isinstance(item, dict)
+        }
+        dest["uploaders"] = list(uploaders.values())
+    merged = [grouped[key] for key in order]
+    for item in merged:
+        item["file_count"] = len(item["files"])
+        for rec in item["files"]:
+            rec["unit_name"] = item["name"]
+    return merged
+
+
 def _overlay_metadata(
     snapshot: dict[str, Any],
     metadata: dict[str, Any],
@@ -1676,6 +1771,7 @@ def _overlay_metadata(
                 item["updated_at"] = meta["updated_at"]
         units.append(item)
 
+    units = _merge_equivalent_units(units)
     _inherit_file_tags(units, metadata)
 
     units_by_batch: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1806,6 +1902,7 @@ def _refresh_data_index(include_empty: bool, stamp: tuple[float | None, ...]) ->
     try:
         data = _build_data_index(include_empty=include_empty)
     except Exception:
+        logging.getLogger("catalog").exception("后台刷新浏览索引失败")
         return
     finally:
         with _browse_refresh_lock:
@@ -2454,7 +2551,7 @@ def data_destination(
     if ontology == "robot" and modality == "motion":
         method = (robot_acquire_method or DEFAULT_ROBOT_ACQUIRE_METHOD).strip().lower()
         if method not in ROBOT_ACQUIRE_METHODS:
-            raise ValueError("机器人数据获取方式须为 omniretarget、umr 或 gmr")
+            raise ValueError("机器人数据获取方式须为 omniretarget、umr、gmr 或 frax")
         parts.append(method)
     if modality == "motion":
         kind = str(motion_kind or "").strip().lower()
@@ -2689,6 +2786,7 @@ def delete_upload_session_files(
     session_id: str,
     *,
     paths: list[str] | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_id = (session_id or "").strip()
     if not session_id:
@@ -2709,14 +2807,8 @@ def delete_upload_session_files(
     ]
     if not targets:
         raise FileNotFoundError(session_id)
-    doomed_units = _unit_keys_emptied_by(targets)
-    removed: list[str] = []
-    for rel_path in targets:
-        try:
-            delete_repo_file(rel_path, update_index=False)
-            removed.append(rel_path)
-        except FileNotFoundError:
-            removed.append(rel_path)
+    trashed = trash_repo_files(targets, actor=actor, label="上传记录")
+    removed = list(trashed.get("paths") or [])
     gone = set(removed)
 
     def mutate(data):
@@ -2732,14 +2824,14 @@ def delete_upload_session_files(
             row["paths"] = remaining
             next_rows.append(row)
         data["upload_sessions"] = next_rows
-        _drop_path_keys(data, removed)
-        units = data.setdefault("units", {})
-        for key in doomed_units:
-            units.pop(key, None)
 
     update_metadata(mutate)
-    refresh_catalog_paths(removed)
-    return {"ok": True, "removed": removed, "session_id": session_id}
+    return {
+        "ok": True,
+        "removed": removed,
+        "session_id": session_id,
+        "trash_id": trashed.get("id") or "",
+    }
 
 
 def rename_user_snapshots(user_id: int, username: str) -> None:
@@ -2781,8 +2873,9 @@ def set_file_uploaders(
 
 
 def save_data_file(
-    source: BinaryIO,
+    source: BinaryIO | None = None,
     *,
+    source_path: Path | None = None,
     ontology: str,
     modality: str,
     channel: str,
@@ -2826,11 +2919,18 @@ def save_data_file(
         file_version=file_version,
         motion_kind=motion_kind,
     )
+    if source is None and source_path is None:
+        raise ValueError("没有可保存的文件")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and not replace:
         raise ValueError(f"该数据单元已有同路径文件：{dest.relative_to(root())}")
-    with dest.open("wb") as out:
-        shutil.copyfileobj(source, out)
+    if source_path is not None:
+        if dest.exists():
+            dest.unlink()
+        shutil.move(source_path, dest)
+    else:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(source, out)
     if update_index:
         create_batch(batch)
         apply_batch_taxonomy_to_new_units(batch, [unit_name])
@@ -2848,7 +2948,331 @@ def resolve_repo_file(rel_path: str) -> Path:
     return path
 
 
-def delete_repo_file(rel_path: str, *, update_index: bool = True) -> None:
+def _trash_root() -> Path:
+    path = root() / "trash"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _trash_entry_dir(entry_id: str) -> Path:
+    if not entry_id or "/" in entry_id or "\\" in entry_id or entry_id in {".", ".."}:
+        raise ValueError("回收站记录无效")
+    return _trash_root() / entry_id
+
+
+def _json_copy(value: Any) -> Any:
+    if value is None:
+        return None
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _normalize_data_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in paths:
+        rel = safe_relative_path(str(raw or "")).as_posix()
+        if not rel.startswith("data/") or rel.startswith("trash/"):
+            raise ValueError("只能把数据文件放进回收站")
+        if rel in seen:
+            continue
+        seen.add(rel)
+        ordered.append(rel)
+    return ordered
+
+
+def _indexed_by_path(paths: list[str]) -> dict[str, dict[str, Any]]:
+    wanted = set(paths)
+    found: dict[str, dict[str, Any]] = {}
+    if not wanted:
+        return found
+    for rec in _iter_indexed_data_files():
+        path = str(rec.get("path") or "")
+        if path in wanted:
+            found[path] = rec
+            if len(found) == len(wanted):
+                break
+    return found
+
+
+def _batches_emptied_by(paths: list[str]) -> list[str]:
+    removing = {str(path) for path in paths if path}
+    if not removing:
+        return []
+    remaining: dict[str, int] = defaultdict(int)
+    touched: set[str] = set()
+    for rec in _iter_indexed_data_files():
+        batch = str(rec.get("batch") or "")
+        if not batch:
+            continue
+        if str(rec.get("path") or "") in removing:
+            touched.add(batch)
+            continue
+        remaining[batch] += 1
+    return [batch for batch in touched if not remaining.get(batch)]
+
+
+def trash_repo_files(
+    paths: list[str],
+    *,
+    actor: dict[str, Any] | None = None,
+    label: str = "",
+    update_index: bool = True,
+) -> dict[str, Any]:
+    """Move data files into the recycle bin instead of erasing them."""
+    rels = _normalize_data_paths(paths)
+    if not rels:
+        return {"id": "", "paths": [], "file_count": 0, "bytes": 0}
+    indexed = _indexed_by_path(rels) if update_index else {}
+    emptied_units = _unit_keys_emptied_by(rels) if update_index else []
+    emptied_batches = _batches_emptied_by(rels) if update_index else []
+    entry_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    entry_dir = _trash_entry_dir(entry_id)
+    payload = entry_dir / "files"
+    moved: list[tuple[Path, Path]] = []
+    stored: list[dict[str, Any]] = []
+    total_bytes = 0
+    try:
+        for rel in rels:
+            src = resolve_repo_file(rel)
+            if not src.is_file():
+                continue
+            dest = payload / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved.append((src, dest))
+            _cleanup_empty_parents(src.parent)
+            size = dest.stat().st_size
+            total_bytes += size
+            rec = indexed.get(rel) or {}
+            stored.append(
+                {
+                    "path": rel,
+                    "name": str(rec.get("name") or Path(rel).name),
+                    "size": size,
+                    "batch": str(rec.get("batch") or ""),
+                    "unit_name": str(rec.get("unit_name") or ""),
+                    "ontology": str(rec.get("ontology") or ""),
+                }
+            )
+    except Exception:
+        for src, dest in reversed(moved):
+            if dest.is_file() and not src.exists():
+                src.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dest), str(src))
+        if entry_dir.exists():
+            shutil.rmtree(entry_dir, ignore_errors=True)
+        raise
+
+    held: dict[str, Any] = {
+        "file_uploaders": {},
+        "file_media": {},
+        "files": {},
+        "units": {},
+        "batches": {},
+    }
+    if update_index and (moved or rels):
+
+        def mutate(data: dict[str, Any]) -> None:
+            for bucket in ("file_uploaders", "file_media", "files"):
+                rows = data.get(bucket) or {}
+                for rel in rels:
+                    if rel in rows:
+                        held[bucket][rel] = _json_copy(rows[rel])
+            units = data.setdefault("units", {})
+            for key in emptied_units:
+                if key in units:
+                    held["units"][key] = _json_copy(units.pop(key))
+                else:
+                    units.pop(key, None)
+            batches = data.setdefault("batches", {})
+            for name in emptied_batches:
+                if name in batches:
+                    held["batches"][name] = _json_copy(batches.pop(name))
+                else:
+                    batches.pop(name, None)
+            _drop_path_keys(data, rels)
+
+        update_metadata(mutate)
+        refresh_catalog_paths(rels)
+
+    if not stored:
+        if entry_dir.exists():
+            shutil.rmtree(entry_dir, ignore_errors=True)
+        return {"id": "", "paths": rels, "file_count": 0, "bytes": 0, "missing": rels}
+
+    entry = {
+        "id": entry_id,
+        "deleted_at": _now(),
+        "deleted_by": _json_copy(actor) if actor else None,
+        "label": (label or "").strip() or f"{len(stored)} 个文件",
+        "file_count": len(stored),
+        "bytes": total_bytes,
+        "files": stored,
+        "metadata": held,
+    }
+    _write_json(entry_dir / "manifest.json", entry)
+    return {
+        "id": entry_id,
+        "paths": rels,
+        "file_count": len(stored),
+        "bytes": total_bytes,
+        "label": entry["label"],
+    }
+
+
+def list_trash_entries() -> list[dict[str, Any]]:
+    base = root() / "trash"
+    if not base.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    for child in base.iterdir():
+        manifest = child / "manifest.json"
+        if not child.is_dir() or not manifest.is_file():
+            continue
+        try:
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict) or not raw.get("id"):
+            continue
+        public = {key: value for key, value in raw.items() if key != "metadata"}
+        entries.append(public)
+    entries.sort(key=lambda item: str(item.get("deleted_at") or ""), reverse=True)
+    return entries
+
+
+def _read_trash_manifest(entry_id: str) -> tuple[Path, dict[str, Any]]:
+    directory = _trash_entry_dir(entry_id)
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(entry_id)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise FileNotFoundError(entry_id)
+    return directory, raw
+
+
+def restore_trash_entry(entry_id: str) -> dict[str, Any]:
+    directory, entry = _read_trash_manifest(entry_id)
+    restored: list[str] = []
+    conflicts: list[str] = []
+    missing: list[str] = []
+    remaining: list[dict[str, Any]] = []
+    for item in entry.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        rel = str(item.get("path") or "")
+        if not rel:
+            continue
+        src = directory / "files" / rel
+        try:
+            dest = resolve_repo_file(rel)
+        except ValueError:
+            conflicts.append(rel)
+            remaining.append(item)
+            continue
+        if not src.is_file():
+            missing.append(rel)
+            continue
+        if dest.exists():
+            conflicts.append(rel)
+            remaining.append(item)
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+        restored.append(rel)
+    meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+
+    def mutate(data: dict[str, Any]) -> None:
+        for bucket in ("file_uploaders", "file_media", "files"):
+            saved = meta.get(bucket) or {}
+            rows = data.setdefault(bucket, {})
+            for rel in restored:
+                if rel in saved and rel not in rows:
+                    rows[rel] = _json_copy(saved[rel])
+        units = data.setdefault("units", {})
+        restored_set = set(restored)
+        for key, blob in (meta.get("units") or {}).items():
+            if key in units or not isinstance(blob, dict):
+                continue
+            batch, _, name = key.partition("::")
+            owned = any(
+                isinstance(item, dict)
+                and item.get("path") in restored_set
+                and str(item.get("batch") or "") == batch
+                and stems_same_unit(str(item.get("unit_name") or ""), name)
+                for item in (entry.get("files") or [])
+            )
+            if owned:
+                units[key] = _json_copy(blob)
+        batches = data.setdefault("batches", {})
+        restored_batches = {
+            str(item.get("batch") or "")
+            for item in (entry.get("files") or [])
+            if isinstance(item, dict) and item.get("path") in restored_set
+        }
+        for name, blob in (meta.get("batches") or {}).items():
+            if name in restored_batches and name not in batches and isinstance(blob, dict):
+                batches[name] = _json_copy(blob)
+
+    if restored:
+        update_metadata(mutate)
+        refresh_catalog_paths(restored)
+    if remaining:
+        entry["files"] = remaining
+        entry["file_count"] = len(remaining)
+        entry["bytes"] = sum(int(item.get("size") or 0) for item in remaining)
+        _write_json(directory / "manifest.json", entry)
+    else:
+        shutil.rmtree(directory, ignore_errors=True)
+    return {
+        "id": entry_id,
+        "restored": restored,
+        "conflicts": conflicts,
+        "missing": missing,
+    }
+
+
+def purge_trash_entry(entry_id: str) -> dict[str, Any]:
+    directory, entry = _read_trash_manifest(entry_id)
+    count = len(entry.get("files") or [])
+    shutil.rmtree(directory, ignore_errors=True)
+    return {"id": entry_id, "file_count": count}
+
+
+def purge_all_trash() -> dict[str, Any]:
+    base = root() / "trash"
+    count = 0
+    entries = 0
+    if base.is_dir():
+        for child in list(base.iterdir()):
+            manifest = child / "manifest.json"
+            if manifest.is_file():
+                try:
+                    raw = json.loads(manifest.read_text(encoding="utf-8"))
+                    count += len(raw.get("files") or [])
+                    entries += 1
+                except (OSError, json.JSONDecodeError):
+                    entries += 1
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+    return {"entries": entries, "file_count": count}
+
+
+def delete_repo_file(
+    rel_path: str,
+    *,
+    update_index: bool = True,
+    actor: dict[str, Any] | None = None,
+    label: str = "",
+) -> None:
+    rel = safe_relative_path(rel_path).as_posix()
+    if rel.startswith("data/"):
+        path = resolve_repo_file(rel)
+        if not path.is_file():
+            raise FileNotFoundError(rel_path)
+        trash_repo_files([rel], actor=actor, label=label or Path(rel).name, update_index=update_index)
+        return
     path = resolve_repo_file(rel_path)
     if not path.is_file():
         raise FileNotFoundError(rel_path)
@@ -3065,24 +3489,22 @@ def rename_file(rel_path: str, new_name: str) -> dict[str, Any]:
     return updated
 
 
-def delete_batches(names: list[str]) -> list[str]:
+def delete_batches(names: list[str], *, actor: dict[str, Any] | None = None) -> list[str]:
     removed: list[str] = []
     deleted_paths: list[str] = []
     for raw in names:
         name = safe_name(raw, label="数据批次名")
         try:
-            snapshot, batch = _require_batch(name)
+            snapshot, _batch = _require_batch(name)
         except FileNotFoundError:
             continue
         for rec in snapshot["files"]:
             if rec["batch"] != name:
                 continue
-            path = resolve_repo_file(rec["path"])
-            if path.is_file():
-                path.unlink()
-                _cleanup_empty_parents(path.parent)
             deleted_paths.append(rec["path"])
         removed.append(name)
+    if deleted_paths:
+        trash_repo_files(deleted_paths, actor=actor, label="批次 " + "、".join(removed))
 
     def mutate(data):
         batches = data.setdefault("batches", {})
@@ -3091,18 +3513,19 @@ def delete_batches(names: list[str]) -> list[str]:
             batches.pop(name, None)
             for key in [key for key in units if key.startswith(f"{name}::")]:
                 units.pop(key, None)
-        _drop_path_keys(data, deleted_paths)
 
     if removed:
         update_metadata(mutate)
-        refresh_catalog_paths(deleted_paths)
     return removed
 
 
-def delete_units(items: list[tuple[str, str]]) -> list[str]:
+def delete_units(
+    items: list[tuple[str, str]],
+    *,
+    actor: dict[str, Any] | None = None,
+) -> list[str]:
     removed: list[str] = []
     deleted_paths: list[str] = []
-    meta_keys: list[str] = []
     for raw_batch, raw_name in items:
         batch = safe_name(raw_batch, label="数据批次名")
         name = safe_name(raw_name, label="数据单元名")
@@ -3111,23 +3534,11 @@ def delete_units(items: list[tuple[str, str]]) -> list[str]:
         except FileNotFoundError:
             continue
         for rec in unit.get("files") or []:
-            path = resolve_repo_file(rec["path"])
-            if path.is_file():
-                path.unlink()
-                _cleanup_empty_parents(path.parent)
             deleted_paths.append(rec["path"])
         removed.append(unit_key(batch, unit["name"]))
-        meta_keys.extend(_metadata_keys_for_unit(batch, unit["name"]))
-
-    def mutate(data):
-        units = data.setdefault("units", {})
-        for key in [*removed, *meta_keys]:
-            units.pop(key, None)
-        _drop_path_keys(data, deleted_paths)
-
-    if removed:
-        update_metadata(mutate)
-        refresh_catalog_paths(deleted_paths)
+    if deleted_paths:
+        label = removed[0] if len(removed) == 1 else f"{len(removed)} 个数据单元"
+        trash_repo_files(deleted_paths, actor=actor, label=label)
     return removed
 
 
@@ -3271,6 +3682,93 @@ def _checked_default_description(source_dir: Path, chosen: str) -> str:
     return path.relative_to(root_dir).as_posix()
 
 
+_MESH_SUFFIXES = {".stl", ".obj", ".dae", ".ply"}
+_DESCRIPTION_SUFFIXES = {".urdf", ".xacro"}
+
+
+def _package_file_count(directory: Path) -> int:
+    if not directory.is_dir():
+        return 0
+    return sum(1 for path in directory.rglob("*") if path.is_file() and not path.name.startswith("."))
+
+
+def _mesh_filename_refs(text: str) -> list[str]:
+    return re.findall(r'filename="([^"]+)"', text)
+
+
+def normalize_standard_package(source: Path) -> dict[str, str]:
+    """Turn a loose URDF-plus-mesh dump into meshes/, urdf/ and mjcf/.
+
+    SolidWorks exports often put the URDF inside meshes/ and still write
+    ``meshes/part.STL``. Those paths are rewritten so they resolve from urdf/.
+    A package that already has both directories is left unchanged.
+    Returns old relative description paths mapped to their new locations.
+    """
+    if _package_file_count(source / "meshes") and _package_file_count(source / "urdf"):
+        return {}
+    files = [
+        path
+        for path in source.rglob("*")
+        if path.is_file() and not path.name.startswith(".") and "__MACOSX" not in path.parts
+    ]
+    descriptions = [path for path in files if path.suffix.lower() in _DESCRIPTION_SUFFIXES]
+    meshes = [path for path in files if path.suffix.lower() in _MESH_SUFFIXES]
+    if not descriptions or not meshes:
+        return {}
+    stage = Path(tempfile.mkdtemp(prefix="standard_layout_", dir=source.parent))
+    try:
+        mesh_dir = stage / "meshes"
+        urdf_dir = stage / "urdf"
+        (stage / "mjcf").mkdir()
+        mesh_dir.mkdir()
+        urdf_dir.mkdir()
+        by_name: dict[str, Path] = {}
+        by_lower: dict[str, Path] = {}
+        for mesh in meshes:
+            dest = mesh_dir / mesh.name
+            if dest.exists():
+                dest = mesh_dir / f"{mesh.parent.name}_{mesh.name}"
+            shutil.copy2(mesh, dest)
+            by_name[mesh.name] = dest
+            by_lower.setdefault(mesh.name.lower(), dest)
+        moved: dict[str, str] = {}
+        missing: list[str] = []
+        for desc in descriptions:
+            old_rel = desc.relative_to(source).as_posix()
+            dest = urdf_dir / desc.name
+            text = desc.read_text(encoding="utf-8", errors="replace")
+
+            def replace(match: re.Match[str], _text_dest: Path = dest) -> str:
+                raw = match.group(1)
+                name = Path(raw.replace("\\", "/")).name
+                target = by_name.get(name) or by_lower.get(name.lower())
+                if target is None:
+                    missing.append(f"{desc.name}: {raw}")
+                    return match.group(0)
+                relative = Path(os.path.relpath(target, _text_dest.parent)).as_posix()
+                return f'filename="{relative}"'
+
+            dest.write_text(re.sub(r'filename="([^"]+)"', replace, text), encoding="utf-8")
+            new_rel = dest.relative_to(stage).as_posix()
+            moved[old_rel] = new_rel
+            moved.setdefault(desc.name, new_rel)
+        if missing:
+            sample = "、".join(missing[:6])
+            raise ValueError(f"URDF 引用的网格找不到：{sample}")
+        for child in list(source.iterdir()):
+            if child.name.startswith("."):
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for item in stage.iterdir():
+            shutil.move(str(item), str(source / item.name))
+        return moved
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def validate_standard_description(path: Path) -> dict[str, int]:
     source = _unwrap_single_directory(path)
     missing = [name for name in STANDARD_DESCRIPTION_DIRS if not (source / name).is_dir()]
@@ -3333,6 +3831,53 @@ def update_model_instance_meta(
     }
 
 
+def model_kind_directory(ontology: str, instance: str, kind: str) -> Path:
+    """Return ``3d_model/<ontology>/<kind>/<instance>`` after rejecting path tricks."""
+    if ontology not in ONTOLOGIES:
+        raise ValueError("模型类型须为 human 或 robot")
+    if kind not in MODEL_KINDS[ontology]:
+        raise ValueError(f"模型格式须为：{', '.join(MODEL_KINDS[ontology])}")
+    name = str(instance or "").strip()
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or any(part in {".", ".."} for part in Path(name).parts)
+    ):
+        raise ValueError("模型实例名无效")
+    base = (root() / "3d_model" / ontology / kind).resolve()
+    directory = (base / name).resolve()
+    try:
+        directory.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("模型实例名无效") from exc
+    if not directory.is_dir():
+        raise FileNotFoundError("该类型还没有文件")
+    return directory
+
+
+def write_model_kind_zip(directory: Path, destination: Path) -> int:
+    """Zip the instance folder's contents at the archive root.
+
+    ``meshes/a.STL`` stays ``meshes/a.STL``. Hidden entries are left out.
+    """
+    count = 0
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(directory)
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            archive.write(path, relative.as_posix())
+            count += 1
+    if count == 0:
+        destination.unlink(missing_ok=True)
+        raise FileNotFoundError("该类型还没有文件")
+    return count
+
+
 def delete_model_instance(ontology: str, name: str) -> None:
     if ontology not in ONTOLOGIES:
         raise ValueError("模型类型须为 human 或 robot")
@@ -3374,7 +3919,13 @@ def save_model_upload(
             temp = Path(temp_name)
             _safe_extract_zip(source, temp)
             source_dir = _unwrap_single_directory(temp)
-            default_rel = _checked_default_description(source_dir, default_description_file)
+            moved = normalize_standard_package(source_dir)
+            chosen = str(default_description_file or "").replace("\\", "/").strip().lstrip("/")
+            if chosen in moved:
+                chosen = moved[chosen]
+            elif Path(chosen).name in moved:
+                chosen = moved[Path(chosen).name]
+            default_rel = _checked_default_description(source_dir, chosen)
             from .robot_retarget_profile import fill_missing_mjcf
 
             generated_files = fill_missing_mjcf(source_dir, default_rel)

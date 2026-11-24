@@ -59,6 +59,30 @@ def choose_human_source(files: list[dict]) -> dict | None:
     return min(candidates, key=source_sort_key)
 
 
+def choose_scene_source(files: list[dict]) -> dict | None:
+    """FBX that carries rigid bodies or markers: merged first, then object."""
+    candidates: list[dict] = []
+    for item in files:
+        if str(item.get("ontology") or "") != "human":
+            continue
+        name = str(item.get("name") or "")
+        if file_format(name, str(item.get("format") or "")) != "fbx":
+            continue
+        kind = motion_kind(item.get("annotation"), item)
+        path = str(item.get("path") or "").replace("\\", "/")
+        if kind not in {"merged", "object"} and "/merged/" not in path and "/object/" not in path:
+            continue
+        candidates.append(item)
+    if not candidates:
+        return None
+
+    def rank(item: dict) -> tuple:
+        kind = motion_kind(item.get("annotation"), item)
+        return (0 if kind == "merged" else 1, str(item.get("name") or ""))
+
+    return min(candidates, key=rank)
+
+
 def robot_styles_present(files: list[dict]) -> set[str]:
     styles: set[str] = set()
     for item in files:

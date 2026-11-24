@@ -12,10 +12,13 @@ import {
 } from "./RobotStyleFields";
 import type { ModelInstance, RetargetFrame, StorageFile } from "../types";
 import { parseCsvFps } from "../types";
-import { FbxSceneObjects, type RobotTrackFrame } from "./AnimationFormatPreview";
+import type { RobotTrackFrame } from "./AnimationFormatPreview";
+import { SceneObjectLayer } from "./SceneObjectLayer";
 import { usePreview } from "../preview/PreviewContext";
 import { DataOriginAxes, FrameFigure, ViewerSceneChrome } from "./ViewerSceneChrome";
+import { NAMES_OFF, NameToggleButtons, SceneNameLabels, useNameFlags, type NameFlags } from "./NameLabels";
 import { upAxisToRotationX } from "../viewerUpAxis";
+import { useReportPlayback } from "../playbackClock";
 
 /** holosoma / MuJoCo robot CSVs are always Z-up: base xyz, quat xyzw, joints. */
 const ROBOT_CSV_ROTATION_X = upAxisToRotationX("z");
@@ -64,6 +67,26 @@ function humanSceneScore(file: StorageFile, stem: string, version: string) {
   return score;
 }
 
+/** 机器人骨架 CSV 对应的物体文件，只认机器人自己的 object/xml 和 object/csv。 */
+export function robotObjectScene(
+  files: StorageFile[],
+  csv: StorageFile
+): { xml: string; csv: string } | null {
+  const path = (csv.path || "").replace(/\\/g, "/");
+  const marker = "/skeleton/csv/";
+  if (!path.includes("/robot/") || !path.includes(marker)) return null;
+  const derivedXml = path.replace(marker, "/object/xml/").replace(/\.csv$/i, ".xml");
+  const derivedCsv = path.replace(marker, "/object/csv/");
+  const notedXml = String(csv.annotation?.scene_xml || "").replace(/\\/g, "/");
+  const notedCsv = String(csv.annotation?.scene_csv || "").replace(/\\/g, "/");
+  const xml = notedXml.includes("/robot/") && notedXml.includes("/object/") ? notedXml : derivedXml;
+  const sceneCsv = notedCsv.includes("/robot/") && notedCsv.includes("/object/") ? notedCsv : derivedCsv;
+  const capture = csv.annotation?.world_frame === "capture_z_up";
+  const known = new Set(files.map((item) => item.path));
+  if (capture || (known.has(xml) && known.has(sceneCsv))) return { xml, csv: sceneCsv };
+  return null;
+}
+
 /** 同一数据单元里的人体 FBX，优先用带场景物体的合并数据。 */
 export function humanSceneFbx(files: StorageFile[], csv: StorageFile): StorageFile | null {
   const fbxs = files.filter((item) => {
@@ -88,11 +111,23 @@ export function robotCsvHipsHint(name: string) {
 }
 
 export function isRobotMotionCsv(file: StorageFile) {
-  return (
-    file.ontology === "robot" &&
-    file.modality === "motion" &&
-    (file.format || "").toLowerCase() === "csv"
-  );
+  if (file.ontology !== "robot" || file.modality !== "motion") return false;
+  if (file.annotation?.motion_kind === "object") return false;
+  const path = (file.path || "").replace(/\\/g, "/");
+  if (path.includes("/object/")) return false;
+  return (file.format || "").toLowerCase() === "csv" || path.toLowerCase().endsWith(".csv");
+}
+
+/** 物体 XML 只看模型，物体 CSV 只看模型加轨迹。 */
+export function robotObjectPreviewKind(file: StorageFile): "model" | "motion" | null {
+  if (file.ontology !== "robot" || file.modality !== "motion") return null;
+  const path = (file.path || "").replace(/\\/g, "/");
+  const objectFile = file.annotation?.motion_kind === "object" || path.includes("/object/");
+  if (!objectFile) return null;
+  const fmt = (file.format || path.split(".").pop() || "").toLowerCase();
+  if (fmt === "xml") return "model";
+  if (fmt === "csv") return "motion";
+  return null;
 }
 
 function parseRobotCsv(text: string): { frames: RobotCsvFrame[]; fps: number | null } {
@@ -158,9 +193,12 @@ function RobotCsvScene({
   viewNonce = 0,
   followRoot = false,
   propsUrl = "",
+  objectXmlUrl = "",
+  objectCsvUrl = "",
   hipsHint = null,
   retargetFrame = null,
   robotStyle = "",
+  names = NAMES_OFF,
   onReady,
   onError,
 }: {
@@ -176,12 +214,16 @@ function RobotCsvScene({
   viewNonce?: number;
   followRoot?: boolean;
   propsUrl?: string;
+  objectXmlUrl?: string;
+  objectCsvUrl?: string;
   hipsHint?: string | null;
+  names?: NameFlags;
   onReady: (info: { duration: number; fps: number; jointCount: number; note: string }) => void;
   onError: (message: string) => void;
 }) {
   const robotRef = useRef<URDFRobot | null>(null);
-  const figureRef = useRef<THREE.Group>(null);
+  const figureRef = useRef<THREE.Group | null>(null);
+  const [labelRoot, setLabelRoot] = useState<THREE.Group | null>(null);
   const framesRef = useRef<RobotCsvFrame[]>([]);
   const namesRef = useRef<string[]>([]);
   const fpsRef = useRef(30);
@@ -336,27 +378,30 @@ function RobotCsvScene({
   });
 
   return (
-    <group ref={figureRef} position={center}>
+    <group
+      ref={(node) => {
+        figureRef.current = node;
+        setLabelRoot((current) => (current === node ? current : node));
+      }}
+      position={center}
+    >
       <group rotation={[rotationX, 0, 0]}>
         <DataOriginAxes length={axisLength} />
         {robot && <primitive object={robot} />}
-        {propsUrl ? (
-          <FbxSceneObjects
-            url={propsUrl}
+        {objectXmlUrl && objectCsvUrl ? (
+          <SceneObjectLayer
+            xmlUrl={objectXmlUrl}
+            csvUrl={objectCsvUrl}
             time={time}
-            alignPose={alignPose}
-            hipsHint={hipsHint}
-            retargetFrame={retargetFrame}
-            robotStyle={robotStyle}
-            robotTrack={robotTrack}
             onReady={() => setPropsNonce((value) => value + 1)}
           />
         ) : null}
+        <SceneNameLabels root={labelRoot} names={names} />
       </group>
       <FrameFigure
         objectRef={figureRef}
         ready={status === "ready"}
-        resetKey={`${csvUrl}:${rotationX}:${propsUrl}`}
+        resetKey={`${csvUrl}:${rotationX}:${objectXmlUrl}`}
         nonce={viewNonce + propsNonce}
       />
       {status === "loading" && (
@@ -373,33 +418,25 @@ function RobotCsvScene({
   );
 }
 
-export function RobotCsvPreview({ file }: { file: StorageFile }) {
+export function RobotCsvPreview({
+  file,
+  sources,
+}: {
+  file: StorageFile;
+  sources?: { csvUrl: string; objectXmlUrl: string; objectCsvUrl: string };
+}) {
+  const [names] = useNameFlags();
   const preview = usePreview();
-  const sceneFbx = humanSceneFbx(
-    preview.filesForUnit(file.batch || "", file.unit_name || ""),
-    file
-  );
-  const propsUrl = sceneFbx ? api.storageFileUrl(sceneFbx.path) : "";
-  const hipsHint = robotCsvHipsHint(file.name || file.path || "");
-  const scenePath = sceneFbx?.path || "";
-  const [retargetFrame, setRetargetFrame] = useState<RetargetFrame | null>(null);
-  useEffect(() => {
-    setRetargetFrame(null);
-    if (!scenePath) return;
-    let cancelled = false;
-    api
-      .storageRetargetFrame(scenePath)
-      .then((frame) => {
-        if (!cancelled) setRetargetFrame(frame);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [scenePath]);
+  const unitFiles = preview.filesForUnit(file.batch || "", file.unit_name || "");
+  const objectScene = sources ? null : robotObjectScene(unitFiles, file);
+  const captureFrame = file.annotation?.world_frame === "capture_z_up" || Boolean(objectScene) || Boolean(sources);
+  const objectXmlUrl = sources?.objectXmlUrl || (objectScene ? api.storageFileUrl(objectScene.xml) : "");
+  const objectCsvUrl = sources?.objectCsvUrl || (objectScene ? api.storageFileUrl(objectScene.csv) : "");
+  const csvUrl = sources?.csvUrl || (file.path.startsWith("blob:") ? file.path : api.storageFileUrl(file.path));
   const [instances, setInstances] = useState<ModelInstance[]>([]);
   const [modelsError, setModelsError] = useState("");
   const [time, setTime] = useState(0);
+  useReportPlayback(time, parseCsvFps(file.annotation?.fps ?? file.fps));
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [mediaDuration, setMediaDuration] = useState(0);
@@ -428,7 +465,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
   useEffect(() => {
     let cancelled = false;
     api
-      .storageModels()
+      .storageModels({ quiet: true })
       .then((data) => {
         if (!cancelled) {
           setInstances(data.instances.filter((item) => item.ontology === "robot"));
@@ -501,7 +538,7 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
             <ViewerSceneChrome />
             <RobotCsvScene
               key={`${file.path}:${contentStamp}:${urdfFile.path}:${parseCsvFps(file.annotation?.fps ?? file.fps)}`}
-              csvUrl={api.storageFileUrl(file.path)}
+              csvUrl={csvUrl}
               urdfPath={urdfFile.path}
               packageRoot={packageRoot}
               fpsHint={parseCsvFps(file.annotation?.fps ?? file.fps)}
@@ -510,10 +547,9 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
               rotationX={rotationX}
               viewNonce={viewNonce}
               followRoot={followRoot}
-              propsUrl={propsUrl}
-              hipsHint={hipsHint}
-              retargetFrame={retargetFrame}
-              robotStyle={style}
+              objectXmlUrl={objectXmlUrl}
+              objectCsvUrl={objectCsvUrl}
+              names={names}
               onReady={handleReady}
               onError={() => undefined}
             />
@@ -591,10 +627,15 @@ export function RobotCsvPreview({ file }: { file: StorageFile }) {
         </button>
         <span
           className="follow-root-toggle secondary is-static"
-          title="机器人动作 CSV 由 holosoma 按 MuJoCo 坐标系导出，固定为 Z-up（米），不需要切换"
+          title={
+            captureFrame
+              ? "合并数据不重置原点。机器人和物体都在动捕原点的 Z-up 坐标系里，只做了朝向转换"
+              : "机器人动作 CSV 由 holosoma 按 MuJoCo 坐标系导出，固定为 Z-up（米），不需要切换"
+          }
         >
-          坐标系·Z-up
+          {captureFrame ? "坐标系·共用原点" : "坐标系·Z-up"}
         </span>
+        <NameToggleButtons />
       </div>
       {note ? <div className="muted animation-format-note">{note}</div> : null}
     </div>

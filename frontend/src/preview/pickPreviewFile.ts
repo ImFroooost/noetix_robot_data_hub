@@ -21,6 +21,7 @@ export function previewFormatKey(file: {
   format?: string | null;
   name?: string | null;
 }): string {
+  if (String(file.name || "").toLowerCase().endsWith(".fbx.zst")) return "fbx";
   if (isSmplFormat(file.format, file.name)) return "smpl";
   const fmt = String(file.format || "")
     .trim()

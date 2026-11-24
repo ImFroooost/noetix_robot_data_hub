@@ -11,8 +11,13 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .file_lock import write_text_atomic
+
 DESIRED = ("running", "stopped")
 PERFORMANCE = ("auto", "light", "balanced", "heavy")
+# Methods the host loop can actually run. umr and gmr are storage labels only.
+RETARGET_METHODS = ("omniretarget", "frax")
+DEFAULT_RETARGET_METHOD = "omniretarget"
 # Manual ceilings and the RAM left for the desktop, in GB.
 PROFILES = {
     "light": {"cap": 2, "reserve_gb": 48, "label": "轻"},
@@ -44,28 +49,40 @@ def load_control(hub: Path) -> dict:
         desired = "running"
     if performance not in PERFORMANCE:
         performance = "heavy"
+    method = str(raw.get("method") or DEFAULT_RETARGET_METHOD)
+    if method not in RETARGET_METHODS:
+        method = DEFAULT_RETARGET_METHOD
     return {
         "desired": desired,
         "performance": performance,
+        "method": method,
         "updated_at": raw.get("updated_at"),
     }
 
 
-def save_control(hub: Path, *, desired: str, performance: str) -> dict:
+def save_control(
+    hub: Path,
+    *,
+    desired: str,
+    performance: str,
+    method: str | None = None,
+) -> dict:
     if desired not in DESIRED:
         raise ValueError("运行状态只能是启动或停止")
     if performance not in PERFORMANCE:
         raise ValueError("占用强度只能是自动、轻、均衡或高")
+    current = load_control(hub)
+    chosen = str(method or current["method"])
+    if chosen not in RETARGET_METHODS:
+        raise ValueError("重定向方法只能是 omniretarget 或 frax")
     payload = {
         "desired": desired,
         "performance": performance,
+        "method": chosen,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     path = control_path(hub)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False))
     return payload
 
 

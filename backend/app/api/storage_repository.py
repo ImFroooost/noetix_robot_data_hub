@@ -5,14 +5,20 @@ from __future__ import annotations
 import gc
 import gzip
 import json
+import logging
+import os
 import shutil
 import tempfile
 import threading
+import time
+import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -36,19 +42,27 @@ from ..services.disk_repository import (
     clean_file_version,
     clean_motion_kind,
     create_batch,
+    data_destination,
     create_model_instance,
     delete_batches,
     delete_upload_session_files,
     delete_model_instance,
     delete_repo_file,
     delete_units,
+    list_trash_entries,
+    purge_all_trash,
+    purge_trash_entry,
+    restore_trash_entry,
+    trash_repo_files,
     inspect_data_file,
+    model_kind_directory,
     normalize_unit_stem,
     parent_taxonomy_ids,
     probe_data_file,
     read_metadata,
     catalog_rebuild_status,
     refresh_catalog_paths,
+    root as repo_root,
     start_catalog_rebuild,
     record_upload_session,
     register_file_version,
@@ -59,6 +73,7 @@ from ..services.disk_repository import (
     resolve_repo_file,
     save_data_file,
     write_archive,
+    write_model_kind_zip,
     save_model_upload,
     scan_data,
     scan_models,
@@ -74,9 +89,10 @@ from ..services.disk_repository import (
 )
 from ..models.enums import is_super_role
 from ..services.human_zip import (
-    extract_zip_files,
     folder_name_from_zip_filename,
     human_format_from_filename,
+    iter_zip_human_members,
+    safe_extract_member,
 )
 from ..services.motion_units import plan_clip_units, plan_followed_paths
 from ..services.permissions import (
@@ -154,6 +170,19 @@ class StorageSelectionIn(BaseModel):
     units: list[UnitRefIn] = Field(default_factory=list)
     kinds: list[DataKindIn] = Field(default_factory=list)
     robot_styles: list[str] | None = None
+    paths: list[str] = Field(default_factory=list)
+    label: str = ""
+
+
+def _actor(user: User) -> dict[str, Any]:
+    return {"id": user.id, "username": user.username}
+
+
+def _can_manage_trash(db: Session, user: User, entry: dict[str, Any]) -> bool:
+    if is_super_role(user.role) or user_has_any_capability(db, user, Capability.manage_users):
+        return True
+    deleted_by = entry.get("deleted_by") if isinstance(entry.get("deleted_by"), dict) else {}
+    return int(deleted_by.get("id") or 0) == user.id
 
 
 def _parse_annotation_form(raw: str) -> dict[str, Any]:
@@ -416,11 +445,39 @@ def _require_file_owner(user: User, file: dict[str, Any]) -> None:
         raise HTTPException(status_code=403, detail="只能替换当前用户自己上传的文件")
 
 
+# Lookup tables for the browse snapshot. The snapshot holds every file in the
+# repository; scanning it for one path on each preview request is what made
+# file serving slow. Rebuilt only when a different snapshot object comes in.
+_snapshot_lookup: tuple[dict[str, Any], dict[str, Any]] | None = None
+
+
+def _lookup(snapshot: dict[str, Any]) -> dict[str, Any]:
+    global _snapshot_lookup
+    cached = _snapshot_lookup
+    if cached is not None and cached[0] is snapshot:
+        return cached[1]
+    files: dict[str, dict[str, Any]] = {}
+    for item in snapshot.get("files") or []:
+        files.setdefault(item["path"], item)
+    units: dict[tuple[str, str], dict[str, Any]] = {}
+    unit_of_path: dict[str, dict[str, Any]] = {}
+    for unit in snapshot.get("units") or []:
+        units.setdefault((unit["batch"], unit["name"]), unit)
+        for item in unit.get("files") or []:
+            path = item.get("path")
+            if path:
+                unit_of_path.setdefault(path, unit)
+    tables = {"files": files, "units": units, "unit_of_path": unit_of_path}
+    _snapshot_lookup = (snapshot, tables)
+    return tables
+
+
+def _file_by_path(snapshot: dict[str, Any], path: str) -> dict[str, Any] | None:
+    return _lookup(snapshot)["files"].get(path)
+
+
 def _find_unit(snapshot: dict[str, Any], batch: str, name: str) -> dict[str, Any] | None:
-    exact = next(
-        (unit for unit in snapshot["units"] if unit["batch"] == batch and unit["name"] == name),
-        None,
-    )
+    exact = _lookup(snapshot)["units"].get((batch, name))
     if exact:
         return exact
     return next(
@@ -434,19 +491,12 @@ def _find_unit(snapshot: dict[str, Any], batch: str, name: str) -> dict[str, Any
 
 
 def _unit_for_file(snapshot: dict[str, Any], path: str) -> dict[str, Any] | None:
-    file = next((item for item in snapshot["files"] if item["path"] == path), None)
+    file = _file_by_path(snapshot, path)
     if file:
         unit = _find_unit(snapshot, file["batch"], file["unit_name"])
         if unit:
             return unit
-    return next(
-        (
-            unit
-            for unit in snapshot["units"]
-            if any(item.get("path") == path for item in unit.get("files") or [])
-        ),
-        None,
-    )
+    return _lookup(snapshot)["unit_of_path"].get(path)
 
 
 def _taxonomy_briefs(db: Session, ids: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -734,6 +784,9 @@ _OVERVIEW_ANN = (
     "gender",
     "height",
     "status",
+    "world_frame",
+    "scene_xml",
+    "scene_csv",
 )
 
 
@@ -954,7 +1007,7 @@ def _schedule_overview_build(key: tuple, user_id: int, params: dict[str, Any]) -
             if current is None or current["gen"] <= gen:
                 _store_overview_entry(key, user_id, params, entry)
         except Exception:
-            pass
+            logging.getLogger("catalog").exception("后台重建浏览页面失败")
         finally:
             db.close()
             with _overview_lock:
@@ -1087,17 +1140,24 @@ def remove_upload_session(
         result = delete_upload_session_files(
             session_id,
             paths=selected if selected is not None else list(current.get("paths") or []),
+            actor=_actor(user),
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="上传记录不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    removed = result.get("removed") or []
     write_audit(
         db,
         user_id=user.id,
-        action="delete",
+        action="trash",
         entity_type="upload_session",
-        detail={"session_id": session_id, "removed": result.get("removed") or []},
+        detail={
+            "session_id": session_id,
+            "trash_id": result.get("trash_id") or "",
+            "file_count": len(removed),
+            "removed": removed[:20],
+        },
     )
     db.commit()
     return result
@@ -1167,11 +1227,11 @@ def remove_batch(
     if batch is None:
         raise HTTPException(status_code=404, detail="数据批次不存在")
     _require_batch_capability(db, user, Capability.edit, batch)
-    delete_batches([name])
+    delete_batches([name], actor=_actor(user))
     write_audit(
         db,
         user_id=user.id,
-        action="delete",
+        action="trash",
         entity_type="storage_batch",
         detail={"batch": name},
     )
@@ -1240,11 +1300,11 @@ def remove_unit(
     if not unit:
         raise HTTPException(status_code=404, detail="数据单元不存在")
     _require_unit(db, user, Capability.edit, unit)
-    delete_units([(batch, unit["name"])])
+    delete_units([(batch, unit["name"])], actor=_actor(user))
     write_audit(
         db,
         user_id=user.id,
-        action="delete",
+        action="trash",
         entity_type="storage_unit",
         detail={"batch": batch, "unit_name": unit_name},
     )
@@ -1279,6 +1339,42 @@ def bulk_delete(
     user: User = Depends(get_current_user),
 ):
     snapshot = scan_data(include_empty=user_has_any_capability(db, user, Capability.manage_data))
+    actor = _actor(user)
+    if body.paths:
+        by_path = {
+            str(item.get("path") or ""): unit
+            for unit in snapshot["units"]
+            for item in unit.get("files") or []
+        }
+        allowed: list[str] = []
+        for raw in body.paths:
+            path = str(raw or "").strip()
+            unit = by_path.get(path)
+            if not unit:
+                raise HTTPException(status_code=404, detail=f"文件不在数据单元中：{path}")
+            _require_unit(db, user, Capability.edit, unit)
+            allowed.append(path)
+        trashed = trash_repo_files(allowed, actor=actor, label=body.label)
+        write_audit(
+            db,
+            user_id=user.id,
+            action="trash",
+            entity_type="storage_files",
+            detail={
+                "trash_id": trashed.get("id") or "",
+                "label": trashed.get("label") or body.label,
+                "file_count": trashed.get("file_count") or 0,
+                "paths": allowed[:20],
+            },
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "batches": [],
+            "units": [],
+            "trash_id": trashed.get("id") or "",
+            "file_count": trashed.get("file_count") or 0,
+        }
     batches_by_name = {item["name"]: item for item in snapshot["batches"]}
     removed_batches: list[str] = []
     removed_units: list[tuple[str, str]] = []
@@ -1298,14 +1394,14 @@ def bulk_delete(
         _require_unit(db, user, Capability.edit, unit)
         removed_units.append((item.batch, item.name))
     if removed_units:
-        delete_units(removed_units)
+        delete_units(removed_units, actor=actor)
     if removed_batches:
-        delete_batches(removed_batches)
+        delete_batches(removed_batches, actor=actor)
     for name in removed_batches:
         write_audit(
             db,
             user_id=user.id,
-            action="delete",
+            action="trash",
             entity_type="storage_batch",
             detail={"batch": name},
         )
@@ -1313,7 +1409,7 @@ def bulk_delete(
         write_audit(
             db,
             user_id=user.id,
-            action="delete",
+            action="trash",
             entity_type="storage_unit",
             detail={"batch": batch_name, "unit_name": unit_name},
         )
@@ -1323,6 +1419,111 @@ def bulk_delete(
         "batches": removed_batches,
         "units": [f"{batch}::{name}" for batch, name in removed_units],
     }
+
+
+def _require_trash_reader(db: Session, user: User) -> None:
+    if not user_has_any_capability(db, user, Capability.manage_data):
+        raise HTTPException(status_code=403, detail="需要数据管理权限才能查看回收站")
+
+
+@router.get("/trash")
+def trash_list(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_trash_reader(db, user)
+    entries = [
+        entry
+        for entry in list_trash_entries()
+        if _can_manage_trash(db, user, entry)
+    ]
+    return {"entries": entries}
+
+
+@router.post("/trash/{entry_id}/restore")
+def trash_restore(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_trash_reader(db, user)
+    try:
+        current = next(item for item in list_trash_entries() if item.get("id") == entry_id)
+    except StopIteration as exc:
+        raise HTTPException(status_code=404, detail="回收站里没有这项") from exc
+    if not _can_manage_trash(db, user, current):
+        raise HTTPException(status_code=403, detail="不能恢复别人删除的数据")
+    try:
+        result = restore_trash_entry(entry_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="回收站里没有这项") from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="restore",
+        entity_type="storage_trash",
+        detail={
+            "trash_id": entry_id,
+            "file_count": len(result.get("restored") or []),
+            "conflicts": result.get("conflicts") or [],
+        },
+    )
+    db.commit()
+    return result
+
+
+@router.delete("/trash/{entry_id}")
+def trash_purge(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_trash_reader(db, user)
+    try:
+        current = next(item for item in list_trash_entries() if item.get("id") == entry_id)
+    except StopIteration as exc:
+        raise HTTPException(status_code=404, detail="回收站里没有这项") from exc
+    if not _can_manage_trash(db, user, current):
+        raise HTTPException(status_code=403, detail="不能永久删除别人放进回收站的数据")
+    try:
+        result = purge_trash_entry(entry_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="回收站里没有这项") from exc
+    write_audit(
+        db,
+        user_id=user.id,
+        action="purge",
+        entity_type="storage_trash",
+        detail={"trash_id": entry_id, "file_count": result.get("file_count") or 0},
+    )
+    db.commit()
+    return result
+
+
+@router.delete("/trash")
+def trash_empty(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_trash_reader(db, user)
+    visible = [entry for entry in list_trash_entries() if _can_manage_trash(db, user, entry)]
+    if is_super_role(user.role) or user_has_any_capability(db, user, Capability.manage_users):
+        result = purge_all_trash()
+    else:
+        result = {"entries": 0, "file_count": 0}
+        for entry in visible:
+            purged = purge_trash_entry(str(entry["id"]))
+            result["entries"] += 1
+            result["file_count"] += int(purged.get("file_count") or 0)
+    write_audit(
+        db,
+        user_id=user.id,
+        action="purge",
+        entity_type="storage_trash",
+        detail={"scope": "all", **result},
+    )
+    db.commit()
+    return result
 
 
 @router.post("/archive")
@@ -2000,170 +2201,274 @@ async def upload_data_folder(
     return summary
 
 
-@router.post("/data/upload-zip")
-async def upload_data_zip(
-    ontology: str = Form(...),
-    modality: str = Form(...),
-    channel: str = Form(""),
-    batch: str = Form(""),
-    replace: bool = Form(False),
-    follow_paths: bool = Form(False),
-    manage_override: bool = Form(False),
-    annotation: str = Form(""),
-    taxonomy_tag_ids: str = Form(""),
-    robot_acquire_method: str = Form(""),
-    file_version: str = Form(""),
-    local_path: str = Form(""),
-    file: UploadFile | None = File(None),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Import a motion zip (bvh/csv/fbx/tak in one archive) as one storage batch."""
-    if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
-        raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
-    filename = file.filename if file and file.filename else Path(local_path).name
-    if not str(filename).lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="请上传 .zip 文件")
-    batch = (batch or "").strip() or folder_name_from_zip_filename(filename)
-    ontology = ontology.strip().lower()
-    modality = modality.strip().lower()
-    channel = channel.strip().lower()
-    parsed_annotation = _parse_annotation_form(annotation)
-    ensure_capability(db, user, Capability.upload, f"/{batch}/")
-    version = _resolve_upload_file_version(scan_data(), batch, file_version)
+_ZIP_JOBS: dict[str, dict[str, Any]] = {}
+_ZIP_JOBS_LOCK = threading.Lock()
+_ZIP_JOB_KEEP = 24
 
-    _tmp_root = Path("/hub_repo/index/tmp")
-    _tmp_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix="storage_zip_", dir=_tmp_root)
-    )
-    zip_path = staging / "upload.zip"
-    work_dir = staging / "extracted"
+
+def _http_detail(exc: HTTPException) -> str:
+    detail = exc.detail
+    return detail if isinstance(detail, str) else str(detail)
+
+
+def _zip_job_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "processed": len(results),
+        "uploaded": sum(item["status"] == "uploaded" for item in results),
+        "replaced": sum(item["status"] == "replaced" for item in results),
+        "skipped": sum(item["status"] == "skip" for item in results),
+        "failed": sum(item["status"] == "failed" for item in results),
+    }
+
+
+def _public_zip_job(job: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "job_id": job["id"],
+        "status": job["status"],
+        "batch": job["batch"],
+        "total": job["total"],
+        "processed": job["processed"],
+        "uploaded": job["uploaded"],
+        "replaced": job["replaced"],
+        "skipped": job["skipped"],
+        "failed": job["failed"],
+        "detail": job.get("detail") or "",
+    }
+    if job["status"] == "done" and job.get("result") is not None:
+        payload["result"] = job["result"]
+    return payload
+
+
+def _new_zip_job(job_id: str, user_id: int, batch: str) -> None:
+    job = {
+        "id": job_id,
+        "user_id": user_id,
+        "batch": batch,
+        "status": "running",
+        "total": 0,
+        "processed": 0,
+        "uploaded": 0,
+        "replaced": 0,
+        "skipped": 0,
+        "failed": 0,
+        "detail": "正在保存压缩包",
+        "result": None,
+        "started": time.time(),
+    }
+    with _ZIP_JOBS_LOCK:
+        _ZIP_JOBS[job_id] = job
+        overflow = len(_ZIP_JOBS) - _ZIP_JOB_KEEP
+        if overflow > 0:
+            finished = sorted(
+                (item for item in _ZIP_JOBS.values() if item["status"] != "running"),
+                key=lambda item: item["started"],
+            )
+            for item in finished[:overflow]:
+                _ZIP_JOBS.pop(item["id"], None)
+
+
+def _touch_zip_job(job_id: str, **fields: Any) -> None:
+    with _ZIP_JOBS_LOCK:
+        job = _ZIP_JOBS.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _copy_zip_job(job_id: str, user_id: int | None = None) -> dict[str, Any] | None:
+    with _ZIP_JOBS_LOCK:
+        job = _ZIP_JOBS.get(job_id)
+        if job is None or (user_id is not None and job["user_id"] != user_id):
+            return None
+        return _public_zip_job(job)
+
+
+def _absent_zip_job() -> dict[str, Any]:
+    return {
+        "status": "absent",
+        "total": 0,
+        "processed": 0,
+        "uploaded": 0,
+        "replaced": 0,
+        "skipped": 0,
+        "failed": 0,
+        "detail": "",
+    }
+
+
+def _run_zip_import(
+    *,
+    job_id: str,
+    staging: Path,
+    archive: Path | None,
+    source_fd: int | None,
+    user_id: int,
+    ontology: str,
+    modality: str,
+    channel: str,
+    batch: str,
+    replace: bool,
+    follow_paths: bool,
+    manage_override: bool,
+    annotation: str,
+    taxonomy_tag_ids: str,
+    robot_acquire_method: str,
+    version: str,
+) -> None:
+    """Extract and store a zip after the HTTP response has already been sent."""
+    from ..database import SessionLocal
+
+    db = None
     try:
-        if local_path.strip():
-            try:
-                source = resolve_import_zip(local_path.strip())
-            except FileNotFoundError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            shutil.copy2(source, zip_path)
-        elif file is not None:
-            with zip_path.open("wb") as out:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-        else:
-            raise HTTPException(status_code=400, detail="请选择 zip 或填写服务器路径")
+        if source_fd is not None:
+            _touch_zip_job(job_id, detail="正在保存压缩包")
+            archive = staging / "upload.zip"
+            held_fd = source_fd
+            source_fd = None
+            with os.fdopen(held_fd, "rb") as src, archive.open("wb") as out:
+                src.seek(0)
+                shutil.copyfileobj(src, out, 1024 * 1024)
+        if archive is None:
+            raise RuntimeError("缺少 zip 文件")
 
+        db = SessionLocal()
+        user = db.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+        parsed_annotation = _parse_annotation_form(annotation)
+        work_dir = staging / "extracted"
+        warnings: list[str] = []
+        _touch_zip_job(job_id, detail="正在读取压缩包")
         try:
-            extracted, warnings = extract_zip_files(zip_path, work_dir)
+            archive_handle = zipfile.ZipFile(archive)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"无法解压 ZIP：{exc}") from exc
-        if not extracted:
-            raise HTTPException(
-                status_code=400,
-                detail="ZIP 中未找到可导入文件（按后缀识别格式，未知后缀会作为新格式入库）",
+        with archive_handle:
+            members = iter_zip_human_members(archive_handle)
+            if not members:
+                raise HTTPException(
+                    status_code=400,
+                    detail="ZIP 中未找到可导入文件（按后缀识别格式，未知后缀会作为新格式入库）",
+                )
+            zip_rels = [name for _info, name in members]
+            clip_plan = (
+                plan_followed_paths(zip_rels, strip_common_root=False)
+                if follow_paths
+                else plan_clip_units(zip_rels)
             )
-
-        zip_rels: list[str] = []
-        zip_files: list[tuple[Path, str]] = []
-        for path in extracted:
-            rel = ""
-            try:
-                rel = path.relative_to(work_dir).as_posix()
-            except Exception:
-                rel = path.name
-            zip_files.append((path, rel))
-            zip_rels.append(rel)
-        clip_plan = (
-            plan_followed_paths(zip_rels, strip_common_root=False)
-            if follow_paths
-            else plan_clip_units(zip_rels)
-        )
-
-        snapshot = scan_data()
-        current_units = {
-            (item["batch"], item["name"]): item for item in snapshot.get("units", [])
-        }
-        results: list[dict[str, Any]] = []
-        saved_paths: list[str] = []
-        formats: list[str] = []
-        new_robot_style = str(parsed_annotation.get("robot_style") or "").strip()
-
-        for path, rel in zip_files:
-            original_name = path.name
-            planned = clip_plan.get(rel) or {}
-            if planned.get("skip"):
-                results.append(
-                    {
-                        "name": original_name,
-                        "unit_name": "",
-                        "status": "skip",
-                        "detail": planned["skip"],
-                    }
-                )
-                continue
-            file_sub_path = planned.get("sub_path") or ""
-            effective_unit = planned.get("unit_name") or (normalize_unit_stem(Path(original_name).stem) or Path(original_name).stem)
-            stored_name = planned.get("stored_name") or original_name
-            fmt = human_format_from_filename(original_name).lstrip(".")
-            row: dict[str, Any] = {
-                "name": original_name,
-                "unit_name": effective_unit,
-                "status": "upload",
+            _touch_zip_job(job_id, total=len(members), detail="正在对照已有文件")
+            snapshot = scan_data()
+            current_units = {
+                (item["batch"], item["name"]): item for item in snapshot.get("units", [])
             }
-            current = current_units.get((batch, effective_unit))
-            if not current:
-                current = next(
-                    (
-                        item
-                        for item in snapshot.get("units", [])
-                        if item["batch"] == batch
-                        and stems_same_unit(item["name"], effective_unit)
-                    ),
-                    None,
-                )
-            if current:
-                _require_unit(db, user, Capability.upload, current)
-            else:
-                ensure_capability(db, user, Capability.upload, f"/{batch}/{effective_unit}/")
-            existing = None
-            if current:
-                existing = next(
-                    (
-                        item
-                        for item in current.get("files", [])
-                        if item["ontology"] == ontology
-                        and item["modality"] == modality
-                        and item["channel"] == channel
-                        and item["format"] == fmt
-                        and item["name"] == stored_name
-                        and (item.get("sub_path") or "") == file_sub_path
-                        and _stored_file_version(item) == version
-                        and (
-                            ontology != "robot"
-                            or not new_robot_style
-                            or str(item.get("robot_style") or "").strip() == new_robot_style
-                        )
-                    ),
-                    None,
-                )
-            if existing and not replace:
-                row["status"] = "skip"
-                results.append(row)
-                continue
-            if existing and not manage_override:
-                try:
-                    _require_file_owner(user, existing)
-                except HTTPException as exc:
-                    row.update({"status": "failed", "detail": exc.detail})
-                    results.append(row)
+            results: list[dict[str, Any]] = []
+            saved_paths: list[str] = []
+            formats: list[str] = []
+            new_robot_style = str(parsed_annotation.get("robot_style") or "").strip()
+
+            def publish() -> None:
+                _touch_zip_job(job_id, detail="", **_zip_job_counts(results))
+
+            for info, rel in members:
+                original_name = Path(rel).name
+                planned = clip_plan.get(rel) or {}
+                if planned.get("skip"):
+                    results.append(
+                        {
+                            "name": original_name,
+                            "unit_name": "",
+                            "status": "skip",
+                            "detail": planned["skip"],
+                        }
+                    )
+                    publish()
                     continue
-            try:
-                with path.open("rb") as handle:
+                file_sub_path = planned.get("sub_path") or ""
+                effective_unit = planned.get("unit_name") or (
+                    normalize_unit_stem(Path(original_name).stem) or Path(original_name).stem
+                )
+                stored_name = planned.get("stored_name") or original_name
+                fmt = human_format_from_filename(original_name).lstrip(".")
+                row: dict[str, Any] = {
+                    "name": original_name,
+                    "unit_name": effective_unit,
+                    "status": "upload",
+                }
+                current = current_units.get((batch, effective_unit))
+                if not current:
+                    current = next(
+                        (
+                            item
+                            for item in snapshot.get("units", [])
+                            if item["batch"] == batch
+                            and stems_same_unit(item["name"], effective_unit)
+                        ),
+                        None,
+                    )
+                if current:
+                    _require_unit(db, user, Capability.upload, current)
+                else:
+                    ensure_capability(db, user, Capability.upload, f"/{batch}/{effective_unit}/")
+                existing = None
+                if current:
+                    existing = next(
+                        (
+                            item
+                            for item in current.get("files", [])
+                            if item["ontology"] == ontology
+                            and item["modality"] == modality
+                            and item["channel"] == channel
+                            and item["format"] == fmt
+                            and item["name"] == stored_name
+                            and (item.get("sub_path") or "") == file_sub_path
+                            and _stored_file_version(item) == version
+                            and (
+                                ontology != "robot"
+                                or not new_robot_style
+                                or str(item.get("robot_style") or "").strip() == new_robot_style
+                            )
+                        ),
+                        None,
+                    )
+                try:
+                    dest = data_destination(
+                        ontology=ontology,
+                        modality=modality,
+                        channel=channel,
+                        fmt=fmt,
+                        batch=batch,
+                        filename=stored_name,
+                        robot_style=new_robot_style,
+                        robot_acquire_method=robot_acquire_method,
+                        sub_path=file_sub_path,
+                        file_version=version,
+                        motion_kind=str(parsed_annotation.get("motion_kind") or ""),
+                    )
+                except ValueError as exc:
+                    row.update({"status": "failed", "detail": str(exc)})
+                    results.append(row)
+                    publish()
+                    continue
+                on_disk = dest.is_file()
+                if (existing or on_disk) and not replace:
+                    row["status"] = "skip"
+                    row["detail"] = f"已有同路径文件：{dest.relative_to(repo_root())}"
+                    results.append(row)
+                    publish()
+                    continue
+                if existing and not manage_override:
+                    try:
+                        _require_file_owner(user, existing)
+                    except HTTPException as exc:
+                        row.update({"status": "failed", "detail": exc.detail})
+                        results.append(row)
+                        publish()
+                        continue
+                try:
+                    extracted = safe_extract_member(
+                        archive_handle, info, work_dir, filename=rel
+                    )
                     result = save_data_file(
-                        handle,
+                        source_path=extracted,
                         ontology=ontology,
                         modality=modality,
                         channel=channel,
@@ -2171,7 +2476,7 @@ async def upload_data_zip(
                         batch=batch,
                         unit_name=row["unit_name"],
                         original_name=stored_name,
-                        replace=bool(existing and replace),
+                        replace=bool(replace and (existing or on_disk)),
                         update_index=False,
                         robot_style=str(parsed_annotation.get("robot_style") or ""),
                         robot_acquire_method=robot_acquire_method,
@@ -2180,20 +2485,23 @@ async def upload_data_zip(
                         motion_kind=str(parsed_annotation.get("motion_kind") or ""),
                         preserve_tree=True,
                     )
-                result["uploader"] = {"id": user.id, "username": user.username}
-                row.update(
-                    {
-                        "status": "replaced" if existing and replace else "uploaded",
-                        "file": result,
-                    }
-                )
-                saved_paths.append(result["path"])
-                formats.append(str(fmt).lstrip("."))
-            except (ValueError, OSError) as exc:
-                row.update({"status": "failed", "detail": str(exc)})
-            results.append(row)
+                    result["uploader"] = {"id": user.id, "username": user.username}
+                    row.update(
+                        {
+                            "status": "replaced" if replace and (existing or on_disk) else "uploaded",
+                            "file": result,
+                        }
+                    )
+                    saved_paths.append(result["path"])
+                    formats.append(str(fmt).lstrip("."))
+                except (ValueError, OSError) as exc:
+                    row.update({"status": "failed", "detail": str(exc)})
+                    warnings.append(f"导入失败 {original_name}: {exc}")
+                results.append(row)
+                publish()
 
         session = None
+        _touch_zip_job(job_id, detail="正在写入索引")
         if saved_paths:
             set_file_uploaders(saved_paths, user_id=user.id, username=user.username)
             csv_paths = [path for path in saved_paths if path.lower().endswith(".csv")]
@@ -2253,9 +2561,153 @@ async def upload_data_zip(
             results=results,
         )
         db.commit()
-        return summary
+        _touch_zip_job(
+            job_id,
+            status="done",
+            detail="",
+            result=summary,
+            total=len(results),
+            **_zip_job_counts(results),
+        )
+    except HTTPException as exc:
+        if db is not None:
+            db.rollback()
+        _touch_zip_job(job_id, status="failed", detail=_http_detail(exc))
+    except Exception as exc:
+        if db is not None:
+            db.rollback()
+        _touch_zip_job(job_id, status="failed", detail=str(exc) or "Zip 导入失败")
     finally:
+        if source_fd is not None:
+            os.close(source_fd)
+        if db is not None:
+            db.close()
         shutil.rmtree(staging, ignore_errors=True)
+
+
+@router.get("/data/upload-zip/active")
+def active_zip_import(
+    batch: str = Query(""),
+    user: User = Depends(get_current_user),
+):
+    batch = batch.strip()
+    now = time.time()
+    with _ZIP_JOBS_LOCK:
+        jobs = [
+            job
+            for job in _ZIP_JOBS.values()
+            if job["user_id"] == user.id
+            and (not batch or job["batch"] == batch)
+            and (job["status"] == "running" or now - float(job["started"]) < 6 * 3600)
+        ]
+        jobs.sort(key=lambda item: item["started"], reverse=True)
+        chosen = next((job for job in jobs if job["status"] == "running"), None)
+        if chosen is None and jobs:
+            chosen = jobs[0]
+        return _public_zip_job(chosen) if chosen is not None else _absent_zip_job()
+
+
+@router.get("/data/upload-zip/{job_id}")
+def zip_import_status(
+    job_id: str,
+    user: User = Depends(get_current_user),
+):
+    job = _copy_zip_job(job_id, user.id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="导入任务不存在")
+    return job
+
+
+@router.post("/data/upload-zip")
+async def upload_data_zip(
+    ontology: str = Form(...),
+    modality: str = Form(...),
+    channel: str = Form(""),
+    batch: str = Form(""),
+    replace: bool = Form(False),
+    follow_paths: bool = Form(False),
+    manage_override: bool = Form(False),
+    annotation: str = Form(""),
+    taxonomy_tag_ids: str = Form(""),
+    robot_acquire_method: str = Form(""),
+    file_version: str = Form(""),
+    local_path: str = Form(""),
+    file: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Accept a motion zip and import it after the response, so a slow disk cannot time out the page."""
+    if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
+        raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
+    filename = file.filename if file and file.filename else Path(local_path).name
+    if not str(filename).lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="请上传 .zip 文件")
+    batch = (batch or "").strip() or folder_name_from_zip_filename(filename)
+    ontology = ontology.strip().lower()
+    modality = modality.strip().lower()
+    channel = channel.strip().lower()
+    _parse_annotation_form(annotation)
+    parsed_tags = _parse_taxonomy_form(taxonomy_tag_ids)
+    if parsed_tags:
+        _validate_taxonomy_ids(db, parsed_tags)
+    ensure_capability(db, user, Capability.upload, f"/{batch}/")
+    version = _resolve_upload_file_version({"batches": []}, batch, file_version)
+
+    _tmp_root = Path("/hub_repo/index/tmp")
+    _tmp_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="storage_zip_", dir=_tmp_root))
+    source_fd: int | None = None
+    archive: Path | None = None
+    try:
+        if local_path.strip():
+            try:
+                archive = resolve_import_zip(local_path.strip())
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        elif file is not None:
+            file.file.seek(0)
+            source_fd = os.dup(file.file.fileno())
+        else:
+            raise HTTPException(status_code=400, detail="请选择 zip 或填写服务器路径")
+    except Exception:
+        if source_fd is not None:
+            os.close(source_fd)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    job_id = uuid.uuid4().hex
+    _new_zip_job(job_id, user.id, batch)
+    try:
+        threading.Thread(
+            target=_run_zip_import,
+            kwargs={
+                "job_id": job_id,
+                "staging": staging,
+                "archive": archive,
+                "source_fd": source_fd,
+                "user_id": user.id,
+                "ontology": ontology,
+                "modality": modality,
+                "channel": channel,
+                "batch": batch,
+                "replace": replace,
+                "follow_paths": follow_paths,
+                "manage_override": manage_override,
+                "annotation": annotation,
+                "taxonomy_tag_ids": taxonomy_tag_ids,
+                "robot_acquire_method": robot_acquire_method,
+                "version": version,
+            },
+            daemon=True,
+            name=f"zip-import-{job_id[:8]}",
+        ).start()
+    except Exception:
+        if source_fd is not None:
+            os.close(source_fd)
+        shutil.rmtree(staging, ignore_errors=True)
+        _touch_zip_job(job_id, status="failed", detail="无法启动导入")
+        raise
+    return _copy_zip_job(job_id)
 
 
 @router.get("/file-detail")
@@ -2360,7 +2812,7 @@ def get_file(
 ):
     if path.startswith("data/"):
         snapshot = scan_data()
-        file = next((item for item in snapshot["files"] if item["path"] == path), None)
+        file = _file_by_path(snapshot, path)
         unit = _unit_for_file(snapshot, path)
         if not unit:
             raise HTTPException(status_code=404, detail="文件未纳入数据单元")
@@ -2441,6 +2893,26 @@ def get_smpl_model(
         raise HTTPException(status_code=400, detail=f"SMPL 模型解析失败：{exc}") from exc
 
 
+@router.post("/smpl-motion")
+async def upload_smpl_motion(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """解析浏览器本地拖入的 SMPL 动作 npz。"""
+    from ..worker.parsers import load_smpl_motion
+
+    raw = await file.read()
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as handle:
+        handle.write(raw)
+        tmp = Path(handle.name)
+    try:
+        return load_smpl_motion(tmp)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SMPL 解析失败：{exc}") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 @router.get("/smpl-motion")
 def get_smpl_motion_by_path(
     path: str = Query(...),
@@ -2504,7 +2976,7 @@ def remove_file(
         raise HTTPException(status_code=404, detail="文件未纳入数据单元")
     _require_unit(db, user, Capability.edit, unit)
     try:
-        delete_repo_file(path)
+        delete_repo_file(path, actor=_actor(user), label=Path(path).name)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
     except ValueError as exc:
@@ -2512,7 +2984,7 @@ def remove_file(
     write_audit(
         db,
         user_id=user.id,
-        action="delete",
+        action="trash",
         entity_type="storage_file",
         detail={"path": path},
     )
@@ -2549,6 +3021,42 @@ def models(_: User = Depends(get_current_user)):
     result["instances"].sort(key=lambda x: (x["ontology"], x["name"]))
     result["kinds"] = MODEL_KINDS
     return result
+
+
+@router.get("/models/kind-zip")
+def download_model_kind_zip(
+    ontology: str = Query(...),
+    instance: str = Query(...),
+    kind: str = Query(...),
+    _: User = Depends(get_current_user),
+):
+    """Zip one model-type folder. The archive is named after the instance."""
+    try:
+        directory = model_kind_directory(ontology.strip().lower(), instance, kind.strip().lower())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    tmp_root = repo_root().parent / ".model_zip_tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(prefix="model-kind-", suffix=".zip", dir=tmp_root, delete=False)
+    handle.close()
+    archive_path = Path(handle.name)
+    try:
+        write_model_kind_zip(directory, archive_path)
+    except FileNotFoundError as exc:
+        archive_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    filename = f"{directory.name}.zip"
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
+    )
 
 
 @router.post("/models/instances")

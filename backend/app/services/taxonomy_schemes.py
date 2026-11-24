@@ -56,6 +56,7 @@ DEFAULT_CUSTOM_TREES: dict[str, dict] = {
         "omniretarget": ("K1", None),
         "umr": ("K2", None),
         "gmr": ("K3", None),
+        "frax": ("K4", None),
     },
 }
 
@@ -215,6 +216,26 @@ def ensure_default_custom_schemes(db: Session) -> None:
         if child_count == 0:
             tree = DEFAULT_CUSTOM_TREES.get(key) or {}
             _ensure(root, tree)
+        elif key == "custom_8":
+            frax_path = join_folder_path(root.path, "frax")
+            frax_node = (
+                db.query(TaxonomyNode)
+                .filter(TaxonomyNode.scheme == key, TaxonomyNode.path == frax_path)
+                .first()
+            )
+            if frax_node is None:
+                db.add(
+                    TaxonomyNode(
+                        scheme=key,
+                        parent_id=root.id,
+                        code="K4",
+                        name="frax",
+                        path=frax_path,
+                        sort_order=3,
+                        description="",
+                    )
+                )
+                db.flush()
     db.flush()
 
 

@@ -184,7 +184,7 @@ export function RepositoryModelsPage() {
       if (!uploadFile) {
         setError(
           kind === "standard_description"
-            ? "请选择包含 meshes、mjcf、urdf 的文件夹或 zip"
+            ? "请选择包含网格和 URDF 的文件夹或 zip"
             : "请选择模型文件"
         );
         return;
@@ -330,24 +330,43 @@ export function RepositoryModelsPage() {
                 {kinds.map((item) => {
                   const count = selected.files.filter((f) => f.kind === item).length;
                   return (
-                    <button
-                      type="button"
-                      key={item}
-                      className={kind === item ? "active" : "secondary"}
-                      onClick={() => {
-                        setKind(item);
-                        setFile(null);
-                        setFolderFiles([]);
-                        setPreviewId(
-                          item === "standard_description"
-                            ? defaultDescriptionFile(selected)?.id || null
-                            : null
-                        );
-                      }}
-                    >
-                      {KIND_LABEL[item] || item}
-                      <small>{count ? `${count} 个文件` : "缺省"}</small>
-                    </button>
+                    <div key={item} className="storage-model-kind">
+                      <button
+                        type="button"
+                        className={kind === item ? "active" : "secondary"}
+                        onClick={() => {
+                          setKind(item);
+                          setFile(null);
+                          setFolderFiles([]);
+                          setPreviewId(
+                            item === "standard_description"
+                              ? defaultDescriptionFile(selected)?.id || null
+                              : null
+                          );
+                        }}
+                      >
+                        {KIND_LABEL[item] || item}
+                        <small>{count ? `${count} 个文件` : "缺省"}</small>
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={!count}
+                        title={
+                          count
+                            ? `下载 ${selected.name}.zip，压缩包里直接是这个类型文件夹的内容`
+                            : "该类型还没有文件"
+                        }
+                        onClick={() => {
+                          void downloadAuth(
+                            api.storageModelKindZipUrl(selected.ontology, selected.name, item),
+                            `${selected.name}.zip`
+                          ).catch((e) => setError(e instanceof Error ? e.message : "下载失败"));
+                        }}
+                      >
+                        下载
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -487,8 +506,8 @@ export function RepositoryModelsPage() {
                   {kind === "standard_description" ? (
                     <>
                       <div className="storage-standard-help">
-                        需包含 meshes 和 urdf。mjcf 若缺失或为空，会按所选 URDF 自动生成并保存：
-                        <pre>{`${selected.name}/\n├── meshes/   （网格文件）\n├── mjcf/     （可留空，将按 URDF 自动生成）\n└── urdf/     （至少一个 URDF）`}</pre>
+                        需包含网格和 URDF。URDF 可以单独放在 urdf/，也可以和网格一起放在 meshes/。mjcf 若缺失，会按所选 URDF 自动生成，并写入重定向配置：
+                        <pre>{`${selected.name}/\n├── meshes/   （网格，URDF 也可以放在这里）\n├── mjcf/     （可留空，将按 URDF 自动生成）\n└── urdf/     （整理后的 URDF）`}</pre>
                       </div>
                       <FolderDropZone
                         allowZip
@@ -503,7 +522,7 @@ export function RepositoryModelsPage() {
                           setError("");
                         }}
                         disabled={busy}
-                        hint="需包含 meshes 和 urdf，mjcf 可自动生成"
+                        hint="需包含网格和 URDF。URDF 放在 meshes 里也可以，mjcf 会自动生成"
                       />
                       <label>
                         默认描述文件

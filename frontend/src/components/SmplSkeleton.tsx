@@ -19,6 +19,8 @@ import {
   type UpAxis,
   type UpAxisMode,
 } from "../viewerUpAxis";
+import { useReportPlayback } from "../playbackClock";
+import { NAMES_OFF, NameToggleButtons, SmplNameLabels, useNameFlags, type NameFlags } from "./NameLabels";
 
 /**
  * SMPL / SMPL-X / SMPL-H 动作骨架播放。
@@ -291,12 +293,16 @@ function SmplFigure({
   positionsRef,
   rotationX,
   visible = true,
+  names = NAMES_OFF,
+  skeletonName = "SMPL",
 }: {
   motion: SmplMotion;
   time: number;
   positionsRef: RefObject<Vec3Array>;
   rotationX: number;
   visible?: boolean;
+  names?: NameFlags;
+  skeletonName?: string;
 }) {
   const look = useViewerLook();
   const frameCount = motion.poses.length;
@@ -360,6 +366,7 @@ function SmplFigure({
   });
 
   return (
+    <>
     <group rotation={[rotationX, 0, 0]} visible={visible}>
       <primitive object={lineObj} />
       <instancedMesh ref={dotsRef} args={[undefined, undefined, JOINT_COUNT]} frustumCulled={false}>
@@ -367,6 +374,10 @@ function SmplFigure({
         <meshBasicMaterial color={look.joint} />
       </instancedMesh>
     </group>
+    <group rotation={[rotationX, 0, 0]}>
+      <SmplNameLabels positions={jointPositions} names={names} skeletonName={skeletonName} />
+    </group>
+    </>
   );
 }
 
@@ -471,6 +482,8 @@ function SmplScene({
   viewNonce,
   upAxisMode,
   followRoot = false,
+  names = NAMES_OFF,
+  skeletonName = "SMPL",
   onDuration,
   onStatus,
   onDetectedUpAxis,
@@ -481,6 +494,8 @@ function SmplScene({
   viewNonce: number;
   upAxisMode: UpAxisMode;
   followRoot?: boolean;
+  names?: NameFlags;
+  skeletonName?: string;
   onDuration?: (sec: number) => void;
   onStatus?: (status: "loading" | "ready" | "error", message?: string) => void;
   onDetectedUpAxis?: (up: UpAxis) => void;
@@ -563,6 +578,8 @@ function SmplScene({
           positionsRef={positionsRef}
           rotationX={rotationX}
           visible={!body}
+          names={names}
+          skeletonName={skeletonName}
         />
       )}
       <FollowSmplRoot positionsRef={positionsRef} rotationX={rotationX} enabled={followRoot} />
@@ -582,9 +599,17 @@ function SmplScene({
 }
 
 /** 完整 SMPL 动作预览（画布 + 播放条），用于存储页同屏预览。 */
-export function SmplPreview({ file }: { file: StorageFile }) {
-  const url = api.storageSmplMotionUrl(file.path);
+export function SmplPreview({
+  file,
+  motionUrl,
+}: {
+  file: StorageFile;
+  motionUrl?: string;
+}) {
+  const [names] = useNameFlags();
+  const url = motionUrl || api.storageSmplMotionUrl(file.path);
   const [time, setTime] = useState(0);
+  useReportPlayback(time);
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [duration, setDuration] = useState(0);
@@ -601,7 +626,7 @@ export function SmplPreview({ file }: { file: StorageFile }) {
   useEffect(() => {
     let cancelled = false;
     api
-      .storageModels()
+      .storageModels({ quiet: true })
       .then((data) => {
         if (!cancelled) setInstances(data.instances.filter((item) => item.ontology === "human"));
       })
@@ -679,6 +704,8 @@ export function SmplPreview({ file }: { file: StorageFile }) {
             viewNonce={viewNonce}
             upAxisMode={upAxisMode}
             followRoot={followRoot}
+            names={names}
+            skeletonName={modelName || "SMPL"}
             onDuration={setDuration}
             onDetectedUpAxis={setDetectedUp}
           />
@@ -780,6 +807,7 @@ export function SmplPreview({ file }: { file: StorageFile }) {
         >
           {upAxisLabel}
         </button>
+        <NameToggleButtons />
       </div>
       <div className="muted animation-format-note">
         {modelFile

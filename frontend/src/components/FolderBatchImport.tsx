@@ -14,6 +14,7 @@ import type {
   StorageOverview,
   TaxonomyNode,
   TaxonomySchemeDef,
+  ZipImportJob,
 } from "../types";
 import {
   compactTaxonomyTagIds,
@@ -57,6 +58,43 @@ function resolveImportTarget(
   if (repair) return { batch: repair, existing: true };
   if (choice === "existing") return { batch: folderName, existing: true };
   return { batch: batchName.trim(), existing: false };
+}
+
+function isGatewayTimeout(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /gateway time-?out|504|timed out/i.test(message);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollZipJob(
+  jobId: string,
+  onProgress: (job: ZipImportJob) => void
+): Promise<StorageFolderUploadResult> {
+  let misses = 0;
+  for (;;) {
+    try {
+      const job = await api.storageUploadZipJob(jobId);
+      misses = 0;
+      onProgress(job);
+      if (job.status === "done") {
+        if (!job.result) throw new Error("导入已完成，但没有返回结果");
+        return job.result;
+      }
+      if (job.status === "failed") throw new Error(job.detail || "Zip 导入失败");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const retryable = /无法连接|接口不存在|Failed to fetch/.test(message);
+      if (!retryable) throw error;
+      misses += 1;
+      if (misses >= 5) {
+        throw new Error("导入任务已中断。请到批次里确认文件，不要直接重新导入。");
+      }
+    }
+    await sleep(1500);
+  }
 }
 
 function validateFileVersion(
@@ -287,6 +325,7 @@ export function FolderBatchImport({
   const [zipDraft, setZipDraft] = useState<ZipImportDraft | null>(null);
   const [folderResult, setFolderResult] = useState<StorageFolderUploadResult | null>(null);
   const [folderBusy, setFolderBusy] = useState(false);
+  const [zipProgress, setZipProgress] = useState<ZipImportJob | null>(null);
   const [folderError, setFolderError] = useState("");
   const [fileFilter, setFileFilter] = useState<"all" | "new" | "skipped">("all");
   const [localZipPath, setLocalZipPath] = useState("");
@@ -311,7 +350,7 @@ export function FolderBatchImport({
     if (!needRobotStyles && !needHumanModels) return;
     let cancelled = false;
     api
-      .storageModels()
+      .storageModels({ quiet: true })
       .then((data) => {
         if (cancelled) return;
         if (needRobotStyles) {
@@ -552,24 +591,43 @@ export function FolderBatchImport({
       }
       let sessionId: string | undefined;
       const uploadedPaths: string[] = [];
+      const showZipResult = (result: StorageFolderUploadResult) => {
+        sessionId = result.upload_session_id || undefined;
+        uploadedPaths.splice(
+          0,
+          uploadedPaths.length,
+          ...result.items.map((item) => item.file?.path).filter((path): path is string => !!path)
+        );
+        setFolderError("");
+        setFolderResult(result);
+        invalidateStorageOverview();
+        onImported(targetBatch, sessionId);
+        if (!result.failed) {
+          onMessage(
+            `Zip 导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
+          );
+        }
+      };
       await execute({
         label: `导入 Zip 到 ${targetBatch}`,
         do: async () => {
-          const result = await api.storageUploadZip(form);
-          sessionId = result.upload_session_id || undefined;
-          uploadedPaths.splice(
-            0,
-            uploadedPaths.length,
-            ...result.items.map((item) => item.file?.path).filter((path): path is string => !!path)
-          );
-          setFolderResult(result);
-          invalidateStorageOverview();
-          onImported(targetBatch, sessionId);
-          if (!result.failed) {
-            onMessage(
-              `Zip 导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
-            );
+          let job: ZipImportJob;
+          try {
+            job = await api.storageUploadZip(form);
+          } catch (error) {
+            if (!isGatewayTimeout(error)) throw error;
+            job = await api.storageActiveZipJob(targetBatch);
+            if (!job.job_id || job.status === "absent") {
+              throw new Error("网关等待超时。请到批次里查看是否已经写入，不要重复导入。");
+            }
           }
+          setZipProgress(job);
+          if (job.status === "failed") throw new Error(job.detail || "Zip 导入失败");
+          const result =
+            job.status === "done" && job.result
+              ? job.result
+              : await pollZipJob(job.job_id || "", (update) => setZipProgress(update));
+          showZipResult(result);
         },
         undo: async () => {
           await undoUploadSession(sessionId, uploadedPaths);
@@ -579,6 +637,7 @@ export function FolderBatchImport({
       setFolderError(e instanceof Error ? e.message : "Zip 导入失败");
     } finally {
       setFolderBusy(false);
+      setZipProgress(null);
     }
   };
 
@@ -1565,8 +1624,16 @@ export function FolderBatchImport({
               </label>
               {folderBusy && (
                 <div className="stack">
-                  <span>正在解压并导入 zip，请勿关闭…</span>
-                  <progress className="storage-folder-progress" />
+                  <span>
+                    {zipProgress && zipProgress.total > 0
+                      ? `正在导入 zip，已处理 ${zipProgress.processed} / ${zipProgress.total}，请勿关闭…`
+                      : `${zipProgress?.detail || "正在解压并导入 zip"}，请勿关闭…`}
+                  </span>
+                  <progress
+                    className="storage-folder-progress"
+                    value={zipProgress && zipProgress.total > 0 ? zipProgress.processed : undefined}
+                    max={zipProgress && zipProgress.total > 0 ? zipProgress.total : undefined}
+                  />
                 </div>
               )}
               {folderError && <div className="error">{folderError}</div>}
@@ -1578,6 +1645,23 @@ export function FolderBatchImport({
                 >
                   上传 {folderResult.uploaded}，替换 {folderResult.replaced}，跳过{" "}
                   {folderResult.skipped}，失败 {folderResult.failed}
+                  {folderResult.skipped > 0 && !folderResult.uploaded && !folderResult.replaced && !folderResult.failed ? (
+                    <div className="muted" style={{ marginTop: 4 }}>
+                      这些文件已经在这个批次里，没有重复写入。
+                    </div>
+                  ) : null}
+                  {!!folderResult.failed && (
+                    <ul>
+                      {folderResult.items
+                        ?.filter((item) => item.status === "failed")
+                        .slice(0, 8)
+                        .map((item) => (
+                          <li key={`${item.name}-${item.detail || ""}`}>
+                            {item.name}：{item.detail || "导入失败"}
+                          </li>
+                        ))}
+                    </ul>
+                  )}
                 </div>
               )}
               <div className="row storage-folder-actions">

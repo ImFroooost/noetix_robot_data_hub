@@ -3,9 +3,14 @@
 For each data unit that has human motion and is missing one or more robot styles,
 pick a source file (merged before skeleton, then fbx, bvh, smpl) and run
 holosoma_retargeting's data_utils/batch_retarget_to_csv.py in a fresh process
-(same flags as the official batch command). Merged FBX carries the scene
-objects the new retargeter reads. Outputs stay headerless 30 Hz skeleton
-CSVs under data/robot/<style>/motion/omniretarget/skeleton/csv/<batch>/...
+(same flags as the official batch command). Merged FBX keeps the capture
+origin: Y-up becomes Z-up, then the human and the rigid bodies are scaled by
+the same robot-height factor. Rigid bodies and markers are written as object
+XML and CSV in that frame. The retargeted
+robot and those objects are also written as one merged FBX, plus the
+robot merged npz and the zip of skeleton CSV plus object CSV/XML. Robot skeleton
+CSVs stay headerless 30 Hz under
+data/robot/<style>/motion/omniretarget/skeleton/csv/<batch>/...
 
 Run on the host with the holosoma virtualenv:
 
@@ -16,9 +21,11 @@ Run on the host with the holosoma virtualenv:
 from __future__ import annotations
 
 import ast
+import csv
 import json
 import os
 import shutil
+import xml.etree.ElementTree as ET
 import struct
 import subprocess
 import sys
@@ -39,6 +46,8 @@ PKG = Path(
 BACKEND = Path("/media/noetix/my_passport1/noetix_robot_data_hub/backend")
 STATE_PATH = HUB / "index" / "auto_retarget_state.json"
 LOG_PATH = HUB / "index" / "auto_retarget.log"
+# Rotated to auto_retarget.log.1 … .3 past this size.
+LOG_MAX_BYTES = 200 * 1024 * 1024
 STATUS_PATH = HUB / "index" / "auto_retarget_status.json"
 _status_lock = threading.Lock()
 _status: dict = {}
@@ -47,14 +56,16 @@ sys.path.insert(0, str(BACKEND))
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(PKG / "holosoma_retargeting" / "data_utils"))
 
+from app.services.file_lock import locked, rotate_if_large, write_text_atomic  # noqa: E402
 from app.services.retarget_control import load_control, wave_plan  # noqa: E402
 from app.services.retarget_priority import (  # noqa: E402
     FOLDER_SCHEME,
     UNLISTED,
     config_path,
     describe_rule,
+    rule_rank_label,
     folder_constraints,
-    job_queue,
+    batch_reserved_for,
     job_queue,
     load_config,
     load_pins,
@@ -70,6 +81,7 @@ from app.services.retarget_priority import (  # noqa: E402
 )
 from app.services.retarget_select import (  # noqa: E402
     choose_human_source,
+    choose_scene_source,
     human_height_m,
     output_stem,
 )
@@ -90,10 +102,32 @@ RETARGET_PYTHON = Path(
 )
 INNER = PKG / "holosoma_retargeting"
 RETARGET_METHOD = "batch_retarget_to_csv"
+# FBX SDK bindings in this tree are built for Python 3.7.
+FBX_PYTHON = Path(
+    os.environ.get(
+        "FBX_PYTHON",
+        "/home/noetix/miniforge3/pkgs/python-3.7.12-hf930737_100_cpython/bin/python3.7",
+    )
+)
+FBX_PYTHONPATH = Path(
+    os.environ.get(
+        "FBX_PYTHONPATH",
+        "/home/noetix/Desktop/new_home/softwares/fbx202021_fbxpythonsdk_linux/lib/Python37_x64",
+    )
+)
 # CSVs written by the in-process loop on this day used a stale solver and are redone.
 REDO_AFTER = datetime(2026, 9, 24).timestamp()
 # Acquire-method directory inserted under robot/<style>/motion/.
-_ACQUIRE_METHODS = frozenset({"omniretarget", "umr", "gmr"})
+_ACQUIRE_METHODS = frozenset({"omniretarget", "umr", "gmr", "frax"})
+FRAX_ROOT = Path(
+    os.environ.get(
+        "FRAX_ROOT",
+        "/media/noetix/samsung_9901/new_home_2/code/open_src/frax",
+    )
+)
+FRAX_PYTHON = Path(
+    os.environ.get("FRAX_PYTHON", str(FRAX_ROOT / ".venv" / "bin" / "python"))
+)
 # Outputs finished in this process. A priority rescan can happen before the
 # next catalog pass attaches them to their data unit.
 _finished_outputs: set[str] = set()
@@ -116,9 +150,7 @@ def _now() -> str:
 def _dump_status_locked() -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(_status, ensure_ascii=False)
-    tmp = STATUS_PATH.with_suffix(".json.tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(STATUS_PATH)
+    write_text_atomic(STATUS_PATH, payload)
 
 
 def publish_status(**fields: object) -> None:
@@ -220,7 +252,7 @@ def fresh_queues(
             {
                 "key": rule["id"],
                 "rule_id": rule["id"],
-                "rank": str(index + 1),
+                "rank": rule_rank_label(rule, index),
                 "title": describe_rule(rule, seen_robots, rules),
                 "total": 0,
                 "done": 0,
@@ -332,6 +364,7 @@ def log(message: str) -> None:
     line = f"{datetime.now(timezone.utc).isoformat()} {message}"
     print(line, flush=True)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    rotate_if_large(LOG_PATH, max_bytes=LOG_MAX_BYTES)
     with LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
 
@@ -742,6 +775,7 @@ def sort_jobs(
         robot_rank, category_rank = selection_rank(job)
         pinned = 0 if job.get("queue") == "pinned" else 1
         return (
+            0 if job.get("object_only") or job.get("merged_only") else 1,
             pinned,
             order.get(job["queue"], len(compiled)),
             robot_rank,
@@ -863,11 +897,113 @@ def _note_skipped_npz(count: int) -> None:
         _last_skipped_npz = count
 
 
+def _styles_for_scene(files: list[dict], scheduled: list[str]) -> list[str]:
+    """Scheduled styles, plus any style that already has a skeleton CSV for this unit."""
+    ordered = list(scheduled)
+    seen = set(ordered)
+    for item in files:
+        if str(item.get("ontology") or "") != "robot":
+            continue
+        name = str(item.get("name") or "")
+        fmt = str(item.get("format") or "").lower()
+        if fmt != "csv" and not name.lower().endswith(".csv"):
+            continue
+        path = str(item.get("path") or "").replace("\\", "/")
+        if "/object/" in path or "/skeleton/csv/" not in path:
+            continue
+        style = str(item.get("robot_style") or "").strip()
+        if style and style not in seen:
+            ordered.append(style)
+            seen.add(style)
+    return ordered
+
+
+def _acquire_in_path(path: str) -> str:
+    parts = str(path or "").replace("\\", "/").split("/")
+    if "motion" in parts:
+        index = parts.index("motion") + 1
+        if index < len(parts) and parts[index] in _ACQUIRE_METHODS:
+            return parts[index]
+    return "omniretarget"
+
+
+def _frax_source(source: dict) -> bool:
+    name = str(source.get("name") or "").lower()
+    return name.endswith(".fbx") or name.endswith(".bvh") or name.endswith(".fbx.zst")
+
+
+def _planned_skeleton_dest(
+    style: str, source: dict, batch: str, method: str = "omniretarget"
+) -> Path:
+    stem = output_stem(source["name"])
+    sub = source.get("sub_path") or ""
+    version = str(source.get("file_version") or ORIGINAL_FILE_VERSION)
+    dest = HUB / "data" / "robot" / style / "motion" / method / "skeleton" / "csv" / batch
+    if version and version != ORIGINAL_FILE_VERSION:
+        dest = dest / FILE_VERSION_DIR / version
+    if sub:
+        dest = dest / sub
+    return dest / f"{stem}.csv"
+
+
+def _scene_skeleton_dests(
+    files: list[dict],
+    style: str,
+    source: dict,
+    batch: str,
+    scheduled: bool,
+    method: str = "omniretarget",
+) -> list[Path]:
+    dests: list[Path] = []
+    seen: set[str] = set()
+    for item in files:
+        if str(item.get("robot_style") or "") != style:
+            continue
+        path = str(item.get("path") or "").replace("\\", "/")
+        if "/skeleton/csv/" not in path or not path.endswith(".csv"):
+            continue
+        if _acquire_in_path(path) != method:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        dests.append(HUB / path)
+    if scheduled:
+        planned = _planned_skeleton_dest(style, source, batch, method)
+        key = planned.relative_to(HUB).as_posix()
+        if key not in seen:
+            dests.append(planned)
+    return dests
+
+
+def _active_retarget_method() -> str:
+    method = str(load_control(HUB).get("method") or "omniretarget")
+    if method not in {"omniretarget", "frax"}:
+        return "omniretarget"
+    return method
+
+
+def _style_method_dests(
+    files: list[dict],
+    style: str,
+    source: dict,
+    batch: str,
+    scheduled: bool,
+    method: str | None = None,
+):
+    chosen = method or _active_retarget_method()
+    if chosen == "frax" and not _frax_source(source):
+        return
+    for dest in _scene_skeleton_dests(files, style, source, batch, scheduled, chosen):
+        yield chosen, dest
+
+
 def collect_jobs(
     grouped: dict[tuple[str, str], list[dict]],
     state: dict,
     compiled: list[tuple] | None = None,
     redo: dict[str, float] | None = None,
+    acquire_method: str | None = None,
 ) -> list[dict]:
     failures = state.get("failures") or {}
     pins = load_pins(HUB)
@@ -896,71 +1032,130 @@ def collect_jobs(
             continue
         source = dict(source)
         source["abs"] = str(source.get("abs") or "")
+        scene = choose_scene_source(files)
+        scene_payload = None
+        if scene is not None:
+            scene_abs = str(scene.get("abs") or "")
+            recorded = (state.get("no_scene") or {}).get(scene_abs)
+            try:
+                scene_mtime = Path(scene_abs).stat().st_mtime if scene_abs else None
+            except OSError:
+                scene_mtime = None
+            if recorded is None or scene_mtime is None or float(recorded) != float(scene_mtime):
+                scene_payload = dict(scene)
+                scene_payload["abs"] = scene_abs
         tag_ids: set[int] = set()
         for item in files:
             tag_ids |= set(item.get("tag_ids") or ())
         tag_list = sorted(tag_ids)
         pinned = pin_index(pins, batch, unit) is not None
-        for style in styles:
-            key = f"{batch}::{unit}::{style}::{source['path']}"
-            until = float(failures.get(key) or 0)
-            redo_after = None
-            scope_queue = ""
-            if compiled:
-                scope_queue = job_queue(
-                    style,
-                    set(tag_list),
-                    compiled,
-                    batch=batch,
-                    unit=unit,
-                    sub_path=str(source.get("sub_path") or ""),
-                )
-                redo_after = redo.get(scope_queue)
-            stem = output_stem(source["name"])
-            sub = source.get("sub_path") or ""
-            version = str(source.get("file_version") or ORIGINAL_FILE_VERSION)
-            dest = HUB / "data" / "robot" / style / "motion" / "omniretarget" / "skeleton" / "csv" / batch
-            if version and version != ORIGINAL_FILE_VERSION:
-                dest = dest / FILE_VERSION_DIR / version
-            if sub:
-                dest = dest / sub
-            dest = dest / f"{stem}.csv"
-            needs = needs_official_retarget(dest, files, style, redo_after=redo_after)
-            if scope_queue:
-                bucket = scope.setdefault(scope_queue, {"total": 0, "done": 0})
-                bucket["total"] += 1
-                if not needs:
-                    bucket["done"] += 1
-            if redo_after is not None:
-                failed_at = until - 30 * 60
-                cooling = until > now and failed_at >= redo_after
-                if cooling or needs:
-                    pending_redo.add(scope_queue)
-                if cooling or not needs:
-                    continue
-            elif until > now and not pinned and not any(
-                targets_match(rule, batch, unit) for rule in targeted
+        for style in _styles_for_scene(files, styles):
+            if batch_reserved_for(compiled, style, batch) is False:
+                continue
+            scheduled = style in styles
+            for method, dest in _style_method_dests(
+                files, style, source, batch, scheduled, acquire_method
             ):
-                continue
-            elif not needs:
-                continue
-            if redo_after is not None:
-                redo_jobs += 1
-            jobs.append(
-                {
-                    "batch": batch,
-                    "unit": unit,
-                    "style": style,
-                    "source": source,
-                    "dest": str(dest),
-                    "failure_key": key,
-                    "kind": "skeleton",
-                    "height": human_height_m(source.get("annotation")),
-                    "tag_ids": tag_list,
-                    "redo_after": redo_after,
-                    "scope_queue": scope_queue,
-                }
-            )
+                needs = scheduled and needs_official_retarget(dest, files, style, redo_after=None)
+                needs_objects = (
+                    scene_payload is not None
+                    and not scene_outputs_ready(dest)
+                    and scene_copy_available(dest)
+                )
+                needs_merged = (
+                    scene_payload is not None
+                    and dest.is_file()
+                    and dest.stat().st_size > 0
+                    and scene_outputs_ready(dest)
+                    and not merged_fbx_ready(dest)
+                )
+                needs_packages = (
+                    dest.is_file()
+                    and dest.stat().st_size > 0
+                    and scene_outputs_ready(dest)
+                    and not packages_ready(dest)
+                )
+                if not scheduled:
+                    needs = False
+                object_only = (not needs) and needs_objects
+                merged_only = (not needs) and (not needs_objects) and needs_merged
+                package_only = (
+                    (not needs) and (not needs_objects) and (not needs_merged) and needs_packages
+                )
+                needs_work = needs or needs_objects or needs_merged or needs_packages
+                key = f"{batch}::{unit}::{style}::{source['path']}"
+                if method != "omniretarget":
+                    key += f"::{method}"
+                if object_only:
+                    key += "::object"
+                elif merged_only:
+                    key += "::merged"
+                elif package_only:
+                    key += "::package"
+                until = float(failures.get(key) or 0)
+                redo_after = None
+                scope_queue = ""
+                if compiled and scheduled:
+                    scope_queue = job_queue(
+                        style,
+                        set(tag_list),
+                        compiled,
+                        batch=batch,
+                        unit=unit,
+                        sub_path=str(source.get("sub_path") or ""),
+                    )
+                    redo_after = redo.get(scope_queue)
+                    if redo_after is not None and not object_only and not merged_only and not package_only:
+                        needs = needs_official_retarget(dest, files, style, redo_after=redo_after)
+                        object_only = (not needs) and needs_objects
+                        merged_only = (not needs) and (not needs_objects) and needs_merged
+                        package_only = (
+                            (not needs)
+                            and (not needs_objects)
+                            and (not needs_merged)
+                            and needs_packages
+                        )
+                        needs_work = needs or needs_objects or needs_merged or needs_packages
+                if scope_queue:
+                    bucket = scope.setdefault(scope_queue, {"total": 0, "done": 0})
+                    bucket["total"] += 1
+                    if not needs_work:
+                        bucket["done"] += 1
+                if redo_after is not None and not object_only and not merged_only and not package_only:
+                    failed_at = until - 30 * 60
+                    cooling = until > now and failed_at >= redo_after
+                    if cooling or needs:
+                        pending_redo.add(scope_queue)
+                    if cooling or not needs_work:
+                        continue
+                elif until > now and not pinned and not any(
+                    targets_match(rule, batch, unit) for rule in targeted
+                ):
+                    continue
+                elif not needs_work:
+                    continue
+                if redo_after is not None and needs:
+                    redo_jobs += 1
+                jobs.append(
+                    {
+                        "batch": batch,
+                        "unit": unit,
+                        "style": style,
+                        "source": source,
+                        "scene_source": scene_payload,
+                        "object_only": object_only,
+                        "merged_only": merged_only,
+                        "package_only": package_only,
+                        "dest": str(dest),
+                        "method": method,
+                        "failure_key": key,
+                        "kind": "skeleton",
+                        "height": human_height_m(source.get("annotation")),
+                        "tag_ids": tag_list,
+                        "redo_after": redo_after,
+                        "scope_queue": scope_queue,
+                    }
+                )
     _note_skipped_npz(skipped_npz)
     if redo_jobs:
         log(f"全部重做 {redo_jobs} 条，新的 CSV 写好后覆盖原来的文件")
@@ -973,6 +1168,13 @@ def remember_files(rows: list[tuple[str, dict]]) -> None:
     if not rows:
         return
     meta_path = HUB / "index" / "repository.json"
+    # Same lock as the API's update_metadata: without it a tag saved in the
+    # page between this read and write is overwritten.
+    with locked(meta_path):
+        _remember_files_locked(meta_path, rows)
+
+
+def _remember_files_locked(meta_path: Path, rows: list[tuple[str, dict]]) -> None:
     data = json.loads(meta_path.read_text())
     now = datetime.now(timezone.utc).isoformat()
     for rel, annotation in rows:
@@ -989,9 +1191,7 @@ def remember_files(rows: list[tuple[str, dict]]) -> None:
         media["size"] = target.stat().st_size
         media["mtime"] = int(target.stat().st_mtime)
     data["version"] = int(data.get("version") or 1) + 1
-    tmp = meta_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(meta_path)
+    write_text_atomic(meta_path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
 
 def mark_finished_output(rel: str) -> None:
@@ -1046,7 +1246,7 @@ def needs_official_retarget(
         item_style = str(item.get("robot_style") or "")
         if style and item_style and item_style != style:
             continue
-        if (item.get("annotation") or {}).get("retarget_method") == RETARGET_METHOD:
+        if (item.get("annotation") or {}).get("retarget_method") in {RETARGET_METHOD, "frax"}:
             return False
     return dest.stat().st_mtime >= REDO_AFTER
 
@@ -1072,6 +1272,429 @@ def _solver_reason(log_path: Path) -> str:
     return lines[-1] if lines else "重定向没有写出 csv"
 
 
+def source_keeps_capture(job: dict) -> bool:
+    """Merged or object human data stays on the capture origin."""
+    source = job.get("source") or {}
+    kind = str(source.get("path_motion_kind") or "")
+    path = str(source.get("path") or "").replace("\\", "/")
+    return kind in {"merged", "object"} or "/merged/" in path or "/object/" in path
+
+
+def scene_output_paths(job: dict) -> tuple[Path, Path]:
+    """Object files sit with the robot, beside the skeleton CSV.
+
+    ``.../omniretarget/skeleton/csv/<batch>/name.csv`` becomes
+    ``.../omniretarget/object/xml/<batch>/name.xml`` and ``object/csv/...csv``.
+    """
+    dest = Path(job["dest"])
+    parts = list(dest.parts)
+    for index in range(len(parts) - 1):
+        if parts[index] == "skeleton" and parts[index + 1] == "csv":
+            parts[index] = "object"
+            break
+    else:
+        raise ValueError(f"机器人骨架路径里没有 skeleton/csv：{dest}")
+
+    def place(fmt: str) -> Path:
+        copied = list(parts)
+        copied[copied.index("object") + 1] = fmt
+        return Path(*copied).with_suffix(f".{fmt}")
+
+    return place("xml"), place("csv")
+
+
+def merged_fbx_path(dest: Path) -> Path:
+    """``.../skeleton/csv/<batch>/name.csv`` -> ``.../merged/fbx/<batch>/name.fbx``."""
+    parts = list(Path(dest).parts)
+    for index in range(len(parts) - 1):
+        if parts[index] == "skeleton" and parts[index + 1] == "csv":
+            parts[index] = "merged"
+            parts[index + 1] = "fbx"
+            break
+    else:
+        raise ValueError(f"机器人骨架路径里没有 skeleton/csv：{dest}")
+    return Path(*parts).with_suffix(".fbx")
+
+
+def merged_package_path(dest: Path, fmt: str) -> Path:
+    """``.../skeleton/csv/<batch>/name.csv`` -> ``.../merged/<fmt>/<batch>/name.<fmt>``."""
+    parts = list(Path(dest).parts)
+    for index in range(len(parts) - 1):
+        if parts[index] == "skeleton" and parts[index + 1] == "csv":
+            parts[index] = "merged"
+            parts[index + 1] = fmt
+            break
+    else:
+        raise ValueError(f"机器人骨架路径里没有 skeleton/csv：{dest}")
+    return Path(*parts).with_suffix(f".{fmt}")
+
+
+def packages_ready(dest: Path) -> bool:
+    try:
+        npz_path = merged_package_path(dest, "npz")
+        zip_path = merged_package_path(dest, "zip")
+    except ValueError:
+        return False
+    return (
+        npz_path.is_file()
+        and zip_path.is_file()
+        and npz_path.stat().st_size > 0
+        and zip_path.stat().st_size > 0
+    )
+
+
+def export_robot_packages(job: dict, skeleton_csv: Path) -> list[Path]:
+    """Write the robot merged npz and the zip of skeleton CSV plus object files."""
+    if not skeleton_csv.is_file() or skeleton_csv.stat().st_size <= 0:
+        return []
+    if not scene_outputs_ready(skeleton_csv):
+        return []
+    xml_path, csv_path = scene_output_paths({"dest": str(skeleton_csv)})
+    style = str(job.get("style") or "")
+    urdf = style_urdf(style)
+    if urdf is None:
+        log(f"缺少 URDF，跳过合并 npz/zip {style}")
+        return []
+    sys.path.insert(0, str(BACKEND / "scripts"))
+    from export_robot_merged_npz import build_one
+
+    written: list[Path] = []
+    npz_path = merged_package_path(skeleton_csv, "npz")
+    build_one(skeleton_csv, xml_path, csv_path, urdf, npz_path, style)
+    written.append(npz_path)
+    zip_path = merged_package_path(skeleton_csv, "zip")
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = zip_path.with_suffix(".zip.tmp")
+    extra_csvs = sorted(
+        path
+        for path in skeleton_csv.parent.glob(skeleton_csv.stem + "_skeleton_*.csv")
+        if path.is_file() and path.stat().st_size > 0
+    )
+    with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(skeleton_csv, f"skeleton/{skeleton_csv.name}")
+        for extra in extra_csvs:
+            archive.write(extra, f"skeleton/{extra.name}")
+        archive.write(csv_path, f"object/{csv_path.name}")
+        archive.write(xml_path, f"object/{xml_path.name}")
+    staged.replace(zip_path)
+    written.append(zip_path)
+    log(f"合并 npz/zip {npz_path.relative_to(HUB).as_posix()}")
+    return written
+
+
+def merged_fbx_ready(dest: Path) -> bool:
+    try:
+        path = merged_fbx_path(dest)
+    except ValueError:
+        return False
+    return path.is_file() and path.stat().st_size > 0
+
+
+def style_urdf(style: str) -> Path | None:
+    folder = HUB / "3d_model" / "robot" / "standard_description" / style / "urdf"
+    if not folder.is_dir():
+        return None
+    named = [path for path in folder.glob(f"{style}*.urdf") if path.is_file()]
+    dof = [path for path in named if "dof" in path.name]
+    chosen = sorted(dof or named)
+    if chosen:
+        return chosen[0]
+    any_urdf = sorted(path for path in folder.glob("*.urdf") if path.is_file())
+    return any_urdf[0] if any_urdf else None
+
+
+def export_robot_merged(job: dict, skeleton_csv: Path) -> Path | None:
+    """Build the robot merged FBX from this style's skeleton CSV and object files."""
+    if not skeleton_csv.is_file() or skeleton_csv.stat().st_size <= 0:
+        return None
+    if not scene_outputs_ready(skeleton_csv):
+        return None
+    xml_path, csv_path = scene_output_paths({"dest": str(skeleton_csv)})
+    out = merged_fbx_path(skeleton_csv)
+    robot_csvs = [skeleton_csv]
+    robot_csvs.extend(
+        sorted(
+            path
+            for path in skeleton_csv.parent.glob(skeleton_csv.stem + "_skeleton_*.csv")
+            if path.is_file() and path.stat().st_size > 0
+        )
+    )
+    urdf = style_urdf(str(job.get("style") or ""))
+    if urdf is None:
+        log(f"缺少 URDF，跳过合并 FBX {job.get('style')}")
+        return None
+    if not FBX_PYTHON.is_file() or not FBX_PYTHONPATH.is_dir():
+        log("缺少 FBX SDK 的 Python 3.7，跳过合并 FBX")
+        return None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(FBX_PYTHONPATH)
+    proc = subprocess.run(
+        [
+            str(FBX_PYTHON),
+            "-u",
+            str(BACKEND / "scripts" / "export_robot_merged_fbx.py"),
+            "--urdf",
+            str(urdf),
+            "--robot-csv",
+            str(skeleton_csv),
+        ]
+        + [arg for path in robot_csvs[1:] for arg in ("--robot-csv", str(path))]
+        + [
+            "--object-xml",
+            str(xml_path),
+            "--object-csv",
+            str(csv_path),
+            "--output",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if proc.returncode != 0 or not out.is_file() or out.stat().st_size <= 0:
+        detail = (proc.stderr or proc.stdout or "合并 FBX 失败").strip().splitlines()
+        raise RuntimeError(detail[-1] if detail else "合并 FBX 失败")
+    message = (proc.stdout or "").strip().splitlines()
+    if message:
+        log(message[-1])
+    return out
+
+
+def capture_scale_from_log(log_path: Path) -> float:
+    """Uniform scale the solver applied to the human and the scene points."""
+    if not log_path.is_file():
+        return 1.0
+    scale = 1.0
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "HOLOSOMA_CAPTURE_SCALE" not in line:
+            continue
+        try:
+            scale = float(line.split()[-1])
+        except ValueError:
+            continue
+    return scale if scale > 0.0 else 1.0
+
+
+def apply_scene_scale(xml_path: Path, csv_path: Path, target: float) -> None:
+    """Scale object positions and mesh vertices onto the robot's frame.
+
+    ``capture_scale`` on the XML is the factor already baked in, so a later
+    robot with a different height adjusts instead of scaling twice.
+    """
+    if target <= 0.0 or not xml_path.is_file() or not csv_path.is_file():
+        return
+    root = ET.parse(xml_path).getroot()
+    applied = float(root.get("capture_scale") or 1.0)
+    if applied <= 0.0:
+        applied = 1.0
+    factor = target / applied
+    if abs(factor - 1.0) < 1e-4:
+        if root.get("capture_scale") is None:
+            root.set("capture_scale", f"{target:.6f}")
+            tree = ET.ElementTree(root)
+            ET.indent(tree, space="  ")
+            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+        return
+
+    def scaled(value: str) -> str:
+        return f"{float(value) * factor:.8f}"
+
+    for body in root.findall("body"):
+        for key in ("x", "y", "z"):
+            if body.get(key) is not None:
+                body.set(key, scaled(body.get(key) or "0"))
+        for vertex in body.findall("vertices/v"):
+            for key in ("x", "y", "z"):
+                if vertex.get(key) is not None:
+                    vertex.set(key, scaled(vertex.get(key) or "0"))
+    root.set("capture_scale", f"{target:.6f}")
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+
+    with csv_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        return
+    header = rows[0]
+    xyz = [
+        index
+        for index, name in enumerate(header)
+        if name.endswith(("_x", "_y", "_z")) and not name.endswith(("_qx", "_qy", "_qz"))
+    ]
+    for row in rows[1:]:
+        for index in xyz:
+            if index < len(row) and row[index]:
+                row[index] = f"{float(row[index]) * factor:.8f}"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    log(f"物体按机器人身高缩放 {target:.4f}（本次 ×{factor:.4f}）{csv_path.name}")
+
+
+def scene_outputs_ready(dest: Path) -> bool:
+    try:
+        xml_path, csv_path = scene_output_paths({"dest": str(dest)})
+    except ValueError:
+        return False
+    return (
+        xml_path.is_file()
+        and csv_path.is_file()
+        and xml_path.stat().st_size > 0
+        and csv_path.stat().st_size > 0
+    )
+
+
+def _sibling_scene(xml_path: Path, csv_path: Path) -> tuple[Path, Path] | None:
+    """Object files are the same capture frame for every robot style."""
+    parts = xml_path.parts
+    try:
+        robot_idx = parts.index("robot")
+    except ValueError:
+        return None
+    style = parts[robot_idx + 1]
+    robot_root = Path(*parts[: robot_idx + 1])
+    rel_xml = Path(*xml_path.parts[robot_idx + 2 :])
+    rel_csv = Path(*csv_path.parts[robot_idx + 2 :])
+    if not robot_root.is_dir():
+        return None
+    for other in robot_root.iterdir():
+        if not other.is_dir() or other.name == style:
+            continue
+        found_xml = other / rel_xml
+        found_csv = other / rel_csv
+        if (
+            found_xml.is_file()
+            and found_csv.is_file()
+            and found_xml.stat().st_size > 0
+            and found_csv.stat().st_size > 0
+        ):
+            return found_xml, found_csv
+    return None
+
+
+def scene_copy_available(dest: Path) -> bool:
+    """True when some other robot style already has this clip's object files."""
+    try:
+        xml_path, csv_path = scene_output_paths({"dest": str(dest)})
+    except ValueError:
+        return False
+    return _sibling_scene(xml_path, csv_path) is not None
+
+
+def export_capture_scene(job: dict) -> list[Path]:
+    """Write this style's object XML and CSV.
+
+    A style that only lacks object files copies them from the style that
+    already has the pair. A fresh retarget may still export from the merged FBX.
+    """
+    xml_path, csv_path = scene_output_paths(job)
+    if scene_outputs_ready(Path(job["dest"])):
+        return [xml_path, csv_path]
+    sibling = _sibling_scene(xml_path, csv_path)
+    if sibling is not None:
+        xml_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sibling[0], xml_path)
+        shutil.copy2(sibling[1], csv_path)
+        log(f"物体复制 {sibling[0].relative_to(HUB).as_posix()} -> {xml_path.relative_to(HUB).as_posix()}")
+        return [xml_path, csv_path]
+    if job.get("object_only"):
+        return []
+    info = job.get("scene_source") or {}
+    if not info and source_keeps_capture(job):
+        info = job.get("source") or {}
+    source = Path(str(info.get("abs") or ""))
+    if not source.is_file() or source.suffix.lower() != ".fbx":
+        return []
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(RETARGET_PYTHON),
+        "-u",
+        str(BACKEND / "scripts" / "export_scene_objects.py"),
+        "--input",
+        str(source),
+        "--xml",
+        str(xml_path),
+        "--csv",
+        str(csv_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    message = (proc.stdout or proc.stderr or "").strip().splitlines()
+    if message:
+        log(message[-1])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "物体导出失败").strip().splitlines()
+        raise RuntimeError(detail[-1] if detail else "物体导出失败")
+    if xml_path.is_file() and csv_path.is_file() and xml_path.stat().st_size > 0 and csv_path.stat().st_size > 0:
+        return [xml_path, csv_path]
+    text = "\n".join(message)
+    if "No rigid bodies" in text or "no object" in text.lower():
+        raise RuntimeError("no-scene")
+    raise RuntimeError("物体导出没有写出文件")
+
+
+def retarget_with_frax(job: dict) -> list[Path]:
+    """Retarget one human clip with frax and write the same files as omniretarget."""
+    source = Path(job["source"]["abs"])
+    dest = Path(job["dest"])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not FRAX_PYTHON.is_file():
+        raise RuntimeError(f"找不到 frax 解释器：{FRAX_PYTHON}")
+    urdf = style_urdf(str(job.get("style") or ""))
+    if urdf is None:
+        raise RuntimeError(f"款式 {job.get('style')} 没有 URDF，不能用 frax 重定向")
+    scenes = export_capture_scene(job)
+    log_path = dest.with_suffix(".frax.log")
+    cmd = [
+        str(FRAX_PYTHON),
+        "-u",
+        str(BACKEND / "scripts" / "frax_retarget_clip.py"),
+        "--urdf",
+        str(urdf),
+        "--input",
+        str(source),
+        "--output",
+        str(dest),
+    ]
+    if source_keeps_capture(job):
+        cmd.append("--preserve-world")
+    env = os.environ.copy()
+    env["JAX_PLATFORMS"] = "cpu"
+    env["JAX_ENABLE_X64"] = "1"
+    env["XLA_FLAGS"] = (
+        "--xla_cpu_multi_thread_eigen=false "
+        "--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED"
+    )
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["PYTHONPATH"] = str(FRAX_ROOT)
+    with log_path.open("w", encoding="utf-8") as handle:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(FRAX_ROOT),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size <= 0:
+        raise RuntimeError(_solver_reason(log_path))
+    log_path.unlink(missing_ok=True)
+    written = [dest]
+    written.extend(
+        path
+        for path in dest.parent.glob(dest.stem + "_skeleton_*.csv")
+        if path.is_file() and path.stat().st_size > 0
+    )
+    written.extend(scenes)
+    merged = export_robot_merged(job, dest)
+    if merged is not None:
+        written.append(merged)
+    written.extend(export_robot_packages(job, dest))
+    return written
+
+
 def retarget(job: dict) -> list[Path]:
     """Run data_utils/batch_retarget_to_csv.py the same way as the official command.
 
@@ -1081,6 +1704,27 @@ def retarget(job: dict) -> list[Path]:
     """
     from retarget_to_csv import list_input_skeletons, output_csv_for_skeleton
 
+    if job.get("package_only"):
+        packages = export_robot_packages(job, Path(job["dest"]))
+        if len(packages) < 2:
+            raise RuntimeError("没有写出机器人合并 npz/zip")
+        return packages
+    if job.get("merged_only"):
+        merged = export_robot_merged(job, Path(job["dest"]))
+        packages = export_robot_packages(job, Path(job["dest"]))
+        written = [path for path in [merged, *packages] if path is not None]
+        if not written:
+            raise RuntimeError("没有写出机器人合并数据")
+        return written
+    if job.get("object_only"):
+        scenes = export_capture_scene(job)
+        merged = export_robot_merged(job, Path(job["dest"]))
+        if merged is not None:
+            scenes.append(merged)
+        scenes.extend(export_robot_packages(job, Path(job["dest"])))
+        return scenes
+    if job.get("method") == "frax" or "/motion/frax/" in str(job.get("dest") or "").replace("\\", "/"):
+        return retarget_with_frax(job)
     source = Path(job["source"]["abs"])
     skeletons = list_input_skeletons(source) or [None]
     dest = Path(job["dest"])
@@ -1102,6 +1746,7 @@ def retarget(job: dict) -> list[Path]:
 
         ensure_retarget_profile(HUB, job["style"], python=str(RETARGET_PYTHON))
         log_path = tmp / "run.log"
+        scenes = export_capture_scene(job)
         cmd = [
             str(RETARGET_PYTHON),
             "-u",
@@ -1116,6 +1761,8 @@ def retarget(job: dict) -> list[Path]:
             "1",
             "--skip-existing",
         ]
+        if source_keeps_capture(job):
+            cmd.append("--preserve-capture-frame")
         with log_path.open("w", encoding="utf-8") as handle:
             proc = subprocess.run(
                 cmd,
@@ -1141,6 +1788,14 @@ def retarget(job: dict) -> list[Path]:
             shutil.copyfile(produced, staged)
             staged.replace(target)
             written.append(target)
+        if source_keeps_capture(job):
+            xml_path, csv_path = scene_output_paths(job)
+            apply_scene_scale(xml_path, csv_path, capture_scale_from_log(log_path))
+        written.extend(scenes)
+        merged = export_robot_merged(job, dest)
+        if merged is not None:
+            written.append(merged)
+        written.extend(export_robot_packages(job, dest))
     return written
 
 
@@ -1198,6 +1853,15 @@ def _record_wave(jobs: list[dict], results: list[tuple[str, list[str] | None, st
     failures = state.setdefault("failures", {})
     rows: list[tuple[str, dict]] = []
     for job, (key, written, error) in zip(jobs, results):
+        if error == "no-scene":
+            src = str((job.get("scene_source") or job.get("source") or {}).get("abs") or "")
+            if src:
+                try:
+                    state.setdefault("no_scene", {})[src] = Path(src).stat().st_mtime
+                except OSError:
+                    state.setdefault("no_scene", {})[src] = 0
+            log(f"无刚体或 marker {job['batch']} / {job['unit']}")
+            continue
         if error:
             failures[key] = time.time() + 30 * 60
             log(f"失败 {key}: {error}")
@@ -1205,21 +1869,50 @@ def _record_wave(jobs: list[dict], results: list[tuple[str, list[str] | None, st
         failures.pop(key, None)
         state["last_ok"] = key
         note = f"由 {job['source']['name']} 自动重定向"
-        for path_str in written or []:
-            path = Path(path_str)
-            if not path.is_file():
-                continue
-            mark_finished_output(path.relative_to(HUB).as_posix())
-            annotation = {
-                "robot_style": job["style"],
-                "motion_kind": job["kind"],
-                "fps": 30,
-                "retarget_method": RETARGET_METHOD,
-                "note": note,
-            }
+        capture = source_keeps_capture(job)
+        ready = [Path(path_str) for path_str in (written or []) if Path(path_str).is_file()]
+        scene_xml = next((path for path in ready if path.suffix.lower() == ".xml"), None)
+        scene_csv = next((path for path in ready if "/object/" in path.as_posix() and path.suffix.lower() == ".csv"), None)
+        for path in ready:
+            rel = path.relative_to(HUB).as_posix()
+            mark_finished_output(rel)
+            if "/omniretarget/object/" in rel:
+                annotation = {
+                    "motion_kind": "object",
+                    "fps": 30,
+                    "world_frame": "capture_z_up",
+                    "note": "由合并动捕导出。Y-up 绕 X 轴转 -90 度得到 Z-up，原点与动捕一致",
+                }
+            elif "/omniretarget/merged/" in rel:
+                if rel.endswith(".npz"):
+                    note = "机器人合并数据。30Hz，Z-up，米，四元数 xyzw。网格在 3D 模型库。"
+                elif rel.endswith(".zip"):
+                    note = "机器人合并数据打包：skeleton/*.csv、object/*.csv、object/*.xml。"
+                else:
+                    note = "由人体合并数据重定向。骨架来自机器人 CSV，刚体和 marker 来自物体轨迹，坐标系与二者相同"
+                annotation = {
+                    "robot_style": job["style"],
+                    "motion_kind": "merged",
+                    "fps": 30,
+                    "world_frame": "capture_z_up",
+                    "note": note,
+                }
+            else:
+                annotation = {
+                    "robot_style": job["style"],
+                    "motion_kind": job["kind"],
+                    "fps": 30,
+                    "retarget_method": "frax" if job.get("method") == "frax" else RETARGET_METHOD,
+                    "note": note,
+                }
+                if capture:
+                    annotation["world_frame"] = "capture_z_up"
+                if scene_xml is not None and scene_csv is not None:
+                    annotation["scene_xml"] = scene_xml.relative_to(HUB).as_posix()
+                    annotation["scene_csv"] = scene_csv.relative_to(HUB).as_posix()
             if job.get("redo_after"):
                 annotation["redo_epoch"] = job["redo_after"]
-            rows.append((path.relative_to(HUB).as_posix(), annotation))
+            rows.append((rel, annotation))
         log(f"完成 {Path(job['dest']).relative_to(HUB).as_posix()}")
     save_state(state)
     remember_files(rows)
@@ -1287,10 +1980,13 @@ def main() -> None:
                 **_pace_fields(),
             )
             compiled, rules, priority_mtime = prepare_rules()
+            selected_method = _active_retarget_method()
             records = iter_motion_files()
             attach_annotations(records)
             grouped = group_units(records)
-            jobs, scope = collect_jobs(grouped, load_state(), compiled, load_redo(HUB))
+            jobs, scope = collect_jobs(
+                grouped, load_state(), compiled, load_redo(HUB), selected_method
+            )
             jobs = sort_jobs(jobs, grouped, compiled)
             redo_gen = _redo_generation()
             if _stop_if_requested():
@@ -1320,7 +2016,10 @@ def main() -> None:
             done = 0
             failed = 0
             round_started = _now()
-            log(f"本轮 {len(jobs)} 条，先做 {describe_rule(rules[0], set()) if rules else '未列入规则'}，最多 {WORKERS} 路并行")
+            log(
+                f"本轮 {len(jobs)} 条（{selected_method}），先做 "
+                f"{describe_rule(rules[0], set()) if rules else '未列入规则'}，最多 {WORKERS} 路并行"
+            )
 
             def snapshot(phase: str, current: list[dict], message: str) -> None:
                 _mark_active(queues, current)
@@ -1355,6 +2054,10 @@ def main() -> None:
                     log("优先级已调整，重新扫描")
                     snapshot("scanning", [], "优先级已调整，正在重新扫描")
                     break
+                if _active_retarget_method() != selected_method:
+                    log(f"重定向方法已切换为 {_active_retarget_method()}，重新扫描")
+                    snapshot("scanning", [], "重定向方法已切换，正在重新扫描")
+                    break
                 # Workers from the previous wave have already exited, so this
                 # check sees memory that is actually free.
                 size, detail = choose_wave_size()
@@ -1384,8 +2087,15 @@ def main() -> None:
                     for job in wave
                 ]
                 for job in wave:
+                    action = (
+                        "复制物体"
+                        if job.get("object_only")
+                        else "合并 FBX"
+                        if job.get("merged_only")
+                        else "重定向"
+                    )
                     log(
-                        f"重定向 {job['batch']} / {job['unit']} -> {job['style']} "
+                        f"{action} {job['batch']} / {job['unit']} -> {job['style']} "
                         f"来源 {job['source']['name']}"
                     )
                 snapshot("running", current, f"本波 {len(wave)} 路")
@@ -1409,7 +2119,7 @@ def main() -> None:
                         "status": "failed" if error else "done",
                         "error": (error or "").splitlines()[-1] if error else "",
                     }
-                    if error:
+                    if error and error != "no-scene":
                         failed += 1
                         if row is not None:
                             row["failed"] += 1

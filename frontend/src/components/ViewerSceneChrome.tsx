@@ -2,6 +2,9 @@ import { Grid, Html } from "@react-three/drei";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef, useSyncExternalStore, type RefObject } from "react";
 import * as THREE from "three";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 import { viewerLook, type Theme, type ViewerLook } from "../viewerTheme";
 
 // Canvas 内是独立 React 根，ThemeContext 传不进来；直接订阅 <html data-theme>。
@@ -53,35 +56,45 @@ function expandVisibleBox(root: THREE.Object3D, box: THREE.Box3) {
   if (box.isEmpty()) box.setFromObject(root);
 }
 
-/** 按骨骼世界坐标画线，不依赖 SkeletonHelper，避免只剩空画布。 */
+/** 按骨骼世界坐标画线。只连接上下两节骨骼，避免从场景原点拉一条线到髋部。 */
 export function SkeletonLines({
   root,
   color,
+  include,
 }: {
   root: THREE.Object3D | null;
   color: string;
+  /** 为真时只画人体骨架。刚体上的 `_Bone` 不画进这棵骨架。 */
+  include?: (bone: THREE.Object3D) => boolean;
 }) {
-  const geom = useMemo(() => new THREE.BufferGeometry(), []);
-  const mat = useMemo(
-    () =>
-      new THREE.LineBasicMaterial({
-        color,
-        depthTest: false,
-        depthWrite: false,
-        transparent: false,
-      }),
-    [color]
-  );
-
+  const geom = useMemo(() => new LineSegmentsGeometry(), []);
+  const mat = useMemo(() => {
+    const material = new LineMaterial({
+      linewidth: 4,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+      opacity: 1,
+    });
+    material.color.set(color);
+    return material;
+  }, [color]);
   const lines = useMemo(() => {
-    const obj = new THREE.LineSegments(geom, mat);
+    const obj = new LineSegments2(geom, mat);
     obj.frustumCulled = false;
+    obj.renderOrder = 6;
     return obj;
   }, [geom, mat]);
+  const size = useThree((state) => state.size);
+  const dpr = useThree((state) => state.viewport.dpr);
 
   useEffect(() => {
     mat.color.set(color);
   }, [color, mat]);
+
+  useEffect(() => {
+    mat.resolution.set(size.width * dpr, size.height * dpr);
+  }, [size, dpr, mat]);
 
   useEffect(() => {
     return () => {
@@ -92,22 +105,28 @@ export function SkeletonLines({
 
   useFrame(() => {
     if (!root) {
-      geom.setAttribute("position", new THREE.Float32BufferAttribute([], 3));
+      lines.visible = false;
       return;
     }
     root.updateWorldMatrix(true, true);
     const positions: number[] = [];
     root.traverse((obj) => {
       const bone = obj as THREE.Bone;
-      if (!bone.isBone || !obj.parent) return;
+      const parent = obj.parent as THREE.Bone | null;
+      if (!bone.isBone || !parent?.isBone) return;
+      if (include && !include(bone)) return;
       bone.getWorldPosition(_lineA);
-      obj.parent.getWorldPosition(_lineB);
+      parent.getWorldPosition(_lineB);
       if (![..._lineA.toArray(), ..._lineB.toArray()].every(Number.isFinite)) return;
       if (_lineA.distanceTo(_lineB) < 1e-6) return;
       positions.push(_lineB.x, _lineB.y, _lineB.z, _lineA.x, _lineA.y, _lineA.z);
     });
-    geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    geom.computeBoundingSphere();
+    if (positions.length < 6) {
+      lines.visible = false;
+      return;
+    }
+    geom.setPositions(positions);
+    lines.visible = true;
   });
 
   return <primitive object={lines} />;

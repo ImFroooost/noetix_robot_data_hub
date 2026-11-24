@@ -552,6 +552,20 @@ export interface StorageFolderUploadResult {
   upload_session_id?: string | null;
 }
 
+export interface ZipImportJob {
+  job_id?: string;
+  status: "running" | "done" | "failed" | "absent";
+  batch?: string;
+  total: number;
+  processed: number;
+  uploaded: number;
+  replaced: number;
+  skipped: number;
+  failed: number;
+  detail?: string;
+  result?: StorageFolderUploadResult;
+}
+
 export interface ModelInstanceFile {
   id: string;
   path: string;
@@ -870,6 +884,36 @@ export function taxonomySchemeLabel(
 export function processStatusLabel(status: string | null | undefined): string {
   if (!status) return "-";
   return PROCESS_STATUS_LABEL[status] || status;
+}
+
+export interface TrashFile {
+  path: string;
+  name: string;
+  size: number;
+  batch: string;
+  unit_name: string;
+  ontology: string;
+}
+
+export interface TrashEntry {
+  id: string;
+  deleted_at: string;
+  deleted_by?: { id: number; username: string } | null;
+  label: string;
+  file_count: number;
+  bytes: number;
+  files: TrashFile[];
+}
+
+export interface TrashOverview {
+  entries: TrashEntry[];
+}
+
+export interface TrashRestoreResult {
+  id: string;
+  restored: string[];
+  conflicts: string[];
+  missing: string[];
 }
 
 export function clipDisplayName(clip: {

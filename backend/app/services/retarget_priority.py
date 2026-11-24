@@ -16,6 +16,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .file_lock import write_text_atomic
+
 # Checkbox order used before the list followed 3D model instances.
 ROBOTS = ("noetix_e2v2_1015", "unitree_g1", "noetix_e2")
 # Styles the holosoma retargeter can actually run. New 3D instances show up
@@ -34,7 +36,8 @@ _MOTION_EXTS = frozenset({".fbx", ".bvh", ".npz", ".c3d", ".smpl"})
 UNLISTED = "unlisted"
 _SCHEME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
-_MAX_RULES = 24
+_MAX_RULES = 160
+_MAX_RANK = 999
 _MAX_NAMES = 40
 
 
@@ -170,6 +173,33 @@ def describe_rule(
         if scheme and scheme != "custom_6":
             text += f" · {scheme}"
     return text
+
+
+def batch_reserved_for(compiled: list[tuple], style: str, batch: str) -> bool | None:
+    """Whether a whole-batch rule assigns this batch.
+
+    None means no whole-batch assignment. True means this robot is named.
+    False means the batch is reserved for other robots, so rest rules must
+    not pick it up.
+    """
+    assigned = False
+    named = False
+    for item in compiled:
+        rule = item[0]
+        if not rule.get("enabled") or rule.get("data_mode") != "targets":
+            continue
+        for target in rule.get("targets") or []:
+            if str(target.get("batch") or "") != batch:
+                continue
+            names = [str(name).strip() for name in (target.get("units") or []) if str(name).strip()]
+            if names:
+                continue
+            assigned = True
+            if style in (rule.get("robots") or []):
+                named = True
+    if not assigned:
+        return None
+    return named
 
 
 def targets_match(rule: dict, batch: str, unit: str) -> bool:
@@ -543,7 +573,7 @@ def _clean_rule(
         scheme = include_picks[0]["scheme"]
     elif mode != "taxonomy":
         scheme = ""
-    return {
+    cleaned = {
         "id": rule_id,
         "enabled": bool(raw.get("enabled", True)),
         "robots": robots,
@@ -555,6 +585,25 @@ def _clean_rule(
         "exclude_picks": exclude_picks,
         "targets": targets,
     }
+    rank = _clean_rank(raw.get("rank"))
+    if rank is not None:
+        cleaned["rank"] = rank
+    return cleaned
+
+
+def _clean_rank(value: object) -> int | None:
+    """The number the user typed in the priority table. Several rules may share one."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        rank = int(value)
+    except (TypeError, ValueError):
+        return None
+    return rank if 1 <= rank <= _MAX_RANK else None
+
+
+def rule_rank_label(rule: dict, index: int) -> str:
+    return str(rule.get("rank") or index + 1)
 
 
 def _reject_shadowed(rules: list[dict]) -> None:
@@ -664,9 +713,7 @@ def _write_redo(hub: Path, generation: int, rules: dict[str, float]) -> None:
     path = redo_path(hub)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"generation": int(generation), "rules": rules}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def request_tier_redo(hub: Path, rule_id: str) -> dict:
@@ -730,10 +777,7 @@ def save_config(hub: Path, payload: dict) -> dict:
     cleaned = normalize(payload, strict=True, robots=robot_catalog(hub))
     cleaned["updated_at"] = datetime.now(timezone.utc).isoformat()
     path = config_path(hub)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps(cleaned, ensure_ascii=False, indent=2))
     return cleaned
 
 
@@ -751,11 +795,8 @@ def _read_presets_file(hub: Path) -> list[dict]:
 
 def _write_presets_file(hub: Path, presets: list[dict]) -> None:
     path = presets_path(hub)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"presets": presets, "updated_at": datetime.now(timezone.utc).isoformat()}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _clean_preset(raw: object, robots: tuple[str, ...] | list[str] | None = None) -> dict | None:
@@ -885,11 +926,8 @@ def add_pins(hub: Path, items: list[dict]) -> list[dict]:
         if len(result) >= _MAX_PINS:
             break
     path = pins_path(hub)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"items": result, "updated_at": datetime.now(timezone.utc).isoformat()}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
     return result
 
 
@@ -929,24 +967,45 @@ def migrate_pins_into_rules(hub: Path) -> bool:
     if fresh:
         save_config(hub, {"rules": fresh + current["rules"]})
     path = pins_path(hub)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps({"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps({"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False))
     return bool(fresh)
 
 
-def promote_targets(hub: Path, items: list[dict]) -> dict:
-    """Insert one new top tier for the chosen batches or units."""
+def _ordered_robots(hub: Path, robots: list[str] | None) -> list[str]:
+    catalog = robot_catalog(hub)
+    if robots is None:
+        return catalog
+    chosen: list[str] = []
+    for item in robots:
+        name = str(item or "").strip()
+        if not name or name in chosen:
+            continue
+        if name not in catalog:
+            raise ValueError(f"没有可重定向的机器人：{name}")
+        chosen.append(name)
+    if not chosen:
+        raise ValueError("请至少选择一台机器人")
+    return chosen
+
+
+def promote_targets(hub: Path, items: list[dict], robots: list[str] | None = None) -> dict:
+    """Insert one new top tier for the chosen batches or units.
+
+    ``robots`` is the click order: the first checked style is retargeted first.
+    """
     migrate_pins_into_rules(hub)
     targets = _clean_targets(items, strict=True)
     if not targets:
         raise ValueError("没有可优先的数据")
     current = load_config(hub)
-    rules = [_target_rule(targets, robot_catalog(hub))] + current["rules"]
+    fresh = _target_rule(targets, _ordered_robots(hub, robots))
+    if any(rule.get("rank") for rule in current["rules"]):
+        # Keep the table numbers in step with the order: the new tier is 1.
+        fresh["rank"] = 1
+        for rule in current["rules"]:
+            if rule.get("rank"):
+                rule["rank"] = min(_MAX_RANK, int(rule["rank"]) + 1)
+    rules = [fresh] + current["rules"]
     if len(rules) > _MAX_RULES:
         raise ValueError(f"最多 {_MAX_RULES} 档优先级")
     save_config(hub, {"rules": rules})

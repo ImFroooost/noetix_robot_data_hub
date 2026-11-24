@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+sys.path.insert(0, "/media/noetix/my_passport1/noetix_robot_data_hub/backend")
+
+from app.services.file_lock import locked, write_text_atomic  # noqa: E402
 HOLO_MODELS = Path(
     "/home/noetix/Desktop/new_home/learning_based/wbc/open_src/omni_retarget/"
     "holosoma/src/holosoma_retargeting/holosoma_retargeting/models"
@@ -96,11 +100,11 @@ def sync() -> None:
         print(f"{style}: meshes {mesh_count}, descriptions {copied or ['(沿用已有 URDF)']}")
     data["version"] = int(data.get("version") or 1) + 1
     data["updated_at"] = now
-    tmp = meta_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(meta_path)
+    write_text_atomic(meta_path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     print("模型元数据已更新")
 
 
 if __name__ == "__main__":
-    sync()
+    # The API and the retarget loop rewrite the same metadata file.
+    with locked(HUB / "index" / "repository.json"):
+        sync()

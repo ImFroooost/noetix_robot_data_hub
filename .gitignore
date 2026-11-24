@@ -8,3 +8,10 @@ dist/
 *.egg-info/
 .DS_Store
 .venv-retarget/
+
+# 重定向/工具在 frontend/ 下留下的临时文件
+frontend/holosoma_virtual_*/
+frontend/retarget_batch_*/
+frontend/tmp*/
+frontend/node-compile-cache/
+frontend/uv-setuptools-*.lock

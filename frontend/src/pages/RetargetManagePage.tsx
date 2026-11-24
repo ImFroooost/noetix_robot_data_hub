@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { api } from "../api";
 import { useAuth } from "../auth";
 import {
@@ -37,6 +37,8 @@ export type PriorityRule = {
   include_picks?: TaxonomyPick[];
   exclude_picks?: TaxonomyPick[];
   targets?: { batch: string; units: string[] }[];
+  /** 优先级表里填的序号。几条规则可以共用一个序号。 */
+  rank?: number;
 };
 
 export type PriorityPreset = {
@@ -95,6 +97,7 @@ export type RetargetStatus = {
   desired?: "running" | "stopped";
   performance?: "auto" | "light" | "balanced" | "heavy";
   performance_note?: string;
+  method?: "omniretarget" | "frax";
 };
 
 const PHASE_LABEL: Record<string, string> = {
@@ -112,6 +115,11 @@ const PERFORMANCE_MODES: { id: "auto" | "light" | "balanced" | "heavy"; label: s
   { id: "light", label: "轻" },
   { id: "balanced", label: "均衡" },
   { id: "heavy", label: "高" },
+];
+
+const RETARGET_METHODS: { id: "omniretarget" | "frax"; label: string }[] = [
+  { id: "omniretarget", label: "omniretarget" },
+  { id: "frax", label: "frax" },
 ];
 
 function performanceHint(mode: string, note?: string) {
@@ -150,10 +158,6 @@ function pinLabel(pin: RetargetPin) {
 
 function rankLabel(rank: string) {
   return /^\d+$/.test(rank) ? `第 ${rank} 档` : rank;
-}
-
-function publishedRuleIds(queues: RetargetQueue[]) {
-  return queues.filter((queue) => queue.key !== "pinned" && queue.key !== "unlisted").map((queue) => queue.key);
 }
 
 function queueCountText(queue: RetargetQueue) {
@@ -203,19 +207,6 @@ function rulePicks(rule: PriorityRule, kind: "include" | "exclude"): TaxonomyPic
   return (names || []).map((name) => ({ scheme: rule.scheme, name }));
 }
 
-function withPicks(rule: PriorityRule, kind: "include" | "exclude", picks: TaxonomyPick[]): PriorityRule {
-  const include = kind === "include" ? picks : rulePicks(rule, "include");
-  const exclude = kind === "exclude" ? picks : rulePicks(rule, "exclude");
-  return {
-    ...rule,
-    include_picks: include,
-    exclude_picks: exclude,
-    include_names: include.map((item) => item.name),
-    exclude_names: exclude.map((item) => item.name),
-    scheme: include[0]?.scheme || exclude[0]?.scheme || rule.scheme,
-  };
-}
-
 function ruleTitle(rule: PriorityRule, earlier: Set<string>, rules: PriorityRule[] = []) {
   const robots = rule.robots.join(" → ") || "未选机器人";
   if (rule.data_mode === "targets") {
@@ -241,12 +232,6 @@ function ruleTitle(rule: PriorityRule, earlier: Set<string>, rules: PriorityRule
   if (exclude) text += `（不含 ${exclude}）`;
   if (rule.scheme && rule.scheme !== "custom_6") text += ` · ${rule.scheme}`;
   return text;
-}
-
-function sameRuleOrder(rules: PriorityRule[], queues: RetargetQueue[]) {
-  const enabled = rules.filter((rule) => rule.enabled).map((rule) => rule.id);
-  const published = publishedRuleIds(queues);
-  return enabled.length > 0 && enabled.length === published.length && enabled.every((id, index) => id === published[index]);
 }
 
 const REDO_PENDING = "已安排全部重做。当前这一波结束后重新扫描，进度从 0 开始，新的 CSV 写好后覆盖原来的文件。";
@@ -310,39 +295,45 @@ function QueueProgress({
 function PriorityProgress({
   rules,
   queues,
-  countsReady,
+  recounting,
   onRedo,
   redoBusy,
   redoIds,
 }: {
   rules: PriorityRule[];
   queues: RetargetQueue[];
-  countsReady: boolean;
+  recounting: boolean;
   onRedo: (ruleId: string, title: string) => void;
   redoBusy: string;
   redoIds: ReadonlySet<string>;
 }) {
   const byKey = new Map(queues.map((queue) => [queue.key, queue]));
   const unlisted = byKey.get("unlisted");
+  const waiting = rules.some((rule) => rule.enabled && !byKey.has(rule.id));
   return (
     <>
-      {countsReady ? null : (
+      {recounting ? (
         <p className="muted" style={{ margin: 0 }}>
-          各档和下面的规则是同一套。数量和预计时间会在当前这一波结束后按这个顺序重新统计。
+          正在重新统计。下面先显示上一轮已经算好的数量，没有数字的档还在算。
         </p>
-      )}
+      ) : waiting ? (
+        <p className="muted" style={{ margin: 0 }}>
+          有的档还没有数量，其余档显示的是最近一次统计。
+        </p>
+      ) : null}
       <ol className="retarget-queues">
         {rules.map((rule, index) => {
           const earlier = new Set(rules.slice(0, index).flatMap((item) => (item.enabled ? item.robots : [])));
           const title = rule.enabled ? ruleTitle(rule, earlier, rules) : "已停用，不会参与排序";
-          const queue = countsReady && rule.enabled ? byKey.get(rule.id) : undefined;
+          const queue = rule.enabled ? byKey.get(rule.id) : undefined;
+          const tier = `第 ${rule.rank || index + 1} 档`;
           if (queue) {
             return (
               <QueueProgress
                 key={rule.id}
                 queue={queue}
                 title={title}
-                rank={`第 ${index + 1} 档`}
+                rank={tier}
                 onRedo={onRedo}
                 redoBusy={redoBusy}
                 redoPending={redoIds.has(rule.id)}
@@ -353,7 +344,7 @@ function PriorityProgress({
           return (
             <li key={rule.id}>
               <div className="row" style={{ justifyContent: "space-between", gap: "0.5rem" }}>
-                <strong>第 {index + 1} 档</strong>
+                <strong>{tier}</strong>
                 <span className="retarget-queue-actions">
                   {rule.enabled ? (
                     <button
@@ -373,7 +364,7 @@ function PriorityProgress({
             </li>
           );
         })}
-        {countsReady && unlisted && unlisted.total > 0 ? (
+        {unlisted && unlisted.total > 0 ? (
           <QueueProgress
             queue={unlisted}
             title={unlisted.title}
@@ -388,20 +379,173 @@ function PriorityProgress({
   );
 }
 
-function blankRule(robots: string[]): PriorityRule {
-  const id =
-    typeof crypto !== "undefined" && crypto.randomUUID
-      ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
-      : `rule-${Date.now().toString(16)}`;
-  return {
-    id,
-    enabled: true,
-    robots: robots.slice(0, 1),
-    data_mode: "taxonomy",
-    scheme: "custom_6",
-    include_names: [],
-    exclude_names: [],
-  };
+/** 表格的一行：一个数据节点，以及每台机器人在这个节点上的序号。 */
+type MatrixRow = {
+  key: string;
+  kind: PriorityRule["data_mode"];
+  include: TaxonomyPick[];
+  exclude: TaxonomyPick[];
+  targets: RetargetPin[];
+  /** 机器人 -> 序号。没有填的机器人不在这里。 */
+  cells: Record<string, number>;
+  /** 序号 -> 这一行原来对应的规则编号，保存时沿用，进度和重做记录不会断。 */
+  ids: Record<string, string>;
+};
+
+const REST_KEY = "rest";
+const MAX_RANK = 999;
+const MAX_TIERS = 160;
+
+function scopeKey(
+  kind: PriorityRule["data_mode"],
+  include: TaxonomyPick[],
+  exclude: TaxonomyPick[],
+  targets: RetargetPin[],
+) {
+  if (kind === "rest") return REST_KEY;
+  return JSON.stringify([
+    kind,
+    include.map((pick) => [pick.scheme, pick.name]),
+    exclude.map((pick) => [pick.scheme, pick.name]),
+    targets.map((item) => [item.batch, item.units]),
+  ]);
+}
+
+function blankRow(
+  kind: PriorityRule["data_mode"],
+  include: TaxonomyPick[] = [],
+  exclude: TaxonomyPick[] = [],
+  targets: RetargetPin[] = [],
+): MatrixRow {
+  return { key: scopeKey(kind, include, exclude, targets), kind, include, exclude, targets, cells: {}, ids: {} };
+}
+
+/** 一条规则里的数据范围拆成表格的行。同一维度的多个分类、多个批次各占一行。 */
+function ruleScopes(rule: PriorityRule): MatrixRow[] {
+  if (rule.data_mode === "rest") return [blankRow("rest")];
+  if (rule.data_mode === "targets") {
+    return (rule.targets || []).map((item) =>
+      blankRow("targets", [], [], [{ batch: item.batch, units: [...item.units] }]),
+    );
+  }
+  const include = rulePicks(rule, "include").map((pick) => ({ ...pick }));
+  const exclude = rulePicks(rule, "exclude").map((pick) => ({ ...pick }));
+  if (!include.length) return [];
+  if (!exclude.length && include.every((pick) => pick.scheme === include[0].scheme)) {
+    return include.map((pick) => blankRow("taxonomy", [pick]));
+  }
+  return [blankRow("taxonomy", include, exclude)];
+}
+
+function rulesToMatrix(rules: PriorityRule[]): MatrixRow[] {
+  const rows: MatrixRow[] = [];
+  const byKey = new Map<string, MatrixRow>();
+  let previous = 0;
+  for (const rule of rules) {
+    if (!rule.enabled) continue;
+    const number = Math.min(MAX_RANK, Math.max(rule.rank || previous + 1, previous, 1));
+    previous = number;
+    for (const scope of ruleScopes(rule)) {
+      let row = byKey.get(scope.key);
+      if (!row) {
+        row = scope;
+        byKey.set(row.key, row);
+        rows.push(row);
+      }
+      let placed = false;
+      for (const robot of rule.robots) {
+        // 排在前面的规则已经拿走了这台机器人的这份数据。
+        if (row.cells[robot] != null) continue;
+        row.cells[robot] = number;
+        placed = true;
+      }
+      if (placed && !row.ids[number]) row.ids[number] = rule.id;
+    }
+  }
+  if (!byKey.has(REST_KEY)) rows.push(blankRow("rest"));
+  return rows;
+}
+
+function newRuleId() {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+    : `rule-${Date.now().toString(16)}${Math.floor(Math.random() * 4096).toString(16)}`;
+}
+
+/** 表格换回按顺序执行的规则：序号小的在前，序号相同时上面的行在前。 */
+function matrixToRules(rows: MatrixRow[], robots: string[]): PriorityRule[] {
+  const used = new Set<string>();
+  const found: { number: number; index: number; rule: PriorityRule }[] = [];
+  rows.forEach((row, index) => {
+    const groups = new Map<number, string[]>();
+    for (const robot of robots) {
+      const number = row.cells[robot];
+      if (!number) continue;
+      const names = groups.get(number);
+      if (names) names.push(robot);
+      else groups.set(number, [robot]);
+    }
+    groups.forEach((names, number) => {
+      let id = row.ids[number];
+      if (!id || used.has(id)) id = newRuleId();
+      used.add(id);
+      const include = row.include.map((pick) => ({ ...pick }));
+      const exclude = row.exclude.map((pick) => ({ ...pick }));
+      found.push({
+        number,
+        index,
+        rule: {
+          id,
+          enabled: true,
+          robots: names,
+          data_mode: row.kind,
+          scheme: include[0]?.scheme || "",
+          include_names: include.map((pick) => pick.name),
+          exclude_names: exclude.map((pick) => pick.name),
+          include_picks: include,
+          exclude_picks: exclude,
+          targets: row.targets.map((item) => ({ batch: item.batch, units: [...item.units] })),
+          rank: number,
+        },
+      });
+    });
+  });
+  found.sort((a, b) => a.number - b.number || a.index - b.index);
+  return found.map((item) => item.rule);
+}
+
+function cloneRows(rows: MatrixRow[]): MatrixRow[] {
+  return JSON.parse(JSON.stringify(rows)) as MatrixRow[];
+}
+
+/** 只看每个节点、每台机器人的序号，用来比较两套优先级是不是一样。 */
+function matrixSignature(rows: MatrixRow[]) {
+  return JSON.stringify(
+    rows
+      .filter((row) => Object.keys(row.cells).length > 0)
+      .map((row) => [row.key, Object.keys(row.cells).sort().map((robot) => [robot, row.cells[robot]])]),
+  );
+}
+
+function rowLabel(row: MatrixRow, schemes: TaxonomySchemeDef[]) {
+  if (row.kind === "rest") return { title: "其余数据", note: "没有被其他行点名的数据" };
+  if (row.kind === "targets") {
+    return { title: row.targets.map((item) => pinLabel(item)).join("、") || "未选数据", note: "指定数据" };
+  }
+  let title = row.include.map((pick) => pick.name).join(" + ") || "未选分类";
+  if (row.exclude.length) title += `（不含 ${row.exclude.map((pick) => pick.name).join("、")}）`;
+  const kinds: string[] = [];
+  for (const pick of row.include) {
+    const label = taxonomySchemeLabel(pick.scheme, schemes);
+    if (!kinds.includes(label)) kinds.push(label);
+  }
+  return { title, note: kinds.join(" 且 ") };
+}
+
+function parseRank(text: string): number | null {
+  const value = parseInt(text.replace(/\D/g, "").slice(0, 3), 10);
+  if (!Number.isFinite(value) || value < 1) return null;
+  return Math.min(MAX_RANK, value);
 }
 
 function nodeCovered(
@@ -628,11 +772,234 @@ function SchemeFacets({
   );
 }
 
+function PriorityMatrix({
+  rows,
+  savedRows,
+  robots,
+  schemes,
+  nodesByScheme,
+  onChange,
+}: {
+  rows: MatrixRow[];
+  savedRows: MatrixRow[];
+  robots: string[];
+  schemes: TaxonomySchemeDef[];
+  nodesByScheme: Record<string, TaxonomyNode[]>;
+  onChange: (rows: MatrixRow[]) => void;
+}) {
+  const [draft, setDraft] = useState<TaxonomyPick[]>([]);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const saved = new Map(savedRows.map((row) => [row.key, row]));
+
+  const patchRow = (key: string, cells: Record<string, number>) => {
+    onChange(rows.map((row) => (row.key === key ? { ...row, cells } : row)));
+  };
+
+  const setCell = (row: MatrixRow, robot: string, text: string) => {
+    const cells = { ...row.cells };
+    const value = parseRank(text);
+    if (value == null) delete cells[robot];
+    else cells[robot] = value;
+    patchRow(row.key, cells);
+  };
+
+  const fillRow = (row: MatrixRow, text: string) => {
+    const value = parseRank(text);
+    const cells: Record<string, number> = {};
+    if (value != null) for (const robot of robots) cells[robot] = value;
+    patchRow(row.key, cells);
+  };
+
+  const fillColumn = (robot: string, text: string) => {
+    const value = parseRank(text);
+    onChange(
+      rows.map((row) => {
+        const cells = { ...row.cells };
+        if (value == null) delete cells[robot];
+        else cells[robot] = value;
+        return { ...row, cells };
+      }),
+    );
+  };
+
+  const compact = () => {
+    const numbers = [...new Set(rows.flatMap((row) => Object.values(row.cells)))].sort((a, b) => a - b);
+    const next = new Map(numbers.map((value, index) => [value, index + 1]));
+    onChange(
+      rows.map((row) => {
+        const cells: Record<string, number> = {};
+        const ids: Record<string, string> = {};
+        for (const [robot, value] of Object.entries(row.cells)) cells[robot] = next.get(value) || value;
+        for (const [value, id] of Object.entries(row.ids)) {
+          const moved = next.get(Number(value));
+          if (moved) ids[moved] = id;
+        }
+        return { ...row, cells, ids };
+      }),
+    );
+  };
+
+  const addDraft = () => {
+    const have = new Set(rows.map((row) => row.key));
+    const fresh = draft
+      .map((pick) => blankRow("taxonomy", [{ ...pick }]))
+      .filter((row) => !have.has(row.key));
+    if (fresh.length) onChange([...rows, ...fresh]);
+    setDraft([]);
+  };
+
+  const onKey = (event: KeyboardEvent<HTMLInputElement>) => {
+    const step =
+      event.key === "ArrowDown" || event.key === "Enter" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+    if (!step) return;
+    const input = event.currentTarget;
+    const row = Number(input.dataset.row) + step;
+    const target = tableRef.current?.querySelector<HTMLInputElement>(
+      `input[data-row="${row}"][data-col="${input.dataset.col}"]`,
+    );
+    if (!target) return;
+    event.preventDefault();
+    target.focus();
+  };
+
+  const numbers = rows.flatMap((row) => Object.values(row.cells));
+  const distinct = new Set(numbers);
+  const canCompact = distinct.size > 0 && Math.max(...numbers) !== distinct.size;
+  const columnValue = (robot: string) => {
+    const values = new Set(rows.map((row) => row.cells[robot] ?? 0));
+    const only = values.size === 1 ? [...values][0] : 0;
+    return only ? String(only) : "";
+  };
+
+  return (
+    <div className="retarget-matrix-box">
+      <div className="retarget-matrix-wrap">
+        <table className="retarget-matrix" ref={tableRef}>
+          <thead>
+            <tr>
+              <th className="retarget-matrix-node">数据节点</th>
+              <th className="retarget-matrix-all">整行</th>
+              {robots.map((robot) => (
+                <th key={robot} title={robot}>
+                  {robot}
+                </th>
+              ))}
+              <th className="retarget-matrix-op" />
+            </tr>
+            <tr className="retarget-matrix-fill">
+              <th className="retarget-matrix-node">整列填同一个序号</th>
+              <th className="retarget-matrix-all" />
+              {robots.map((robot, col) => (
+                <th key={robot}>
+                  <input
+                    className="retarget-cell"
+                    inputMode="numeric"
+                    aria-label={`${robot} 整列`}
+                    placeholder="整列"
+                    value={columnValue(robot)}
+                    data-row={-1}
+                    data-col={col}
+                    onFocus={(event) => event.target.select()}
+                    onKeyDown={onKey}
+                    onChange={(event) => fillColumn(robot, event.target.value)}
+                  />
+                </th>
+              ))}
+              <th className="retarget-matrix-op" />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, index) => {
+              const label = rowLabel(row, schemes);
+              const before = saved.get(row.key);
+              const values = new Set(robots.map((robot) => row.cells[robot] ?? 0));
+              const whole = values.size === 1 && [...values][0] ? String([...values][0]) : "";
+              return (
+                <tr key={row.key} className={before ? undefined : "is-new"}>
+                  <th className="retarget-matrix-node" scope="row" title={label.title}>
+                    <div>{label.title}</div>
+                    <div className="muted">{before ? label.note : `${label.note} · 新加`}</div>
+                  </th>
+                  <td className="retarget-matrix-all">
+                    <input
+                      className="retarget-cell"
+                      inputMode="numeric"
+                      aria-label={`${label.title} 整行`}
+                      placeholder="整行"
+                      value={whole}
+                      data-row={index}
+                      data-col="all"
+                      onFocus={(event) => event.target.select()}
+                      onKeyDown={onKey}
+                      onChange={(event) => fillRow(row, event.target.value)}
+                    />
+                  </td>
+                  {robots.map((robot, col) => {
+                    const value = row.cells[robot];
+                    const changed = (before?.cells[robot] ?? 0) !== (value ?? 0);
+                    return (
+                      <td key={robot}>
+                        <input
+                          className={`retarget-cell${value ? " is-set" : ""}${changed ? " is-changed" : ""}`}
+                          inputMode="numeric"
+                          aria-label={`${label.title} · ${robot}`}
+                          placeholder="—"
+                          value={value ?? ""}
+                          data-row={index}
+                          data-col={col}
+                          onFocus={(event) => event.target.select()}
+                          onKeyDown={onKey}
+                          onChange={(event) => setCell(row, robot, event.target.value)}
+                        />
+                      </td>
+                    );
+                  })}
+                  <td className="retarget-matrix-op">
+                    {row.kind === "rest" ? null : (
+                      <button
+                        type="button"
+                        className="secondary retarget-mini"
+                        onClick={() => onChange(rows.filter((item) => item.key !== row.key))}
+                      >
+                        移除
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="retarget-matrix-add">
+        <span className="muted">添加数据节点</span>
+        <SchemeFacets schemes={schemes} nodesByScheme={nodesByScheme} picks={draft} onChange={setDraft} />
+        <button type="button" className="secondary retarget-mini" disabled={!draft.length} onClick={addDraft}>
+          {draft.length ? `加入表格（${draft.length} 行）` : "加入表格"}
+        </button>
+        <button type="button" className="secondary retarget-mini" disabled={!canCompact} onClick={compact}>
+          序号排成 1、2、3…
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function RetargetManagePage() {
   const { isAdmin } = useAuth();
+  const adoptRules = (cfg: RetargetPriority) => {
+    const matrix = rulesToMatrix(cfg.rules || []);
+    setRows(matrix);
+    setSavedRows(cloneRows(matrix));
+    setSavedRules(cloneRules(cfg.rules || []));
+    setRobots(cfg.robots || []);
+    setPresets(cfg.presets || []);
+    setPins(cfg.pins || []);
+  };
   const [data, setData] = useState<RetargetStatus | null>(null);
   const [error, setError] = useState("");
-  const [rules, setRules] = useState<PriorityRule[]>([]);
+  const [rows, setRows] = useState<MatrixRow[]>([]);
+  const [savedRows, setSavedRows] = useState<MatrixRow[]>([]);
   const [savedRules, setSavedRules] = useState<PriorityRule[]>([]);
   const [robots, setRobots] = useState<string[]>([]);
   const [presets, setPresets] = useState<PriorityPreset[]>([]);
@@ -646,37 +1013,26 @@ export function RetargetManagePage() {
   const [controlBusy, setControlBusy] = useState(false);
   const [redoBusy, setRedoBusy] = useState("");
   const [redoIds, setRedoIds] = useState<string[]>([]);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const rulesRef = useRef(rules);
-  const savedRef = useRef(savedRules);
+  const rowsRef = useRef(rows);
+  const savedRef = useRef(savedRows);
   const savingRef = useRef(false);
   const loadingSchemes = useRef(new Set<string>());
-  const collapsedInit = useRef(false);
-  rulesRef.current = rules;
-  savedRef.current = savedRules;
+  rowsRef.current = rows;
+  savedRef.current = savedRows;
   savingRef.current = saving;
 
   useEffect(() => {
     if (!isAdmin) return;
     let alive = true;
     api
-      .listTaxonomySchemes()
+      .listTaxonomySchemes({ quiet: true })
       .then((next) => {
         if (alive) setSchemes(next);
       })
       .catch(() => undefined);
     const applyPriority = (cfg: RetargetPriority) => {
-      const next = cloneRules(cfg.rules || []);
-      setRules(next);
-      setSavedRules(cloneRules(cfg.rules || []));
-      setRobots(cfg.robots || []);
-      setPresets(cfg.presets || []);
-      setPins(cfg.pins || []);
+      adoptRules(cfg);
       setRedoIds(cfg.redo || []);
-      if (!collapsedInit.current) {
-        collapsedInit.current = true;
-        setCollapsed(new Set(next.map((rule) => rule.id)));
-      }
     };
     const load = () => {
       api
@@ -690,13 +1046,13 @@ export function RetargetManagePage() {
           if (!alive) return;
           setError(err.message || "加载失败");
         });
-      const untouched = JSON.stringify(rulesRef.current) === JSON.stringify(savedRef.current);
+      const untouched = JSON.stringify(rowsRef.current) === JSON.stringify(savedRef.current);
       if (!savingRef.current && untouched) {
         api
           .retargetPriority()
           .then((cfg) => {
             if (!alive || savingRef.current) return;
-            if (JSON.stringify(rulesRef.current) !== JSON.stringify(savedRef.current)) return;
+            if (JSON.stringify(rowsRef.current) !== JSON.stringify(savedRef.current)) return;
             applyPriority(cfg);
           })
           .catch((err: Error) => {
@@ -732,7 +1088,7 @@ export function RetargetManagePage() {
       if (!scheme.key || nodesByScheme[scheme.key] || loadingSchemes.current.has(scheme.key)) continue;
       loadingSchemes.current.add(scheme.key);
       api
-        .listTaxonomies(scheme.key)
+        .listTaxonomies(scheme.key, { quiet: true })
         .then((nodes) => {
           setNodesByScheme((prev) => ({ ...prev, [scheme.key]: nodes }));
         })
@@ -762,47 +1118,33 @@ export function RetargetManagePage() {
   };
 
   const facetSchemes = [FOLDER_SCHEME, ...schemes];
-  const dirty = JSON.stringify(rules) !== JSON.stringify(savedRules);
+  const dirty = JSON.stringify(rows) !== JSON.stringify(savedRows);
+  const savedSignature = matrixSignature(savedRows);
 
-  const toggleRule = (id: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  const updateRule = (id: string, patch: Partial<PriorityRule>) => {
-    setRules((prev) => prev.map((rule) => (rule.id === id ? { ...rule, ...patch } : rule)));
-    setPriorityNote("");
-  };
-
-  const moveRule = (index: number, delta: number) => {
-    setRules((prev) => {
-      const next = [...prev];
-      const target = index + delta;
-      if (target < 0 || target >= next.length) return prev;
-      const [item] = next.splice(index, 1);
-      next.splice(target, 0, item);
-      return next;
-    });
-    setPriorityNote("");
+  /** 表格换成要保存的规则。填得不对时返回 null，并在页面上说明原因。 */
+  const rulesFromTable = () => {
+    const next = matrixToRules(rows, robots);
+    if (!next.length) {
+      setPriorityError("表格里至少要填一个序号");
+      return null;
+    }
+    if (next.length > MAX_TIERS) {
+      setPriorityError(`不同的序号太多了。同一行里多用相同的序号，让总档数不超过 ${MAX_TIERS}。`);
+      return null;
+    }
+    return next;
   };
 
   const saveRules = () => {
+    const next = rulesFromTable();
+    if (!next) return;
     setSaving(true);
     savingRef.current = true;
     setPriorityError("");
     api
-      .saveRetargetPriority(rules)
+      .saveRetargetPriority(next)
       .then((cfg) => {
-        const next = cloneRules(cfg.rules || []);
-        setRules(next);
-        setSavedRules(cloneRules(cfg.rules || []));
-        setRobots(cfg.robots || []);
-        setPresets(cfg.presets || []);
-        setPins(cfg.pins || []);
+        adoptRules(cfg);
         setPriorityNote("已保存。当前这一波结束后会按新顺序重新扫描。");
       })
       .catch((err: Error) => {
@@ -815,13 +1157,7 @@ export function RetargetManagePage() {
   };
 
   const adoptConfig = (cfg: RetargetPriority, note: string) => {
-    const next = cloneRules(cfg.rules || []);
-    setRules(next);
-    setSavedRules(cloneRules(cfg.rules || []));
-    setRobots(cfg.robots || []);
-    setPresets(cfg.presets || []);
-    setPins(cfg.pins || []);
-    setCollapsed(new Set(next.map((rule) => rule.id)));
+    adoptRules(cfg);
     setPriorityNote(note);
     setPriorityError("");
   };
@@ -829,14 +1165,16 @@ export function RetargetManagePage() {
   const saveAsPreset = () => {
     const name = presetName.trim();
     if (!name) {
-        setPriorityError("请填写预设名称");
+      setPriorityError("请填写预设名称");
       return;
     }
+    const next = rulesFromTable();
+    if (!next) return;
     setSaving(true);
     savingRef.current = true;
     setPriorityError("");
     api
-      .saveRetargetPreset(name, rules)
+      .saveRetargetPreset(name, next)
       .then((cfg) => {
         setPresets(cfg.presets || []);
         setPins(cfg.pins || []);
@@ -897,11 +1235,12 @@ export function RetargetManagePage() {
   const updateControl = (
     desired: "running" | "stopped",
     performance: "auto" | "light" | "balanced" | "heavy",
+    method: "omniretarget" | "frax" = data?.method || "omniretarget",
   ) => {
     setControlBusy(true);
     setError("");
     api
-      .setRetargetControl({ desired, performance })
+      .setRetargetControl({ desired, performance, method })
       .then((next) => setData(next))
       .catch((err: Error) => setError(err.message || "设置失败"))
       .finally(() => setControlBusy(false));
@@ -973,6 +1312,26 @@ export function RetargetManagePage() {
             ))}
           </div>
           <span className="muted">{performanceHint(data?.performance || "heavy", data?.performance_note)}</span>
+          <div className="retarget-modes" role="group" aria-label="重定向方法">
+            {RETARGET_METHODS.map((method) => (
+              <button
+                key={method.id}
+                type="button"
+                className={(data?.method || "omniretarget") === method.id ? "is-on" : ""}
+                disabled={controlBusy}
+                onClick={() =>
+                  updateControl(
+                    data?.desired === "stopped" ? "stopped" : "running",
+                    data?.performance || "heavy",
+                    method.id,
+                  )
+                }
+              >
+                {method.label}
+              </button>
+            ))}
+          </div>
+          <span className="muted">换方法后，当前这一波结束就重新扫描。已经写好的文件会保留。</span>
         </div>
         <p className="muted" style={{ margin: 0 }}>
           {data?.priority_note || "优先级会在扫描完成后显示。"}
@@ -1032,11 +1391,11 @@ export function RetargetManagePage() {
         </p>
         {priorityNote ? <div className="muted">{priorityNote}</div> : null}
         {priorityError ? <div className="error">{priorityError}</div> : null}
-        {rules.length ? (
+        {savedRules.length ? (
           <PriorityProgress
-            rules={rules}
+            rules={savedRules}
             queues={queues}
-            countsReady={!dirty && sameRuleOrder(rules, queues)}
+            recounting={data?.phase === "scanning"}
             onRedo={redoTier}
             redoBusy={redoBusy}
             redoIds={new Set(redoIds)}
@@ -1062,157 +1421,48 @@ export function RetargetManagePage() {
       <section className="card stack">
         <h2>调整优先级</h2>
         <p className="muted" style={{ margin: 0 }}>
-          每条规则同时指定机器人和数据范围，排在上面的先做。同一条规则里，机器人、包含的分类都按勾选顺序分先后：先点的先做，取消后再勾会排到最后。排除的分类不参与排序，会留到后面的规则。其余数据是这些机器人里没有被任何一档指定数据或指定分类点名的动作，那些档可以排在其余数据的上面或下面。保存后，当前这一波结束就会按新顺序重新扫描。
+          每一行是一个数据节点，每一列是一台机器人，格子里填序号：数字小的先做，留空表示这台机器人不单独排这份数据。序号相同时，上面的行先做，同一行里左边的机器人先做。「其余数据」是这台机器人没有被其他行点名的全部动作。一份数据同时落在几行里时，按序号最小的那一行算。按回车或上下方向键可以在同一列里移动。保存后，当前这一波结束就会按新顺序重新扫描。
         </p>
         {priorityError ? <div className="error">{priorityError}</div> : null}
         {priorityNote ? <div className="muted">{priorityNote}</div> : null}
-        <div className="retarget-editor">
-          {rules.map((rule, index) => {
-            const earlier = new Set(rules.slice(0, index).flatMap((item) => (item.enabled ? item.robots : [])));
-            return (
-            <div key={rule.id} className={rule.enabled ? "retarget-rule" : "retarget-rule is-off"}>
-              <div className="retarget-rule-head" onClick={() => toggleRule(rule.id)}>
-                <div className="retarget-rule-summary">
-                  <strong>第 {index + 1} 档</strong>
-                  <div className="muted">{rule.enabled ? ruleTitle(rule, earlier, rules) : "已停用，不会参与排序"}</div>
-                </div>
-                <div className="row" onClick={(event) => event.stopPropagation()}>
-                  <button type="button" className="secondary retarget-mini" disabled={index === 0} onClick={() => moveRule(index, -1)}>
-                    上移
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary retarget-mini"
-                    disabled={index === rules.length - 1}
-                    onClick={() => moveRule(index, 1)}
-                  >
-                    下移
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary retarget-mini"
-                    disabled={rules.length <= 1}
-                    onClick={() => {
-                      setRules((prev) => prev.filter((item) => item.id !== rule.id));
-                      setPriorityNote("");
-                    }}
-                  >
-                    删除
-                  </button>
-                  <button type="button" className="secondary retarget-mini" onClick={() => toggleRule(rule.id)}>
-                    {collapsed.has(rule.id) ? "展开" : "收起"}
-                  </button>
-                </div>
-              </div>
-              {!collapsed.has(rule.id) ? (
-              <>
-              <div className="retarget-inline">
-                <label className="retarget-check">
-                  <input
-                    type="checkbox"
-                    checked={rule.enabled}
-                    onChange={(event) => updateRule(rule.id, { enabled: event.target.checked })}
-                  />
-                  启用
-                </label>
-                <span className="muted">机器人</span>
-                {rule.robots.map((robot, index) => (
-                  <button
-                    key={robot}
-                    type="button"
-                    className="retarget-chip"
-                    onClick={() => updateRule(rule.id, { robots: rule.robots.filter((item) => item !== robot) })}
-                  >
-                    {index + 1}. {robot} ×
-                  </button>
-                ))}
-                {(robots.length ? robots : rule.robots).map((robot) => {
-                  const rank = rule.robots.indexOf(robot);
-                  return (
-                    <label key={robot} className="retarget-check">
-                      <input
-                        type="checkbox"
-                        checked={rank >= 0}
-                        onChange={() => {
-                          const next = rank >= 0
-                            ? rule.robots.filter((item) => item !== robot)
-                            : [...rule.robots, robot];
-                          updateRule(rule.id, { robots: next });
-                        }}
-                      />
-                      {rank >= 0 ? <span className="retarget-rank">{rank + 1}</span> : null}
-                      {robot}
-                    </label>
-                  );
-                })}
-              </div>
-              {rule.data_mode === "targets" ? (
-                <div className="muted">
-                  这一档只包含上面这些数据。用上移、下移可以调整它和其他档的顺序。
-                </div>
-              ) : (
-                <>
-                <div className="retarget-inline">
-                <label className="retarget-check">
-                  <input
-                    type="radio"
-                    name={`mode-${rule.id}`}
-                    checked={rule.data_mode === "taxonomy"}
-                    onChange={() => updateRule(rule.id, { data_mode: "taxonomy" })}
-                  />
-                  指定分类
-                </label>
-                <label className="retarget-check">
-                  <input
-                    type="radio"
-                    name={`mode-${rule.id}`}
-                    checked={rule.data_mode === "rest"}
-                    onChange={() => updateRule(rule.id, { data_mode: "rest" })}
-                  />
-                  其余数据
-                </label>
-                </div>
-              {rule.data_mode === "taxonomy" ? (
-                <>
-                  <div>
-                    <div className="muted">包含这些分类。勾选父节点会带上全部下级，先勾的先做。多个维度要同时满足。</div>
-                    <SchemeFacets
-                      ranked
-                      schemes={facetSchemes}
-                      nodesByScheme={nodesByScheme}
-                      picks={rulePicks(rule, "include")}
-                      onChange={(include_picks) => updateRule(rule.id, withPicks(rule, "include", include_picks))}
-                    />
-                  </div>
-                  <div>
-                    <div className="muted">排除这些分类。勾选父节点会排除它的全部下级。</div>
-                    <SchemeFacets
-                      schemes={facetSchemes}
-                      nodesByScheme={nodesByScheme}
-                      picks={rulePicks(rule, "exclude")}
-                      onChange={(exclude_picks) => updateRule(rule.id, withPicks(rule, "exclude", exclude_picks))}
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="muted">这一档是这些机器人里、其他档没有点名的动作。指定数据或指定分类可以放在它下面，那些动作不会算进其余数据。</div>
-              )}
-                </>
-              )}
-              </>
-              ) : null}
-            </div>
-            );
-          })}
+        <PriorityMatrix
+          rows={rows}
+          savedRows={savedRows}
+          robots={robots}
+          schemes={facetSchemes}
+          nodesByScheme={nodesByScheme}
+          onChange={(next) => {
+            setRows(next);
+            setPriorityNote("");
+            setPriorityError("");
+          }}
+        />
+        <div className="row">
+          <button type="button" disabled={!dirty || saving} onClick={saveRules}>
+            {saving ? "正在保存" : "保存优先级"}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={!dirty || saving}
+            onClick={() => {
+              setRows(cloneRows(savedRows));
+              setPriorityNote("");
+              setPriorityError("");
+            }}
+          >
+            放弃修改
+          </button>
+          {dirty ? <span className="muted">有改动还没保存，改过的格子带蓝色边框。</span> : null}
         </div>
         <div className="retarget-preset-box">
           <strong>预设</strong>
           <p className="muted" style={{ margin: 0 }}>
-            调好上面的档位后，填一个新名称，就能把当前优先级新增成一套预设。可以存多套。点预设名称会换成那一套，当前这一波结束后重新扫描。删除预设不会改正在执行的优先级。
+            填好上面的表格后，填一个新名称，就能把当前优先级新增成一套预设。可以存多套。点预设名称会换成那一套，当前这一波结束后重新扫描。删除预设不会改正在执行的优先级。
           </p>
           <div className="retarget-presets">
             {presets.map((preset) => {
-              const active = JSON.stringify(savedRules) === JSON.stringify(preset.rules);
+              const active = matrixSignature(rulesToMatrix(preset.rules)) === savedSignature;
               return (
                 <span key={preset.id} className={active ? "retarget-preset is-on" : "retarget-preset"}>
                   <button type="button" disabled={saving} onClick={() => applyPreset(preset)}>
@@ -1246,29 +1496,8 @@ export function RetargetManagePage() {
             </button>
           </div>
         </div>
-        <div className="row">
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => {
-              const rule = blankRule(robots);
-              setRules((prev) => [...prev, rule]);
-              setCollapsed((prev) => {
-                const next = new Set(prev);
-                next.delete(rule.id);
-                return next;
-              });
-              setPriorityNote("");
-            }}
-          >
-            添加规则
-          </button>
-          <button type="button" disabled={!dirty || saving} onClick={saveRules}>
-            {saving ? "正在保存" : "保存优先级"}
-          </button>
-        </div>
         <p className="muted" style={{ margin: 0 }}>
-          noetix_e2v2_1015、unitree_g1、noetix_e2 没被规则选中时，仍会排在最后继续重定向。新加入的机器人要在某一档勾选并保存后才会开始。同一档里，开源数据和其他数据集会稍晚一些，小批次先做。
+          noetix_e2v2_1015、unitree_g1、noetix_e2 整列都没填序号时，仍会排在最后继续重定向。新加入的机器人要在表格里填了序号并保存后才会开始。同一个序号里，开源数据和其他数据集会稍晚一些，小批次先做。
         </p>
       </section>
 

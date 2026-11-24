@@ -429,7 +429,7 @@ export function UsersPage() {
   useEffect(() => {
     if (!canManageUsers) return;
     reload().catch((e) => setError(e.message));
-    Promise.all([api.listFolders(), fetchStorageOverview(), api.storageModels()])
+    Promise.all([api.listFolders(), fetchStorageOverview(), api.storageModels({ quiet: true })])
       .then(([folders, storage, models]) => {
         const paths = [
           ...folders.map((folder) => folder.path),

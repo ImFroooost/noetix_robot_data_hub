@@ -37,11 +37,13 @@ PKG = Path(
 )
 BACKEND = Path("/media/noetix/my_passport1/noetix_robot_data_hub/backend")
 FRAME_DIR = HUB / "index" / "retarget_frames"
-VERSION = 2
+VERSION = 3
 
 sys.path.insert(0, str(BACKEND))
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(PKG / "holosoma_retargeting" / "data_utils"))
+
+from app.services.file_lock import write_text_atomic  # noqa: E402
 os.environ.setdefault("HOLOSOMA_ROBOT_PROFILES", str(HUB / "index" / "retarget_robots"))
 
 TOE_NAMES = ("LeftToeBase", "RightToeBase", "LeftToe", "RightToe", "L_Foot", "R_Foot")
@@ -126,7 +128,8 @@ def scene_frame(fbx: Path) -> dict:
         link.symlink_to(fbx)
         jobs = expand_jobs(in_dir, tmp / "out", [link])
         skeletons: list[dict] = []
-        for _input, skeleton, _csv, preserve, shared_height in jobs:
+        for job in jobs:
+            _input, skeleton, _csv, preserve, shared_height = job[:5]
             work = tmp / f"work_{len(skeletons)}"
             work.mkdir()
             convert_input_to_npz(
@@ -179,9 +182,7 @@ def robot_heights() -> dict[str, float]:
 def write_robot_heights() -> None:
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
     payload = {"version": VERSION, "robots": robot_heights()}
-    tmp = FRAME_DIR / "robots.json.tmp"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(FRAME_DIR / "robots.json")
+    write_text_atomic(FRAME_DIR / "robots.json", json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def write_frame(fbx: Path, *, force: bool = False) -> Path | None:
@@ -202,9 +203,7 @@ def write_frame(fbx: Path, *, force: bool = False) -> Path | None:
             pass
     payload = {"path": rel, "size": stat.st_size, "mtime": int(stat.st_mtime), **scene_frame(fbx)}
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(out)
+    write_text_atomic(out, json.dumps(payload, ensure_ascii=False, indent=2))
     return out
 
 

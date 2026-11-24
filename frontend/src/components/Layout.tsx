@@ -21,9 +21,11 @@ const PAGES: Record<string, { title: string; subtitle: string }> = {
   "/?mode=upload": { title: "上传", subtitle: "导入文件夹或压缩包，并补齐分类" },
   "/?mode=annotate": { title: "标注", subtitle: "为范围内的数据补充标签与评价" },
   "/?mode=manage": { title: "数据管理", subtitle: "整理批次、单元，并处理过期文件" },
+  "/trash": { title: "回收站", subtitle: "恢复误删的数据，或再永久删除" },
   "/taxonomies": { title: "分类管理", subtitle: "维护项目、地点等分类标准" },
   "/retarget": { title: "重定向管理", subtitle: "查看自动重定向的进度和优先级" },
   "/robots": { title: "3D 模型", subtitle: "管理人体与机器人的描述和网格" },
+  "/visualize": { title: "可视化", subtitle: "把本地文件拖进来查看动作、物体和模型" },
   "/users": { title: "用户与权限", subtitle: "开账号、配范围，并进入对方视角验收" },
   "/audit": { title: "操作记录", subtitle: "每个用户的每次操作单独保存一条" },
 };
@@ -68,12 +70,16 @@ export function Layout() {
           ? "标注数据"
           : page.title === "数据管理"
             ? "管理数据"
+            : page.title === "回收站"
+              ? "查看回收站"
             : page.title === "分类管理"
               ? "管理分类"
               : page.title === "重定向管理"
                 ? "查看重定向"
                 : page.title === "3D 模型"
                 ? "查看模型"
+                : page.title === "可视化"
+                  ? "可视化数据"
                 : page.title === "用户与权限"
                   ? "管理用户"
                   : page.title === "操作记录"
@@ -239,6 +245,11 @@ export function Layout() {
               </SideLink>
             )}
             {hasPerm("manage_data") && (
+              <SideLink to="/trash" icon={<IconTrash />} onClick={() => setNavOpen(false)}>
+                回收站
+              </SideLink>
+            )}
+            {hasPerm("manage_data") && (
               <SideLink to="/taxonomies" icon={<IconTaxonomy />} onClick={() => setNavOpen(false)}>
                 分类管理
               </SideLink>
@@ -250,6 +261,9 @@ export function Layout() {
             )}
             <SideLink to="/robots" icon={<IconRobot />} onClick={() => setNavOpen(false)}>
               3D 模型
+            </SideLink>
+            <SideLink to="/visualize" icon={<IconVisualize />} onClick={() => setNavOpen(false)}>
+              可视化
             </SideLink>
             {hasPerm("manage_users") && (
               <SideLink to="/users" icon={<IconUsers />} onClick={() => setNavOpen(false)}>
@@ -425,6 +439,16 @@ function IconManage() {
   );
 }
 
+function IconTrash() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 7h14" />
+      <path d="M9 7V5h6v2" />
+      <path d="M7.5 7l.8 12h7.4l.8-12" />
+    </svg>
+  );
+}
+
 function IconTaxonomy() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -455,6 +479,15 @@ function IconRobot() {
       <circle cx="12" cy="5" r="1.2" />
       <circle cx="9.2" cy="13" r="1.1" />
       <circle cx="14.8" cy="13" r="1.1" />
+    </svg>
+  );
+}
+
+function IconVisualize() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M2.5 12S6.5 6.5 12 6.5 21.5 12 21.5 12 17.5 17.5 12 17.5 2.5 12 2.5 12z" />
+      <circle cx="12" cy="12" r="2.4" />
     </svg>
   );
 }

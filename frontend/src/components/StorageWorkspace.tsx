@@ -1880,7 +1880,7 @@ function QuickUpload({
     if (ontology !== "robot" && ontology !== "human") return;
     let cancelled = false;
     api
-      .storageModels()
+      .storageModels({ quiet: true })
       .then((data) => {
         if (cancelled) return;
         setRobotInstances(data.instances.filter((item) => item.ontology === "robot"));
@@ -2465,7 +2465,7 @@ function EntityDetailPanel({
     }
     let cancelled = false;
     api
-      .storageModels()
+      .storageModels({ quiet: true })
       .then((data) => {
         if (cancelled) return;
         if (needRobot) {
@@ -3107,7 +3107,7 @@ function fileRobotStyle(file: StorageFile, unit?: StorageUnit | null) {
   return String(file.robot_style || file.annotation?.robot_style || unit?.annotation?.robot_style || "").trim();
 }
 
-const ROBOT_ACQUIRE_METHODS = ["omniretarget", "umr", "gmr"] as const;
+const ROBOT_ACQUIRE_METHODS = ["omniretarget", "umr", "gmr", "frax"] as const;
 
 function fileRobotAcquireMethod(file: StorageFile) {
   const stored = String(file.robot_acquire_method || "").trim();
@@ -3727,6 +3727,32 @@ function fileMatchesSubject(file: StorageFile, selected: string[]) {
   });
 }
 
+const NARROWING_FILTERS = ["subject", "format", "modality"] as const;
+
+function narrowingActive(checks: Record<string, string[]>) {
+  return NARROWING_FILTERS.some((key) => (checks[key] || []).length > 0);
+}
+
+function fileMatchesNarrowing(file: StorageFile, checks: Record<string, string[]>) {
+  for (const key of NARROWING_FILTERS) {
+    const ids = checks[key] || [];
+    if (!ids.length) continue;
+    if (key === "subject" && !fileMatchesSubject(file, ids)) return false;
+    if (key === "format" && !ids.some((id) => id.toLowerCase() === (file.format || "").toLowerCase())) {
+      return false;
+    }
+    if (key === "modality" && !ids.includes(fileModalityKey(file))) return false;
+  }
+  return true;
+}
+
+function withVisibleFiles(unit: StorageUnit, checks: Record<string, string[]>): StorageUnit {
+  if (!narrowingActive(checks)) return unit;
+  const files = unit.files.filter((file) => fileMatchesNarrowing(file, checks));
+  if (files.length === unit.files.length) return unit;
+  return { ...unit, files, file_count: files.length };
+}
+
 function unitMatchesExtraFilters(unit: StorageUnit, checks: Record<string, string[]>) {
   for (const [key, ids] of Object.entries(checks)) {
     if (!ids.length) continue;
@@ -4101,6 +4127,10 @@ export function StorageWorkspace({
     units: StorageUnit[];
   } | null>(null);
   const [downloadBusy, setDownloadBusy] = useState(false);
+  const [retargetUnits, setRetargetUnits] = useState<StorageUnit[] | null>(null);
+  const [retargetRobots, setRetargetRobots] = useState<string[]>([]);
+  const [retargetOrder, setRetargetOrder] = useState<string[]>([]);
+  const [retargetBusy, setRetargetBusy] = useState(false);
   const loadSequence = useRef(0);
   const pendingSelectBatch = useRef<string | null>(null);
   const pendingSelectSession = useRef<string | null>(null);
@@ -4211,7 +4241,7 @@ export function StorageWorkspace({
   useEffect(() => {
     let cancelled = false;
     const loadTaxonomies = () => {
-      Promise.all([api.listTaxonomySchemes(), api.listTaxonomies()])
+      Promise.all([api.listTaxonomySchemes({ quiet: true }), api.listTaxonomies(undefined, { quiet: true })])
         .then(([schemeRows, nodeRows]) => {
           if (cancelled) return;
           setSchemes(
@@ -4238,7 +4268,7 @@ export function StorageWorkspace({
     if (variant === "upload") return;
     let cancelled = false;
     api
-      .storageModels()
+      .storageModels({ quiet: true })
       .then((overview) => {
         if (!cancelled) setModelInstances(overview.instances);
       })
@@ -4260,15 +4290,18 @@ export function StorageWorkspace({
     return () => window.removeEventListener(INDEX_UPDATED_EVENT, onIndexUpdated);
   }, [mode, tagId, tagExact, user?.id, variant, query]);
 
-  const selected = useMemo(
-    () => data?.units.find((unit) => unit.key === selectedKey) || null,
-    [data, selectedKey]
-  );
-
   const displayData = useMemo(() => {
     if (!data) return null;
     const compareUnits = (a: StorageUnit, b: StorageUnit) =>
       compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes);
+    const visibleCache = new Map<string, StorageUnit>();
+    const showUnit = (unit: StorageUnit) => {
+      const cached = visibleCache.get(unit.key);
+      if (cached) return cached;
+      const next = withVisibleFiles(unit, extraChecks);
+      visibleCache.set(unit.key, next);
+      return next;
+    };
     const known = new Set(data.batches.map((batch) => batch.name));
     const placeholderBatches = extraBatches
       .filter((name) => !known.has(name))
@@ -4292,6 +4325,7 @@ export function StorageWorkspace({
               unitMatchesSchemeFilters(unit, batch, filterNodeIds, nodes) &&
               unitMatchesExtraFilters(unit, extraChecks)
           )
+          .map(showUnit)
           .sort(compareUnits);
         return {
           ...batch,
@@ -4310,14 +4344,22 @@ export function StorageWorkspace({
         compareByStorageSort(a, b, sortMode, (item) => item.name, entitySortTimes)
       );
     const batchByName = new Map(data.batches.map((item) => [item.name, item]));
-    return { ...data, batches, units: data.units.filter((unit) => {
+    return { ...data, batches, units: data.units.flatMap((unit) => {
       const batch = batchByName.get(unit.batch);
-      return (
+      const matched =
         unitMatchesSchemeFilters(unit, batch, filterNodeIds, nodes) &&
-        unitMatchesExtraFilters(unit, extraChecks)
-      );
+        unitMatchesExtraFilters(unit, extraChecks);
+      return matched ? [showUnit(unit)] : [];
     }) };
   }, [data, extraBatches, sortMode, filterNodeIds, nodes, extraChecks]);
+
+  const selected = useMemo(
+    () =>
+      displayData?.units.find((unit) => unit.key === selectedKey) ||
+      data?.units.find((unit) => unit.key === selectedKey) ||
+      null,
+    [displayData, data, selectedKey]
+  );
 
   const pickedUnits = useMemo(() => {
     if (!pickedKeys.length) return [];
@@ -4335,7 +4377,7 @@ export function StorageWorkspace({
   const currentNodes = nodes.filter((node) => node.scheme === mode);
 
   const reloadTaxonomies = async () => {
-    setNodes(await api.listTaxonomies());
+    setNodes(await api.listTaxonomies(undefined, { quiet: true }));
   };
 
   const focusedSession = useMemo(() => {
@@ -4564,35 +4606,62 @@ export function StorageWorkspace({
     }
   };
 
+  const retargetItems = (units: StorageUnit[]) => {
+    const byBatch = new Map<string, StorageUnit[]>();
+    for (const unit of units) {
+      const list = byBatch.get(unit.batch) || [];
+      list.push(unit);
+      byBatch.set(unit.batch, list);
+    }
+    return [...byBatch.entries()].map(([batch, picked]) => {
+      const all = displayData?.batches.find((item) => item.name === batch);
+      if (all && picked.length >= all.units.length) return { batch, units: [] as string[] };
+      return { batch, units: picked.map((unit) => unit.name) };
+    });
+  };
+
   const handlePrioritize = async (units: StorageUnit[]) => {
     const unique = uniqueUnits(units);
     if (!unique.length) {
       setError("没有可优先的数据单元");
       return;
     }
-    const byBatch = new Map<string, StorageUnit[]>();
-    for (const unit of unique) {
-      const list = byBatch.get(unit.batch) || [];
-      list.push(unit);
-      byBatch.set(unit.batch, list);
-    }
-    const items = [...byBatch.entries()].map(([batch, picked]) => {
-      const all = displayData?.batches.find((item) => item.name === batch);
-      if (all && picked.length >= all.units.length) return { batch, units: [] as string[] };
-      return { batch, units: picked.map((unit) => unit.name) };
-    });
+    setError("");
     try {
-      await api.pinRetarget(items);
+      const cfg = await api.retargetPriority();
+      setRetargetRobots(cfg.robots || []);
+      setRetargetOrder([]);
+      setRetargetUnits(unique);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "读取机器人款式失败");
+    }
+  };
+
+  const confirmPrioritize = async () => {
+    if (!retargetUnits?.length) return;
+    if (!retargetOrder.length) {
+      setError("请至少选择一台机器人");
+      return;
+    }
+    const items = retargetItems(retargetUnits);
+    setRetargetBusy(true);
+    try {
+      await api.pinRetarget(items, retargetOrder);
       const label =
         items.length === 1 && items[0].units.length === 0
           ? `批次「${items[0].batch}」`
-          : unique.length === 1
-            ? `「${unique[0].name}」`
-            : `${unique.length} 个数据单元`;
-      setMessage(`已把${label}加为最上面的一档优先级。可在重定向管理里用上移、下移调整。当前这一波结束后会按新顺序扫描。`);
+          : retargetUnits.length === 1
+            ? `「${retargetUnits[0].name}」`
+            : `${retargetUnits.length} 个数据单元`;
+      setMessage(
+        `已把${label}加为最上面的一档。重定向顺序：${retargetOrder.join(" → ")}。当前这一波结束后会按这个顺序扫描。`
+      );
       setError("");
+      setRetargetUnits(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "设置优先级失败");
+    } finally {
+      setRetargetBusy(false);
     }
   };
 
@@ -4629,20 +4698,20 @@ export function StorageWorkspace({
   const handleDeleteItems = async (batches: StorageBatch[], units: StorageUnit[]) => {
     const covered = new Set(batches.map((item) => item.name));
     const leftover = units.filter((unit) => !covered.has(unit.batch));
-    const labels = [
-      ...batches.map((item) => `批次 ${item.name}`),
-      ...leftover.map((unit) => `单元 ${unit.batch}/${unit.name}`),
-    ];
-    if (!labels.length) return;
-    if (!window.confirm(`确认删除以下 ${labels.length} 项？\n${labels.join("\n")}`)) return;
-    const removedPaths = new Set<string>([
-      ...batches.flatMap((item) =>
-        item.units.flatMap((unit) => unit.files.map((file) => file.path))
-      ),
-      ...leftover.flatMap((unit) => unit.files.map((file) => file.path)),
-    ]);
-    const removedBatches = new Set(batches.map((item) => item.name));
-    const removedUnitKeys = new Set(leftover.map((unit) => unit.key));
+    const targetUnits = [...batches.flatMap((item) => item.units), ...leftover];
+    const files = targetUnits.flatMap((unit) => unit.files);
+    const narrowing = narrowingActive(extraChecks);
+    if (!files.length && !batches.length) return;
+    const fileCount = files.length;
+    const prompt = !fileCount
+      ? `确认删除空批次 ${batches.map((item) => item.name).join("、")}？`
+      : narrowing
+        ? `当前筛选只包含一部分文件。将把符合筛选的 ${fileCount} 个文件移入回收站，同单元里没有出现在筛选中的文件会保留。\n可在「回收站」中恢复，或再永久删除。`
+        : `将把所选 ${fileCount} 个文件移入回收站。\n可在「回收站」中恢复，或再永久删除。`;
+    if (!window.confirm(prompt)) return;
+    const removedPaths = new Set(files.map((file) => file.path));
+    const removedBatches = new Set(!narrowing ? batches.map((item) => item.name) : []);
+    const removedUnitKeys = new Set(narrowing ? [] : leftover.map((unit) => unit.key));
     loadSequence.current += 1;
     setData((current) =>
       current ? omitStorageRecords(current, removedPaths, removedBatches) : current
@@ -4661,11 +4730,20 @@ export function StorageWorkspace({
     setSelectedKey(null);
     preview.removeByPaths([...removedPaths]);
     try {
+      const label = narrowing
+        ? `筛选后的 ${fileCount} 个文件`
+        : batches.length === 1 && !leftover.length
+          ? `批次 ${batches[0].name}`
+          : leftover.length === 1 && !batches.length
+            ? `单元 ${leftover[0].batch}/${leftover[0].name}`
+            : `${fileCount} 个文件`;
       await api.storageBulkDelete({
-        batches: batches.map((item) => item.name),
-        units: leftover.map((unit) => ({ batch: unit.batch, name: unit.name })),
+        batches: fileCount ? [] : batches.map((item) => item.name),
+        units: [],
+        paths: files.map((file) => file.path),
+        label,
       });
-      setMessage("已删除所选项目");
+      setMessage(fileCount ? "已移入回收站" : "已删除空批次");
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
@@ -4687,8 +4765,8 @@ export function StorageWorkspace({
     const text =
       confirmText ||
       (whole
-        ? `确认删除这次上传的 ${session.file_count} 个文件？\n${formatSessionTime(session.created_at)} · ${session.batch || "未分批次"}\n不会删除同批次其它上传。`
-        : `确认删除这次上传中的 ${targets.length} 个文件？\n不会删除同单元其它上传留下的文件。`);
+        ? `确认把这次上传的 ${session.file_count} 个文件移入回收站？\n${formatSessionTime(session.created_at)} · ${session.batch || "未分批次"}\n不会删除同批次其它上传。可在回收站中恢复或永久删除。`
+        : `确认把这次上传中的 ${targets.length} 个文件移入回收站？\n不会删除同单元其它上传留下的文件。`);
     if (!window.confirm(text)) return;
     const removedPaths = new Set(targets);
     loadSequence.current += 1;
@@ -4714,7 +4792,7 @@ export function StorageWorkspace({
     preview.removeByPaths(targets);
     try {
       await api.storageDeleteUploadSession(session.id, whole ? undefined : paths);
-      setMessage(whole ? "已删除这次上传的文件" : `已删除 ${targets.length} 个文件`);
+      setMessage(whole ? "这次上传的文件已移入回收站" : `已把 ${targets.length} 个文件移入回收站`);
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "删除失败");
@@ -5337,7 +5415,7 @@ export function StorageWorkspace({
                       type="button"
                       className="danger"
                       onClick={async () => {
-                        if (!confirm(`确认删除 ${selectedFile.name}？`)) return;
+                        if (!confirm(`确认把 ${selectedFile.name} 移入回收站？可在回收站中恢复或永久删除。`)) return;
                         const removedPaths = new Set([selectedFile.path]);
                         loadSequence.current += 1;
                         setData((current) =>
@@ -5446,6 +5524,75 @@ export function StorageWorkspace({
         </div>
       </div>
 
+      {retargetUnits && (
+        <div
+          className="storage-modal-backdrop"
+          onClick={() => {
+            if (!retargetBusy) setRetargetUnits(null);
+          }}
+        >
+          <div
+            className="storage-modal card stack storage-retarget-dialog"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 style={{ margin: 0 }}>选择要重定向的机器人</h3>
+            <p className="muted" style={{ margin: 0 }}>
+              已选 {retargetUnits.length} 个数据单元。按勾选顺序决定先后，先勾的先做，取消后再勾会排到最后。
+            </p>
+            <div className="retarget-inline">
+              <span className="muted">机器人</span>
+              {retargetOrder.map((robot, index) => (
+                <button
+                  key={robot}
+                  type="button"
+                  className="retarget-chip"
+                  disabled={retargetBusy}
+                  onClick={() => setRetargetOrder((current) => current.filter((item) => item !== robot))}
+                >
+                  {index + 1}. {robot} ×
+                </button>
+              ))}
+              {(retargetRobots.length ? retargetRobots : retargetOrder).map((robot) => {
+                const rank = retargetOrder.indexOf(robot);
+                return (
+                  <label key={robot} className="retarget-check">
+                    <input
+                      type="checkbox"
+                      disabled={retargetBusy}
+                      checked={rank >= 0}
+                      onChange={() => {
+                        setRetargetOrder((current) =>
+                          rank >= 0 ? current.filter((item) => item !== robot) : [...current, robot]
+                        );
+                      }}
+                    />
+                    {rank >= 0 ? <span className="retarget-rank">{rank + 1}</span> : null}
+                    {robot}
+                  </label>
+                );
+              })}
+            </div>
+            {!retargetRobots.length && <div className="muted">还没有可重定向的机器人款式</div>}
+            <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+              <button
+                type="button"
+                className="secondary"
+                disabled={retargetBusy}
+                onClick={() => setRetargetUnits(null)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={retargetBusy || !retargetOrder.length}
+                onClick={() => void confirmPrioritize()}
+              >
+                {retargetBusy ? "提交中…" : "开始重定向"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {downloadPick && (
         <DownloadPicker
           batches={downloadPick.batches}

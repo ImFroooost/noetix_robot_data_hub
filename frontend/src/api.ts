@@ -183,12 +183,12 @@ export const api = {
   deleteFolder: (id: number) =>
     request<{ ok: boolean }>(`/api/folders/${id}`, { method: "DELETE" }),
 
-  listTaxonomies: (scheme?: string) => {
+  listTaxonomies: (scheme?: string, opts?: { quiet?: boolean }) => {
     const q = scheme ? `?scheme=${encodeURIComponent(scheme)}` : "";
-    return request<import("./types").TaxonomyNode[]>(`/api/taxonomies${q}`);
+    return request<import("./types").TaxonomyNode[]>(`/api/taxonomies${q}`, { quiet: opts?.quiet });
   },
-  listTaxonomySchemes: () =>
-    request<import("./types").TaxonomySchemeDef[]>("/api/taxonomies/schemes"),
+  listTaxonomySchemes: (opts?: { quiet?: boolean }) =>
+    request<import("./types").TaxonomySchemeDef[]>("/api/taxonomies/schemes", { quiet: opts?.quiet }),
   createTaxonomyScheme: (body: Record<string, unknown>) =>
     request<import("./types").TaxonomySchemeDef>("/api/taxonomies/schemes", {
       method: "POST",
@@ -280,7 +280,7 @@ export const api = {
       method: "POST",
     }),
   storageRescanStatus: () =>
-    request<import("./types").CatalogRebuildStatus>("/api/storage/rescan/status"),
+    request<import("./types").CatalogRebuildStatus>("/api/storage/rescan/status", { quiet: true }),
   storageCreateBatch: (
     name: string,
     extra?: { taxonomy_tag_ids?: Record<string, number | number[] | null> }
@@ -359,11 +359,29 @@ export const api = {
   storageBulkDelete: (body: {
     batches: string[];
     units: { batch: string; name: string }[];
+    paths?: string[];
+    label?: string;
   }) =>
-    request<{ ok: boolean; batches: string[]; units: string[] }>(
+    request<{ ok: boolean; batches: string[]; units: string[]; trash_id?: string; file_count?: number }>(
       "/api/storage/bulk-delete",
       { method: "POST", body: JSON.stringify(body) }
     ),
+  storageTrash: () =>
+    request<import("./types").TrashOverview>("/api/storage/trash"),
+  storageRestoreTrash: (id: string) =>
+    request<import("./types").TrashRestoreResult>(
+      `/api/storage/trash/${encodeURIComponent(id)}/restore`,
+      { method: "POST" }
+    ),
+  storagePurgeTrash: (id: string) =>
+    request<{ id: string; file_count: number }>(
+      `/api/storage/trash/${encodeURIComponent(id)}`,
+      { method: "DELETE" }
+    ),
+  storageEmptyTrash: () =>
+    request<{ entries: number; file_count: number }>("/api/storage/trash", {
+      method: "DELETE",
+    }),
   storageUpload: (form: FormData) =>
     request<import("./types").StorageFile>("/api/storage/data/upload", {
       method: "POST",
@@ -375,9 +393,19 @@ export const api = {
       { method: "POST", body: form }
     ),
   storageUploadZip: (form: FormData) =>
-    request<import("./types").StorageFolderUploadResult>(
-      "/api/storage/data/upload-zip",
-      { method: "POST", body: form }
+    request<import("./types").ZipImportJob>("/api/storage/data/upload-zip", {
+      method: "POST",
+      body: form,
+    }),
+  storageUploadZipJob: (jobId: string) =>
+    request<import("./types").ZipImportJob>(
+      `/api/storage/data/upload-zip/${encodeURIComponent(jobId)}`,
+      { quiet: true }
+    ),
+  storageActiveZipJob: (batch: string) =>
+    request<import("./types").ZipImportJob>(
+      `/api/storage/data/upload-zip/active?batch=${encodeURIComponent(batch)}`,
+      { quiet: true }
     ),
   storageRenameFile: (path: string, next: string) =>
     request<import("./types").StorageFile>(
@@ -401,8 +429,10 @@ export const api = {
     request<import("./types").StorageFileDetail>(
       `/api/storage/file-detail?path=${encodeURIComponent(path)}`
     ),
-  storageModels: () =>
-    request<import("./types").ModelRepositoryOverview>("/api/storage/models"),
+  storageModels: (opts?: { quiet?: boolean }) =>
+    request<import("./types").ModelRepositoryOverview>("/api/storage/models", { quiet: opts?.quiet }),
+  storageModelKindZipUrl: (ontology: string, instance: string, kind: string) =>
+    `/api/storage/models/kind-zip?ontology=${encodeURIComponent(ontology)}&instance=${encodeURIComponent(instance)}&kind=${encodeURIComponent(kind)}`,
   storageCreateModelInstance: (ontology: "human" | "robot", name: string) =>
     request<import("./types").ModelInstance>("/api/storage/models/instances", {
       method: "POST",
@@ -484,7 +514,7 @@ export const api = {
       quiet: true,
     }),
   retargetStorageTree: () =>
-    request<import("./types").TaxonomyNode[]>("/api/repo/retarget/storage-tree"),
+    request<import("./types").TaxonomyNode[]>("/api/repo/retarget/storage-tree", { quiet: true }),
   redoRetargetTier: (ruleId: string) =>
     request<{ ok: boolean; rule_id: string; message: string }>(
       `/api/repo/retarget/priority/${encodeURIComponent(ruleId)}/redo`,
@@ -505,17 +535,21 @@ export const api = {
       `/api/repo/retarget/priority/presets/${encodeURIComponent(presetId)}`,
       { method: "DELETE" },
     ),
-  pinRetarget: (items: { batch: string; units: string[] }[]) =>
+  pinRetarget: (items: { batch: string; units: string[] }[], robots?: string[]) =>
     request<{ ok: boolean; count: number }>("/api/repo/retarget/pin", {
       method: "POST",
-      body: JSON.stringify({ items }),
+      body: JSON.stringify({ items, robots }),
     }),
   applyRetargetPreset: (presetId: string) =>
     request<import("./pages/RetargetManagePage").RetargetPriority>(
       `/api/repo/retarget/priority/presets/${encodeURIComponent(presetId)}/apply`,
       { method: "POST" },
     ),
-  setRetargetControl: (body: { desired: "running" | "stopped"; performance: "auto" | "light" | "balanced" | "heavy" }) =>
+  setRetargetControl: (body: {
+    desired: "running" | "stopped";
+    performance: "auto" | "light" | "balanced" | "heavy";
+    method?: "omniretarget" | "frax";
+  }) =>
     request<import("./pages/RetargetManagePage").RetargetStatus>("/api/repo/retarget/control", {
       method: "POST",
       body: JSON.stringify(body),

@@ -8,6 +8,8 @@ const ACTION_LABEL: Record<string, string> = {
   skip: "跳过",
   fail: "失败",
   delete: "删除",
+  trash: "放入回收站",
+  purge: "永久删除",
   rename: "重命名",
   annotate: "标注",
   login: "登录",

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from ..config import settings
+from .file_lock import write_text_atomic
 from .zip_names import decode_zip_filename
 from .dimensions import (
     load_dimension_schema,
@@ -242,9 +243,7 @@ def write_catalog(root: Path, catalog: dict[str, Any]) -> None:
     catalog = dict(catalog)
     catalog["updated_at"] = _utcnow_iso()
     catalog["version"] = int(catalog.get("version") or 1)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    write_text_atomic(path, json.dumps(catalog, ensure_ascii=False, indent=2))
 
 
 def upsert_catalog_entry(entry: dict[str, Any], root: Path | None = None) -> dict[str, Any]:

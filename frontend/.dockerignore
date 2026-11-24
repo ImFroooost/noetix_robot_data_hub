@@ -1,3 +1,8 @@
 node_modules
 dist
 .git
+holosoma_virtual_*
+retarget_batch_*
+tmp*
+node-compile-cache
+uv-setuptools-*.lock

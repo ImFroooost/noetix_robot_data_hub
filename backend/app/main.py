@@ -58,7 +58,7 @@ async def lifespan(_: FastAPI):
     try:
         ensure_hub_skeleton()
     except Exception:
-        pass
+        logging.getLogger("startup").exception("创建仓库目录骨架失败")
     init_db()
     ensure_admin()
 
@@ -84,7 +84,7 @@ async def lifespan(_: FastAPI):
                     if load1 <= limit:
                         start_catalog_rebuild(force=True)
             except Exception:
-                pass
+                logging.getLogger("catalog").exception("每日全量索引重建失败")
             time.sleep(15 * 60)
 
     def _warm_browse_index() -> None:
@@ -95,7 +95,7 @@ async def lifespan(_: FastAPI):
             load_data_index(include_empty=True)
             load_data_index(include_empty=False)
         except Exception:
-            pass
+            logging.getLogger("catalog").exception("预热浏览索引失败")
 
     import threading
 

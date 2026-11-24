@@ -8,11 +8,14 @@ MuJoCo compiles the URDF into MJCF the first time a retarget job runs.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import struct
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+from .file_lock import write_text_atomic
 
 PROFILE_DIR_NAME = "retarget_robots"
 _ACTUATED = frozenset({"revolute", "continuous", "prismatic"})
@@ -263,7 +266,8 @@ def build_profile(robot_type: str, urdf_path: Path) -> dict:
     for side, parent in feet.items():
         if not parent:
             continue
-        prefix = parent.removesuffix("_link") + "_sphere"
+        stem = parent[:-5] if parent.lower().endswith("_link") else parent
+        prefix = stem + "_sphere"
         groups.append({"parent": parent, "name_prefix": prefix, "kind": "foot_pad"})
         toes[side] = f"{prefix}_5_link"
         sticking.extend(f"{prefix}_{index}_link" for index in range(1, 5))
@@ -824,6 +828,132 @@ def _apply_phc_scene(mjcf: Path, urdf_path: Path) -> None:
     mjcf.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
 
+def _rpy_to_quat(text: str) -> str:
+    """URDF rpy (radians, XYZ) to a MuJoCo ``w x y z`` quaternion."""
+    parts = [float(item) for item in (text or "0 0 0").split()]
+    roll, pitch, yaw = (parts + [0.0, 0.0, 0.0])[:3]
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    quat = (
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    )
+    return " ".join(f"{value:.8g}" for value in quat)
+
+
+def _urdf_visual_meshes(urdf_path: Path) -> dict[str, list[dict[str, str]]]:
+    """Visual mesh placements keyed by link name. Collision-only shapes are ignored."""
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except ET.ParseError:
+        return {}
+    found: dict[str, list[dict[str, str]]] = {}
+    for link in root.iter():
+        if _local(link.tag) != "link":
+            continue
+        name = link.get("name") or ""
+        if not name:
+            continue
+        visuals: list[dict[str, str]] = []
+        for node in list(link):
+            if _local(node.tag) != "visual":
+                continue
+            xyz, rpy, filename = "0 0 0", "0 0 0", ""
+            for child in list(node):
+                tag = _local(child.tag)
+                if tag == "origin":
+                    xyz = child.get("xyz") or xyz
+                    rpy = child.get("rpy") or rpy
+                elif tag == "geometry":
+                    for mesh in child.iter():
+                        if _local(mesh.tag) == "mesh" and mesh.get("filename"):
+                            filename = mesh.get("filename") or ""
+            mesh_path = _resolve_mesh(filename, urdf_path) if filename else None
+            if mesh_path is None:
+                continue
+            visuals.append({"file": mesh_path.name, "xyz": xyz, "rpy": rpy})
+        if visuals:
+            found[name] = visuals
+    return found
+
+
+def restore_visual_meshes(mjcf: Path, urdf_path: Path) -> int:
+    """Put URDF visual meshes back onto bodies MuJoCo dropped.
+
+    The URDF importer keeps collision geometry and skips a link that only has a
+    visual mesh. Foot-pad virtual links then fail because the ankle body has no
+    mesh geom. Restored geoms are visual-only, matching the other mesh geoms.
+    """
+    visuals = _urdf_visual_meshes(urdf_path)
+    if not visuals or not mjcf.is_file():
+        return 0
+    root = ET.parse(mjcf).getroot()
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.Element("asset")
+        root.append(asset)
+    mesh_by_file = {
+        node.get("file"): node.get("name")
+        for node in asset
+        if _local(node.tag) == "mesh" and node.get("file") and node.get("name")
+    }
+    mesh_names = set(mesh_by_file.values())
+    bodies = {
+        body.get("name"): body
+        for body in root.iter()
+        if _local(body.tag) == "body" and body.get("name")
+    }
+    added = 0
+    for link_name, meshes in visuals.items():
+        body = bodies.get(link_name)
+        if body is None:
+            continue
+        if any(
+            _local(child.tag) == "geom" and (child.get("mesh") or child.get("type") == "mesh")
+            for child in list(body)
+        ):
+            continue
+        for spec in meshes:
+            file_name = spec["file"]
+            mesh_name = mesh_by_file.get(file_name)
+            if not mesh_name:
+                mesh_name = Path(file_name).stem
+                suffix = 2
+                while mesh_name in mesh_names:
+                    mesh_name = f"{Path(file_name).stem}_{suffix}"
+                    suffix += 1
+                asset.append(ET.Element("mesh", {"name": mesh_name, "file": file_name}))
+                mesh_by_file[file_name] = mesh_name
+                mesh_names.add(mesh_name)
+            children = list(body)
+            index = next((i for i, child in enumerate(children) if _local(child.tag) == "body"), len(children))
+            body.insert(
+                index,
+                ET.Element(
+                    "geom",
+                    {
+                        "type": "mesh",
+                        "mesh": mesh_name,
+                        "pos": spec["xyz"],
+                        "quat": _rpy_to_quat(spec["rpy"]),
+                        "rgba": "0.79216 0.81961 0.93333 1",
+                        "contype": "0",
+                        "conaffinity": "0",
+                        "group": "1",
+                        "density": "0",
+                    },
+                ),
+            )
+            added += 1
+    if added:
+        ET.indent(root, space="  ")
+        mjcf.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
+    return added
+
+
 def compile_mjcf(urdf_path: Path, python: str) -> Path:
     """Compile URDF to the MJCF path holosoma derives by swapping /urdf/ for /mjcf/."""
     mjcf = _mjcf_path(urdf_path)
@@ -833,9 +963,7 @@ def compile_mjcf(urdf_path: Path, python: str) -> Path:
         and _phc_ready(mjcf)
         and mjcf.stat().st_mtime >= urdf_path.stat().st_mtime
     )
-    if fresh:
-        return mjcf
-    if not _mjcf_usable(mjcf) or mjcf.stat().st_mtime < urdf_path.stat().st_mtime:
+    if not fresh and (not _mjcf_usable(mjcf) or not mjcf.is_file() or mjcf.stat().st_mtime < urdf_path.stat().st_mtime):
         rewritten = _rewrite_urdf_meshes(urdf_path)
         script = (
             "import mujoco, pathlib, sys\n"
@@ -861,8 +989,11 @@ def compile_mjcf(urdf_path: Path, python: str) -> Path:
             detail = (proc.stderr or proc.stdout or "MuJoCo 没有写出 MJCF").strip().splitlines()[-1]
             raise RuntimeError(detail)
         _pin_meshdir(mjcf, urdf_path)
-    _ensure_floating_base(mjcf, urdf_path)
-    _apply_phc_scene(mjcf, urdf_path)
+        _ensure_floating_base(mjcf, urdf_path)
+        restore_visual_meshes(mjcf, urdf_path)
+        _apply_phc_scene(mjcf, urdf_path)
+    else:
+        restore_visual_meshes(mjcf, urdf_path)
     if not _mjcf_usable(mjcf):
         raise RuntimeError(f"{mjcf.name} 已生成，但网格路径无法解析")
     return mjcf
@@ -916,15 +1047,20 @@ def ensure_retarget_profile(hub: Path, robot_type: str, *, python: str) -> Path 
     if urdf is None:
         return None
     written = profile_dir(hub) / f"{robot_type}.json"
+    urdf_text = urdf.resolve().as_posix()
     if not written.is_file():
         written = write_retarget_profile(hub, robot_type, urdf)
+    else:
+        payload = json.loads(written.read_text(encoding="utf-8"))
+        recorded = Path(str(payload.get("urdf_file") or ""))
+        if not recorded.is_file() and payload.get("urdf_file") != urdf_text:
+            payload["urdf_file"] = urdf_text
+            write_text_atomic(written, json.dumps(payload, ensure_ascii=False, indent=2))
     mjcf = compile_mjcf(urdf, python)
     dof = _actuated_dof(mjcf)
     if dof and written.is_file():
         payload = json.loads(written.read_text(encoding="utf-8"))
         if int(payload.get("robot_dof") or 0) != dof:
             payload["robot_dof"] = dof
-            tmp = written.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(written)
+            write_text_atomic(written, json.dumps(payload, ensure_ascii=False, indent=2))
     return written

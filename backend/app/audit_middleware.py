@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from urllib.parse import parse_qsl
 
+import anyio
 from jwt import PyJWTError
 
 from .core.security import decode_access_token
@@ -118,15 +119,26 @@ class AuditMiddleware:
             await self.app(scope, receive, send_wrapper)
         finally:
             try:
-                self._record(scope, status_code)
+                if self._wants_record(scope):
+                    # The insert is a blocking database call; run it off the
+                    # event loop so other requests keep moving. Shielded so a
+                    # client that hangs up does not cancel the audit row.
+                    with anyio.CancelScope(shield=True):
+                        await anyio.to_thread.run_sync(self._record, scope, status_code)
             except Exception:
                 logger.exception("操作记录写入失败")
             finally:
                 end_request_audit(token)
 
-    def _record(self, scope: dict, status_code: int) -> None:
+    @staticmethod
+    def _wants_record(scope: dict) -> bool:
         if request_audit_actions():
-            return
+            return False
+        method = str(scope.get("method") or "GET").upper()
+        path = str(scope.get("path") or "")
+        return _should_record(method, path, _headers(scope))
+
+    def _record(self, scope: dict, status_code: int) -> None:
         method = str(scope.get("method") or "GET").upper()
         path = str(scope.get("path") or "")
         headers = _headers(scope)

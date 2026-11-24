@@ -54,6 +54,7 @@ export function logicalFileKey(file: {
   sub_path?: string | null;
   robot_style?: string | null;
   robot_acquire_method?: string | null;
+  annotation?: { motion_kind?: string | null } | null;
 }) {
   return [
     file.ontology || "",
@@ -64,6 +65,7 @@ export function logicalFileKey(file: {
     file.sub_path || "",
     file.robot_style || "",
     file.robot_acquire_method || "",
+    file.annotation?.motion_kind || "",
   ].join("\0");
 }
 

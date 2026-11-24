@@ -2,8 +2,11 @@ import { useEffect, useState } from "react";
 import { api, getToken } from "../api";
 import type { StorageFile } from "../types";
 import { isSmplMotionFile } from "../types";
-import { AnimationFormatPreview, animationFormatOf } from "./AnimationFormatPreview";
+import { AnimationFormatPreview, animationFormatOf, isRobotMergedFbx } from "./AnimationFormatPreview";
+import { isRobotMergedNpz, RobotHoiNpzPreview } from "./RobotHoiNpzPreview";
+import { isRobotMergedZip, RobotMergedZipPreview } from "./RobotMergedZipPreview";
 import { isRobotMotionCsv, RobotCsvPreview } from "./RobotCsvPreview";
+import { ObjectScenePreview, robotObjectPaths } from "./SceneObjectLayer";
 import { SmplPreview } from "./SmplSkeleton";
 
 /** 人体 SMPL/SMPL-X/SMPL-H 动作文件（npz，format 标记为 smpl）。 */
@@ -24,7 +27,7 @@ export function FilePreview({ file }: { file: StorageFile | null }) {
     setUrl("");
     setText("");
     setError("");
-    if (!file || animationFormat || smplMotion || isRobotMotionCsv(file)) return;
+    if (!file || animationFormat || smplMotion || isRobotMotionCsv(file) || robotObjectPaths(file) || isRobotMergedFbx(file) || isRobotMergedNpz(file) || isRobotMergedZip(file)) return;
     const token = getToken();
     fetch(api.storageFileUrl(file.path), {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -51,6 +54,18 @@ export function FilePreview({ file }: { file: StorageFile | null }) {
   }, [file?.path, animationFormat, smplMotion]);
 
   if (!file) return <div className="storage-preview-empty">点击数据单元中的文件添加到此窗口</div>;
+  if (isRobotMergedZip(file)) return <RobotMergedZipPreview file={file} />;
+  if (isRobotMergedNpz(file)) return <RobotHoiNpzPreview file={file} />;
+  if (isRobotMergedFbx(file)) {
+    return (
+      <AnimationFormatPreview
+        url={api.storageFileUrl(file.path)}
+        format="fbx"
+        durationHint={file.duration_sec}
+        robotMerged
+      />
+    );
+  }
   if (animationFormat) {
     return (
       <AnimationFormatPreview
@@ -60,12 +75,10 @@ export function FilePreview({ file }: { file: StorageFile | null }) {
       />
     );
   }
-  if (smplMotion) {
-    return <SmplPreview file={file} />;
-  }
-  if (isRobotMotionCsv(file)) {
-    return <RobotCsvPreview file={file} />;
-  }
+  if (smplMotion) return <SmplPreview file={file} />;
+  const objectView = robotObjectPaths(file);
+  if (objectView) return <ObjectScenePreview xmlPath={objectView.xml} csvPath={objectView.csv} />;
+  if (isRobotMotionCsv(file)) return <RobotCsvPreview file={file} />;
   if (error) return <div className="storage-preview-empty">{error}</div>;
   if (text) return <pre className="storage-text-preview">{text}</pre>;
   if (!url) return <div className="storage-preview-empty">正在加载 {file.name}…</div>;

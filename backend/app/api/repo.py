@@ -1193,12 +1193,14 @@ def _with_retarget_control(data: dict) -> dict:
     ctrl = load_control(Path(settings.hub_repo_root))
     data["desired"] = ctrl["desired"]
     data["performance"] = ctrl["performance"]
+    data["method"] = ctrl["method"]
     return data
 
 
 class RetargetControlBody(BaseModel):
     desired: str = "running"
     performance: str = "heavy"
+    method: str | None = None
 
 
 @router.post("/retarget/control")
@@ -1206,12 +1208,17 @@ def post_retarget_control(
     body: RetargetControlBody,
     user: User = Depends(require_admin),
 ):
-    """启动、停止，或调整自动重定向的占用强度。正在跑的这一波会做完。"""
+    """启动、停止，调整占用强度，或切换重定向方法。正在跑的这一波会做完。"""
     from ..services.retarget_control import save_control
 
     hub = Path(settings.hub_repo_root)
     try:
-        save_control(hub, desired=body.desired, performance=body.performance)
+        save_control(
+            hub,
+            desired=body.desired,
+            performance=body.performance,
+            method=body.method,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     status = get_retarget_status(user)

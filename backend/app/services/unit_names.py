@@ -23,6 +23,9 @@ def normalize_unit_stem(name: str) -> str:
     if not stem:
         return ""
     cleaned = _UNIT_ROLE_SUFFIX.sub("", stem).strip(" ._")
+    # Capture exports use spaces (``Take 2026-...``) and retarget files use
+    # underscores (``Take_2026-...``). They are the same data unit.
+    cleaned = re.sub(r"[\s_]+", "_", cleaned).strip("_")
     return cleaned or stem
 
 

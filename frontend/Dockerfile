@@ -1,7 +1,8 @@
 FROM node:22-alpine AS build
 WORKDIR /app
-COPY package.json ./
-RUN npm install
+# 按 lock 文件安装，保证每次构建拿到同一套依赖版本
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
 RUN npm run build
 
