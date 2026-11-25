@@ -1,4 +1,5 @@
-import { zipSync, strToU8 } from "fflate";
+import { inflateSync, zipSync, strToU8 } from "fflate";
+import { pairFbxAndC3dPaths } from "./motionUnits";
 
 export type RelFile = { path: string; file: File };
 
@@ -105,11 +106,20 @@ export function descriptionCandidates(paths: string[]): string[] {
     .sort((a, b) => a.localeCompare(b, "zh"));
 }
 
-export async function listZipEntryNames(file: File): Promise<string[]> {
+type ZipCdEntry = {
+  name: string;
+  method: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  localHeaderOffset: number;
+};
+
+async function readZipCentralDirectory(file: File): Promise<ZipCdEntry[]> {
   const size = file.size;
   if (size < 22) throw new Error("不是有效的 zip");
   const tailLen = Math.min(size, 22 + 65535);
-  const tailBuf = await file.slice(size - tailLen).arrayBuffer();
+  const tailStart = size - tailLen;
+  const tailBuf = await file.slice(tailStart).arrayBuffer();
   const tail = new Uint8Array(tailBuf);
   let eocd = -1;
   for (let index = tail.length - 22; index >= 0; index -= 1) {
@@ -125,23 +135,68 @@ export async function listZipEntryNames(file: File): Promise<string[]> {
   }
   if (eocd < 0) throw new Error("不是有效的 zip");
   const view = new DataView(tailBuf);
-  const cdSize = view.getUint32(eocd + 12, true);
-  const cdOffset = view.getUint32(eocd + 16, true);
+  let cdSize = view.getUint32(eocd + 12, true);
+  let cdOffset = view.getUint32(eocd + 16, true);
   if (cdOffset === 0xffffffff || cdSize === 0xffffffff) {
-    throw new Error("这个 zip 过大，请改用文件夹上传");
+    // Check Zip64 EOCD locator right before EOCD (20 bytes)
+    if (eocd >= 20 && view.getUint32(eocd - 20, true) === 0x07064b50) {
+      const zip64EocdOffset = Number(view.getBigUint64(eocd - 12, true));
+      const z64Buf = await file.slice(zip64EocdOffset, zip64EocdOffset + 56).arrayBuffer();
+      const z64View = new DataView(z64Buf);
+      if (z64View.getUint32(0, true) === 0x06064b50) {
+        cdSize = Number(z64View.getBigUint64(40, true));
+        cdOffset = Number(z64View.getBigUint64(48, true));
+      }
+    }
+    if (cdOffset === 0xffffffff || cdSize === 0xffffffff) {
+      throw new Error("这个 zip 过大，请改用文件夹或服务器路径上传");
+    }
   }
   const cdBuf = await file.slice(cdOffset, cdOffset + cdSize).arrayBuffer();
   const bytes = new Uint8Array(cdBuf);
   const directory = new DataView(cdBuf);
-  const names: string[] = [];
+  const entries: ZipCdEntry[] = [];
   let cursor = 0;
   while (cursor + 46 <= bytes.length) {
     if (directory.getUint32(cursor, true) !== 0x02014b50) break;
     const flags = directory.getUint16(cursor + 8, true);
+    const method = directory.getUint16(cursor + 10, true);
+    let compressedSize = directory.getUint32(cursor + 20, true);
+    let uncompressedSize = directory.getUint32(cursor + 24, true);
     const nameLen = directory.getUint16(cursor + 28, true);
     const extraLen = directory.getUint16(cursor + 30, true);
     const commentLen = directory.getUint16(cursor + 32, true);
+    let localHeaderOffset = directory.getUint32(cursor + 42, true);
     const raw = bytes.subarray(cursor + 46, cursor + 46 + nameLen);
+    if (
+      compressedSize === 0xffffffff ||
+      uncompressedSize === 0xffffffff ||
+      localHeaderOffset === 0xffffffff
+    ) {
+      const extraStart = cursor + 46 + nameLen;
+      const extraEnd = extraStart + extraLen;
+      let ep = extraStart;
+      while (ep + 4 <= extraEnd && ep + 4 <= bytes.length) {
+        const headerId = directory.getUint16(ep, true);
+        const dataSize = directory.getUint16(ep + 2, true);
+        if (headerId === 0x0001) {
+          let zp = ep + 4;
+          if (uncompressedSize === 0xffffffff && zp + 8 <= ep + 4 + dataSize) {
+            uncompressedSize = Number(directory.getBigUint64(zp, true));
+            zp += 8;
+          }
+          if (compressedSize === 0xffffffff && zp + 8 <= ep + 4 + dataSize) {
+            compressedSize = Number(directory.getBigUint64(zp, true));
+            zp += 8;
+          }
+          if (localHeaderOffset === 0xffffffff && zp + 8 <= ep + 4 + dataSize) {
+            localHeaderOffset = Number(directory.getBigUint64(zp, true));
+          }
+          break;
+        }
+        ep += 4 + dataSize;
+      }
+    }
     let name = "";
     if (flags & 0x800) name = new TextDecoder("utf-8").decode(raw);
     else {
@@ -152,11 +207,131 @@ export async function listZipEntryNames(file: File): Promise<string[]> {
       }
     }
     name = name.replace(/\\/g, "/");
-    if (name && !name.endsWith("/") && !name.startsWith("__MACOSX/")) names.push(name);
+    if (name && !name.endsWith("/") && !name.startsWith("__MACOSX/")) {
+      entries.push({
+        name,
+        method,
+        compressedSize,
+        uncompressedSize,
+        localHeaderOffset,
+      });
+    }
     cursor += 46 + nameLen + extraLen + commentLen;
   }
-  if (!names.length) throw new Error("zip 里没有文件");
-  return names;
+  if (!entries.length) throw new Error("zip 里没有文件");
+  return entries;
+}
+
+export async function listZipEntryNames(file: File): Promise<string[]> {
+  const entries = await readZipCentralDirectory(file);
+  return entries.map((item) => item.name);
+}
+
+const TOKEN_C3D_COLON = strToU8("C3D:");
+const TOKEN_OPTICAL_MARKER = strToU8("OpticalMarker");
+const TOKEN_OPTICAL_ATTR = new Uint8Array([
+  ...strToU8("Optical"),
+  0x00,
+  0x01,
+  ...strToU8("NodeAttribute"),
+]);
+const TOKEN_ASCII_OPTICAL = strToU8('"Optical"');
+
+function containsSubarray(haystack: Uint8Array, needle: Uint8Array): boolean {
+  const nLen = needle.length;
+  if (!nLen || haystack.length < nLen) return false;
+  const first = needle[0];
+  const limit = haystack.length - nLen;
+  for (let i = 0; i <= limit; i += 1) {
+    if (haystack[i] !== first) continue;
+    let match = true;
+    for (let j = 1; j < nLen; j += 1) {
+      if (haystack[i + j] !== needle[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+/** Check whether an FBX file buffer already contains C3D optical marker nodes. */
+export function fbxBytesHaveC3d(bytes: Uint8Array): boolean {
+  if (!bytes.length) return false;
+  return (
+    containsSubarray(bytes, TOKEN_C3D_COLON) ||
+    containsSubarray(bytes, TOKEN_OPTICAL_MARKER) ||
+    containsSubarray(bytes, TOKEN_OPTICAL_ATTR) ||
+    containsSubarray(bytes, TOKEN_ASCII_OPTICAL)
+  );
+}
+
+export async function detectFolderMergeableC3dPairs(
+  files: Array<{ rel: string; file: File }>
+): Promise<Array<{ fbxRel: string; c3dRel: string }>> {
+  const candidates = pairFbxAndC3dPaths(files.map((item) => item.rel));
+  if (!candidates.length) return [];
+  const byRel = new Map(files.map((item) => [item.rel, item.file]));
+  const mergeable: Array<{ fbxRel: string; c3dRel: string }> = [];
+  for (const pair of candidates) {
+    const fbxFile = byRel.get(pair.fbxRel);
+    if (!fbxFile) continue;
+    try {
+      const buf = new Uint8Array(await fbxFile.arrayBuffer());
+      if (!fbxBytesHaveC3d(buf)) {
+        mergeable.push(pair);
+      }
+    } catch {
+      // ignore unreadable file
+    }
+  }
+  return mergeable;
+}
+
+async function readZipEntryBytes(file: File, entry: ZipCdEntry): Promise<Uint8Array | null> {
+  const headerSlice = await file
+    .slice(entry.localHeaderOffset, entry.localHeaderOffset + 30)
+    .arrayBuffer();
+  if (headerSlice.byteLength < 30) return null;
+  const headerView = new DataView(headerSlice);
+  if (headerView.getUint32(0, true) !== 0x04034b50) return null;
+  const fileNameLen = headerView.getUint16(26, true);
+  const extraFieldLen = headerView.getUint16(28, true);
+  const dataStart = entry.localHeaderOffset + 30 + fileNameLen + extraFieldLen;
+  const rawSlice = new Uint8Array(
+    await file.slice(dataStart, dataStart + entry.compressedSize).arrayBuffer()
+  );
+  if (entry.method === 0) return rawSlice;
+  if (entry.method === 8) return inflateSync(rawSlice);
+  return null;
+}
+
+export async function inspectZipForImport(file: File): Promise<{
+  names: string[];
+  mergeablePairs: Array<{ fbxRel: string; c3dRel: string }>;
+}> {
+  const entries = await readZipCentralDirectory(file);
+  const names = entries.map((item) => item.name);
+  const candidates = pairFbxAndC3dPaths(names);
+  if (!candidates.length) {
+    return { names, mergeablePairs: [] };
+  }
+  const byName = new Map(entries.map((item) => [item.name, item]));
+  const mergeablePairs: Array<{ fbxRel: string; c3dRel: string }> = [];
+  for (const pair of candidates) {
+    const fbxEntry = byName.get(pair.fbxRel);
+    if (!fbxEntry) continue;
+    try {
+      const bytes = await readZipEntryBytes(file, fbxEntry);
+      if (bytes && !fbxBytesHaveC3d(bytes)) {
+        mergeablePairs.push(pair);
+      }
+    } catch {
+      // ignore decompression errors during pre-check
+    }
+  }
+  return { names, mergeablePairs };
 }
 
 /** Zip relative files in-browser for upload to existing zip API. */

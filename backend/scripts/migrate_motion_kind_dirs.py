@@ -13,7 +13,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-ROOT = Path("/media/noetix/my_passport1/noetix_robot_data_hub")
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app.services.unit_names import normalize_unit_stem, split_file_version  # noqa: E402

@@ -15,8 +15,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
-sys.path.insert(0, "/media/noetix/my_passport1/noetix_robot_data_hub/backend")
+ROOT = Path(__file__).resolve().parents[2]
+HUB = ROOT / "data" / "hub_repo"
+sys.path.insert(0, str(ROOT / "backend"))
 
 from app.services.file_lock import locked, write_text_atomic  # noqa: E402
 HOLO_MODELS = Path(

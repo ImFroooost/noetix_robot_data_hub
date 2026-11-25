@@ -14,7 +14,7 @@ import json
 import zipfile
 from pathlib import Path
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+HUB = Path(__file__).resolve().parents[2] / "data" / "hub_repo"
 STYLES = ("noetix_e1", "noetix_e2", "noetix_e2v2_1015", "noetix_m5_0", "unitree_g1")
 
 

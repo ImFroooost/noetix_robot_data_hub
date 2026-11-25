@@ -30,12 +30,13 @@ from pathlib import Path
 
 import numpy as np
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+ROOT = Path(__file__).resolve().parents[2]
+HUB = ROOT / "data" / "hub_repo"
 PKG = Path(
     "/home/noetix/Desktop/new_home/learning_based/wbc/open_src/omni_retarget/"
     "holosoma/src/holosoma_retargeting"
 )
-BACKEND = Path("/media/noetix/my_passport1/noetix_robot_data_hub/backend")
+BACKEND = ROOT / "backend"
 FRAME_DIR = HUB / "index" / "retarget_frames"
 VERSION = 3
 

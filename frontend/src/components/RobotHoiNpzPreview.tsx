@@ -216,10 +216,12 @@ function HoiScene({
   onError: (message: string) => void;
 }) {
   const robotRef = useRef<URDFRobot | null>(null);
+  const robotSubjectRef = useRef<THREE.Group | null>(null);
   const figureRef = useRef<THREE.Group | null>(null);
   const [labelRoot, setLabelRoot] = useState<THREE.Group | null>(null);
   const clipRef = useRef<HoiClip | null>(null);
   const [robot, setRobot] = useState<URDFRobot | null>(null);
+  const [meshesReady, setMeshesReady] = useState(false);
   const [clip, setClip] = useState<HoiClip | null>(null);
   const [axisLength, setAxisLength] = useState(1.2);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -241,6 +243,7 @@ function HoiScene({
     let cancelled = false;
     setStatus("loading");
     setRobot(null);
+    setMeshesReady(false);
     setClip(null);
     robotRef.current = null;
     clipRef.current = null;
@@ -253,29 +256,61 @@ function HoiScene({
       .then(([buffer, urdfText]) => {
         if (cancelled) return;
         const parsed = readClip(parseNpz(buffer));
+        let pendingMeshes = 0;
+        let parseFinished = false;
+        let modelRefLocal: URDFRobot | null = null;
+        const finalizeMeshes = () => {
+          if (!parseFinished || pendingMeshes > 0 || cancelled || !modelRefLocal) return;
+          paintRobot(modelRefLocal);
+          modelRefLocal.updateMatrixWorld(true);
+          _robotBox.setFromObject(modelRefLocal);
+          if (!_robotBox.isEmpty()) {
+            _robotBox.getSize(_robotSize);
+            const span = Math.max(_robotSize.x, _robotSize.y, _robotSize.z);
+            setAxisLength(span > 0.05 ? span : 1.2);
+          }
+          setMeshesReady(true);
+        };
         const loader = new URDFLoader();
         loader.workingPath = root;
         loader.parseVisual = true;
         loader.parseCollision = false;
         loader.loadMeshCb = (path, manager, done) => {
+          pendingMeshes += 1;
           manager.itemStart(path);
           fetchRepoMesh(path, packageRoot, urdfPath)
             .then(({ path: repoPath, buffer: meshBuffer }) => {
               if (!/\.stl$/i.test(repoPath)) throw new Error(`不支持的网格格式：${repoPath}`);
-              done(new THREE.Mesh(new STLLoader().parse(meshBuffer), _robotMat));
+              const geom = new STLLoader().parse(meshBuffer);
+              geom.computeBoundingBox();
+              done(new THREE.Mesh(geom, _robotMat));
             })
             .catch((err) => done(null, err))
-            .finally(() => manager.itemEnd(path));
+            .finally(() => {
+              manager.itemEnd(path);
+              pendingMeshes -= 1;
+              finalizeMeshes();
+            });
         };
         const model = loader.parse(urdfText);
+        modelRefLocal = model;
+        // 预先应用第 0 帧位姿与关节角，保证初始视角对准真实的起始位置
+        const joints0 = parsed.jointPos.length / parsed.frames;
+        model.position.set(parsed.rootPos[0], parsed.rootPos[1], parsed.rootPos[2]);
+        model.quaternion
+          .set(parsed.rootQuat[0], parsed.rootQuat[1], parsed.rootQuat[2], parsed.rootQuat[3])
+          .normalize();
+        parsed.jointNames.forEach((name, index) => {
+          if (index >= joints0) return;
+          try {
+            model.setJointValue(name, parsed.jointPos[index]);
+          } catch {
+            /* ignore */
+          }
+        });
         paintRobot(model);
-        model.updateMatrixWorld(true);
-        _robotBox.setFromObject(model);
-        if (!_robotBox.isEmpty()) {
-          _robotBox.getSize(_robotSize);
-          const span = Math.max(_robotSize.x, _robotSize.y, _robotSize.z);
-          setAxisLength(span > 0.05 ? span : 1.2);
-        }
+        parseFinished = true;
+        finalizeMeshes();
         clipRef.current = parsed;
         robotRef.current = model;
         setClip(parsed);
@@ -359,14 +394,17 @@ function HoiScene({
     >
       <group rotation={[ROTATION_X, 0, 0]}>
         <DataOriginAxes length={axisLength} />
-        {robot && <primitive object={robot} />}
+        <group ref={robotSubjectRef}>
+          {robot && <primitive object={robot} />}
+        </group>
         {clip && <HoiBodies clip={clip} time={time} />}
         <SceneNameLabels root={labelRoot} names={names} />
       </group>
       <FrameFigure
-        objectRef={figureRef}
-        ready={status === "ready"}
-        resetKey={`${npzUrl}:${viewNonce}`}
+        objectRef={robotSubjectRef}
+        fallbackRef={figureRef}
+        ready={status === "ready" && meshesReady}
+        resetKey={npzUrl}
         nonce={viewNonce}
       />
       {status === "loading" && (

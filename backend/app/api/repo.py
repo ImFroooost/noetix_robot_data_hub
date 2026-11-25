@@ -1187,13 +1187,59 @@ def get_retarget_status(
     return _with_retarget_control(data)
 
 
+def _parse_iso_epoch(value: object) -> float | None:
+    from datetime import datetime
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _with_retarget_control(data: dict) -> dict:
     from ..services.retarget_control import load_control
+    from ..services.retarget_priority import load_redo
 
-    ctrl = load_control(Path(settings.hub_repo_root))
+    hub = Path(settings.hub_repo_root)
+    ctrl = load_control(hub)
     data["desired"] = ctrl["desired"]
     data["performance"] = ctrl["performance"]
     data["method"] = ctrl["method"]
+
+    redo = load_redo(hub)
+    queues = data.get("queues")
+    if redo and isinstance(queues, list) and queues:
+        round_ts = _parse_iso_epoch(data.get("round_started_at"))
+        pace = float(data.get("seconds_per_job") or 0)
+        patched = False
+        new_queues: list[dict] = []
+        for item in queues:
+            if not isinstance(item, dict):
+                continue
+            q = dict(item)
+            key = str(q.get("key") or q.get("rule_id") or "")
+            req_at = redo.get(key)
+            if req_at is not None and (round_ts is None or req_at > round_ts):
+                total = int(q.get("total") or 0)
+                q["done"] = 0
+                q["failed"] = 0
+                q["remaining"] = total
+                q["redo_waiting_rescan"] = True
+                patched = True
+            new_queues.append(q)
+        if patched:
+            ahead = 0
+            for q in new_queues:
+                rem = max(0, int(q.get("total") or 0) - int(q.get("done") or 0) - int(q.get("failed") or 0))
+                q["remaining"] = rem
+                if pace > 0:
+                    q["eta_seconds"] = int(rem * pace)
+                    q["eta_after_seconds"] = int((ahead + rem) * pace)
+                ahead += rem
+            data["queues"] = new_queues
     return data
 
 
@@ -1234,11 +1280,13 @@ def post_retarget_control(
 
 class RetargetPriorityBody(BaseModel):
     rules: list[dict[str, Any]] = Field(default_factory=list)
+    layout: dict[str, Any] | None = None
 
 
 class RetargetPresetBody(BaseModel):
     name: str = ""
     rules: list[dict[str, Any]] = Field(default_factory=list)
+    layout: dict[str, Any] | None = None
 
 
 @router.get("/retarget/priority")
@@ -1269,7 +1317,10 @@ def put_retarget_priority(
 
     hub = Path(settings.hub_repo_root)
     try:
-        save_config(hub, {"rules": body.rules})
+        payload: dict[str, Any] = {"rules": body.rules}
+        if body.layout is not None:
+            payload["layout"] = body.layout
+        save_config(hub, payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return public_config(hub)
@@ -1318,7 +1369,7 @@ def post_retarget_preset(
 
     hub = Path(settings.hub_repo_root)
     try:
-        save_preset(hub, body.name, body.rules)
+        save_preset(hub, body.name, body.rules, body.layout)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return public_config(hub)
@@ -1345,11 +1396,11 @@ def apply_retarget_preset(
     _: User = Depends(require_admin),
 ):
     """切换到一套已保存的规则，并让自动重定向在当前这一波结束后重新扫描。"""
-    from ..services.retarget_priority import preset_rules, public_config, save_config
+    from ..services.retarget_priority import preset_payload, public_config, save_config
 
     hub = Path(settings.hub_repo_root)
     try:
-        save_config(hub, {"rules": preset_rules(hub, preset_id)})
+        save_config(hub, preset_payload(hub, preset_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return public_config(hub)

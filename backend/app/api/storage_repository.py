@@ -66,6 +66,7 @@ from ..services.disk_repository import (
     start_catalog_rebuild,
     record_upload_session,
     register_file_version,
+    resolve_import_source,
     resolve_import_zip,
     rename_batch,
     rename_file,
@@ -88,9 +89,16 @@ from ..services.disk_repository import (
     update_units_taxonomy,
 )
 from ..models.enums import is_super_role
+from ..services.c3d_fbx_merge import (
+    fbx_bytes_have_c3d,
+    fbx_file_has_c3d,
+    merge_c3d_into_fbx,
+    pair_fbx_and_c3d_paths,
+)
 from ..services.human_zip import (
     folder_name_from_zip_filename,
     human_format_from_filename,
+    iter_dir_human_members,
     iter_zip_human_members,
     safe_extract_member,
 )
@@ -1995,11 +2003,12 @@ async def upload_data_folder(
         "yes",
         "on",
     }
-    clip_plan = (
-        plan_followed_paths(folder_rels, strip_common_root=True)
-        if follow_paths
-        else plan_clip_units(folder_rels)
-    )
+    merge_c3d = str(form.get("merge_c3d", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     ontology = ontology.strip().lower()
     modality = modality.strip().lower()
@@ -2008,6 +2017,44 @@ async def upload_data_folder(
     parsed_annotation = _parse_annotation_form(annotation)
     robot_style = str(parsed_annotation.get("robot_style") or "")
     robot_acquire_method = str(form.get("robot_acquire_method") or "")
+
+    c3d_by_index: dict[int, Any] = {}
+    paired_c3d_indices: set[int] = set()
+    if merge_c3d and modality == "motion":
+        raw_c3d_files = form.getlist("c3d_files")
+        raw_c3d_indices = form.getlist("c3d_target_indices")
+        if raw_c3d_files and len(raw_c3d_files) == len(raw_c3d_indices):
+            for c3d_obj, idx_str in zip(raw_c3d_files, raw_c3d_indices):
+                try:
+                    target_idx = int(str(idx_str).strip())
+                except ValueError:
+                    continue
+                if 0 <= target_idx < len(files):
+                    c3d_by_index[target_idx] = c3d_obj
+        else:
+            rel_to_idx = {rel: idx for idx, rel in enumerate(folder_rels)}
+            for fbx_rel, c3d_rel in pair_fbx_and_c3d_paths(folder_rels):
+                fbx_idx = rel_to_idx.get(fbx_rel)
+                c3d_idx = rel_to_idx.get(c3d_rel)
+                if fbx_idx is None or c3d_idx is None:
+                    continue
+                fbx_upload = files[fbx_idx]
+                fbx_upload.file.seek(0)
+                fbx_raw = fbx_upload.file.read()
+                fbx_upload.file.seek(0)
+                if not fbx_bytes_have_c3d(fbx_raw):
+                    c3d_by_index[fbx_idx] = files[c3d_idx]
+                    paired_c3d_indices.add(c3d_idx)
+
+    active_folder_rels = [
+        rel for idx, rel in enumerate(folder_rels) if idx not in paired_c3d_indices
+    ]
+    clip_plan = (
+        plan_followed_paths(active_folder_rels, strip_common_root=True)
+        if follow_paths
+        else plan_clip_units(active_folder_rels)
+    )
+
     snapshot = scan_data()
     raw_version = form.get("file_version", "")
     version = _resolve_upload_file_version(
@@ -2021,9 +2068,29 @@ async def upload_data_folder(
     results: list[dict[str, Any]] = []
     saved = 0
     saved_paths: list[str] = []
+    normal_saved_paths: list[str] = []
+    merged_saved_paths: list[str] = []
+    merged_c3d_count = 0
     formats: list[str] = []
 
-    for file, action, sub_path, rel in zip(files, raw_actions, raw_sub_paths, folder_rels):
+    _merge_tmp_root = Path("/hub_repo/index/tmp")
+    if not _merge_tmp_root.parent.exists():
+        _merge_tmp_root = Path(tempfile.gettempdir())
+    else:
+        _merge_tmp_root.mkdir(parents=True, exist_ok=True)
+
+    for idx, (file, action, sub_path, rel) in enumerate(
+        zip(files, raw_actions, raw_sub_paths, folder_rels)
+    ):
+        if idx in paired_c3d_indices:
+            continue
+        paired_c3d = c3d_by_index.get(idx)
+        is_merged_pair = paired_c3d is not None and modality == "motion"
+        effective_motion_kind = (
+            "merged"
+            if is_merged_pair
+            else str(parsed_annotation.get("motion_kind") or "")
+        )
         original_name = Path(file.filename or "").name
         planned = clip_plan.get(rel) or {}
         if planned.get("skip"):
@@ -2056,7 +2123,7 @@ async def upload_data_folder(
             results.append(row)
             continue
         try:
-            file_fmt = _format_from_upload(original_name, fallback_fmt)
+            file_fmt = "fbx" if is_merged_pair else _format_from_upload(original_name, fallback_fmt)
             row["format"] = file_fmt
             current = current_units.get((batch, raw_unit_name))
             if not current:
@@ -2076,7 +2143,7 @@ async def upload_data_folder(
                     db, user, Capability.upload, f"/{batch}/{raw_unit_name}/"
                 )
             if action == "replace" and current:
-                wanted_kind = clean_motion_kind(parsed_annotation.get("motion_kind"))
+                wanted_kind = clean_motion_kind(effective_motion_kind)
                 wanted_method = robot_acquire_method.strip().lower() or "omniretarget"
                 existing = next(
                     (
@@ -2112,33 +2179,73 @@ async def upload_data_folder(
                 )
                 if existing and not user_has_any_capability(db, user, Capability.manage_data):
                     _require_file_owner(user, existing)
-            result = save_data_file(
-                file.file,
-                ontology=ontology,
-                modality=modality,
-                channel=channel,
-                fmt=file_fmt,
-                batch=batch,
-                unit_name=raw_unit_name,
-                original_name=stored_name or f"{raw_unit_name}.{file_fmt}",
-                replace=action == "replace",
-                update_index=False,
-                robot_style=robot_style,
-                robot_acquire_method=robot_acquire_method,
-                sub_path=sub_path,
-                file_version=version,
-                motion_kind=str(parsed_annotation.get("motion_kind") or ""),
-                preserve_tree=True,
-            )
+            if is_merged_pair:
+                with tempfile.TemporaryDirectory(
+                    prefix="c3d_merge_", dir=_merge_tmp_root
+                ) as td:
+                    td_path = Path(td)
+                    fbx_in = td_path / "in.fbx"
+                    c3d_in = td_path / "in.c3d"
+                    fbx_out = td_path / (stored_name or f"{raw_unit_name}.fbx")
+                    file.file.seek(0)
+                    with fbx_in.open("wb") as out_fh:
+                        shutil.copyfileobj(file.file, out_fh, 1024 * 1024)
+                    paired_c3d.file.seek(0)
+                    with c3d_in.open("wb") as out_fh:
+                        shutil.copyfileobj(paired_c3d.file, out_fh, 1024 * 1024)
+                    merge_c3d_into_fbx(fbx_in, c3d_in, fbx_out)
+                    result = save_data_file(
+                        source_path=fbx_out,
+                        ontology=ontology,
+                        modality=modality,
+                        channel=channel,
+                        fmt="fbx",
+                        batch=batch,
+                        unit_name=raw_unit_name,
+                        original_name=stored_name or f"{raw_unit_name}.fbx",
+                        replace=action == "replace",
+                        update_index=False,
+                        robot_style=robot_style,
+                        robot_acquire_method=robot_acquire_method,
+                        sub_path=sub_path,
+                        file_version=version,
+                        motion_kind="merged",
+                        preserve_tree=True,
+                    )
+            else:
+                result = save_data_file(
+                    file.file,
+                    ontology=ontology,
+                    modality=modality,
+                    channel=channel,
+                    fmt=file_fmt,
+                    batch=batch,
+                    unit_name=raw_unit_name,
+                    original_name=stored_name or f"{raw_unit_name}.{file_fmt}",
+                    replace=action == "replace",
+                    update_index=False,
+                    robot_style=robot_style,
+                    robot_acquire_method=robot_acquire_method,
+                    sub_path=sub_path,
+                    file_version=version,
+                    motion_kind=effective_motion_kind,
+                    preserve_tree=True,
+                )
             result["uploader"] = {
                 "id": user.id,
                 "username": user.username,
             }
             row.update({"status": "replaced" if action == "replace" else "uploaded", "file": result})
+            if is_merged_pair:
+                row["merged_c3d"] = True
+                merged_saved_paths.append(result["path"])
+                merged_c3d_count += 1
+            else:
+                normal_saved_paths.append(result["path"])
             saved += 1
             saved_paths.append(result["path"])
             formats.append(file_fmt)
-        except (ValueError, HTTPException) as exc:
+        except (ValueError, RuntimeError, HTTPException) as exc:
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
             row.update({"status": "failed", "detail": detail})
         except OSError as exc:
@@ -2151,7 +2258,13 @@ async def upload_data_folder(
             saved_paths, user_id=user.id, username=user.username
         )
         parsed_annotation = _parse_annotation_form(annotation)
-        update_files_annotation(saved_paths, parsed_annotation)
+        if normal_saved_paths and parsed_annotation:
+            update_files_annotation(normal_saved_paths, parsed_annotation)
+        if merged_saved_paths:
+            update_files_annotation(
+                merged_saved_paths,
+                {**parsed_annotation, "motion_kind": "merged"},
+            )
         create_batch(batch)
         unit_names = [
             str(item.get("unit_name") or "")
@@ -2162,6 +2275,11 @@ async def upload_data_folder(
         if parsed_tags:
             _validate_taxonomy_ids(db, parsed_tags)
         apply_upload_taxonomy(batch, unit_names, parsed_tags, file_paths=saved_paths)
+        session_annotation = (
+            {**parsed_annotation, "motion_kind": "merged"}
+            if merged_saved_paths and not normal_saved_paths
+            else parsed_annotation
+        )
         session = record_upload_session(
             user_id=user.id,
             username=user.username,
@@ -2171,7 +2289,7 @@ async def upload_data_folder(
             modality=modality,
             channel=channel,
             fmt=",".join(dict.fromkeys(formats)),
-            annotation=parsed_annotation,
+            annotation=session_annotation,
             taxonomy_tag_ids=parsed_tags,
             paths=saved_paths,
             unit_names=unit_names,
@@ -2182,11 +2300,12 @@ async def upload_data_folder(
     summary = {
         "batch": batch,
         "file_version": version,
-        "total": len(files),
+        "total": len(results),
         "uploaded": sum(item["status"] == "uploaded" for item in results),
         "replaced": sum(item["status"] == "replaced" for item in results),
         "skipped": sum(item["status"] == "skip" for item in results),
         "failed": sum(item["status"] == "failed" for item in results),
+        "merged_c3d": merged_c3d_count,
         "items": results,
         "upload_session_id": session["id"] if session else None,
     }
@@ -2313,8 +2432,10 @@ def _run_zip_import(
     taxonomy_tag_ids: str,
     robot_acquire_method: str,
     version: str,
+    merge_c3d: bool = False,
 ) -> None:
-    """Extract and store a zip after the HTTP response has already been sent."""
+    """Extract and store a zip (or server directory) after the HTTP response has already been sent."""
+    from contextlib import ExitStack
     from ..database import SessionLocal
 
     db = None
@@ -2328,7 +2449,7 @@ def _run_zip_import(
                 src.seek(0)
                 shutil.copyfileobj(src, out, 1024 * 1024)
         if archive is None:
-            raise RuntimeError("缺少 zip 文件")
+            raise RuntimeError("缺少导入源")
 
         db = SessionLocal()
         user = db.get(User, user_id)
@@ -2337,18 +2458,48 @@ def _run_zip_import(
         parsed_annotation = _parse_annotation_form(annotation)
         work_dir = staging / "extracted"
         warnings: list[str] = []
-        _touch_zip_job(job_id, detail="正在读取压缩包")
-        try:
-            archive_handle = zipfile.ZipFile(archive)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"无法解压 ZIP：{exc}") from exc
-        with archive_handle:
-            members = iter_zip_human_members(archive_handle)
-            if not members:
+        is_dir_source = archive.is_dir()
+        _touch_zip_job(job_id, detail="正在读取文件夹" if is_dir_source else "正在读取压缩包")
+        with ExitStack() as stack:
+            archive_handle: zipfile.ZipFile | None = None
+            if is_dir_source:
+                raw_members: list[tuple[Any, str]] = list(iter_dir_human_members(archive))
+            else:
+                try:
+                    archive_handle = stack.enter_context(zipfile.ZipFile(archive))
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=f"无法解压 ZIP：{exc}") from exc
+                raw_members = list(iter_zip_human_members(archive_handle))
+            if not raw_members:
                 raise HTTPException(
                     status_code=400,
-                    detail="ZIP 中未找到可导入文件（按后缀识别格式，未知后缀会作为新格式入库）",
+                    detail="未找到可导入文件（按后缀识别格式，未知后缀会作为新格式入库）",
                 )
+
+            merge_c3d_by_fbx: dict[str, tuple[Any, str]] = {}
+            paired_c3d_rels: set[str] = set()
+            if merge_c3d and modality == "motion":
+                _touch_zip_job(job_id, detail="正在检查可合并的 C3D 与 FBX")
+                entry_by_rel = {rel: entry for entry, rel in raw_members}
+                for fbx_rel, c3d_rel in pair_fbx_and_c3d_paths(entry_by_rel.keys()):
+                    fbx_entry = entry_by_rel.get(fbx_rel)
+                    c3d_entry = entry_by_rel.get(c3d_rel)
+                    if fbx_entry is None or c3d_entry is None:
+                        continue
+                    has_c3d = (
+                        fbx_file_has_c3d(fbx_entry)
+                        if is_dir_source
+                        else fbx_bytes_have_c3d(archive_handle.read(fbx_entry))  # type: ignore[union-attr]
+                    )
+                    if not has_c3d:
+                        merge_c3d_by_fbx[fbx_rel] = (c3d_entry, c3d_rel)
+                        paired_c3d_rels.add(c3d_rel)
+
+            members = [
+                (entry, rel)
+                for entry, rel in raw_members
+                if rel not in paired_c3d_rels
+            ]
             zip_rels = [name for _info, name in members]
             clip_plan = (
                 plan_followed_paths(zip_rels, strip_common_root=False)
@@ -2362,13 +2513,22 @@ def _run_zip_import(
             }
             results: list[dict[str, Any]] = []
             saved_paths: list[str] = []
+            normal_saved_paths: list[str] = []
+            merged_saved_paths: list[str] = []
+            merged_c3d_count = 0
             formats: list[str] = []
             new_robot_style = str(parsed_annotation.get("robot_style") or "").strip()
 
-            def publish() -> None:
-                _touch_zip_job(job_id, detail="", **_zip_job_counts(results))
+            def publish(detail: str = "") -> None:
+                _touch_zip_job(job_id, detail=detail, **_zip_job_counts(results))
 
             for info, rel in members:
+                is_merged_pair = rel in merge_c3d_by_fbx
+                effective_motion_kind = (
+                    "merged"
+                    if is_merged_pair
+                    else str(parsed_annotation.get("motion_kind") or "")
+                )
                 original_name = Path(rel).name
                 planned = clip_plan.get(rel) or {}
                 if planned.get("skip"):
@@ -2387,7 +2547,7 @@ def _run_zip_import(
                     normalize_unit_stem(Path(original_name).stem) or Path(original_name).stem
                 )
                 stored_name = planned.get("stored_name") or original_name
-                fmt = human_format_from_filename(original_name).lstrip(".")
+                fmt = "fbx" if is_merged_pair else human_format_from_filename(original_name).lstrip(".")
                 row: dict[str, Any] = {
                     "name": original_name,
                     "unit_name": effective_unit,
@@ -2408,6 +2568,7 @@ def _run_zip_import(
                     _require_unit(db, user, Capability.upload, current)
                 else:
                     ensure_capability(db, user, Capability.upload, f"/{batch}/{effective_unit}/")
+                wanted_kind = clean_motion_kind(effective_motion_kind)
                 existing = None
                 if current:
                     existing = next(
@@ -2426,6 +2587,14 @@ def _run_zip_import(
                                 or not new_robot_style
                                 or str(item.get("robot_style") or "").strip() == new_robot_style
                             )
+                            and (
+                                modality != "motion"
+                                or clean_motion_kind(
+                                    (item.get("annotation") or {}).get("motion_kind")
+                                    or item.get("motion_kind")
+                                )
+                                == wanted_kind
+                            )
                         ),
                         None,
                     )
@@ -2441,7 +2610,7 @@ def _run_zip_import(
                         robot_acquire_method=robot_acquire_method,
                         sub_path=file_sub_path,
                         file_version=version,
-                        motion_kind=str(parsed_annotation.get("motion_kind") or ""),
+                        motion_kind=effective_motion_kind,
                     )
                 except ValueError as exc:
                     row.update({"status": "failed", "detail": str(exc)})
@@ -2464,27 +2633,88 @@ def _run_zip_import(
                         publish()
                         continue
                 try:
-                    extracted = safe_extract_member(
-                        archive_handle, info, work_dir, filename=rel
-                    )
-                    result = save_data_file(
-                        source_path=extracted,
-                        ontology=ontology,
-                        modality=modality,
-                        channel=channel,
-                        fmt=fmt,
-                        batch=batch,
-                        unit_name=row["unit_name"],
-                        original_name=stored_name,
-                        replace=bool(replace and (existing or on_disk)),
-                        update_index=False,
-                        robot_style=str(parsed_annotation.get("robot_style") or ""),
-                        robot_acquire_method=robot_acquire_method,
-                        sub_path=file_sub_path,
-                        file_version=version,
-                        motion_kind=str(parsed_annotation.get("motion_kind") or ""),
-                        preserve_tree=True,
-                    )
+                    if is_merged_pair:
+                        c3d_entry, c3d_rel = merge_c3d_by_fbx[rel]
+                        publish(f"正在合并 C3D → {original_name}")
+                        merge_stage = work_dir / f"_merge_{len(results)}"
+                        merge_stage.mkdir(parents=True, exist_ok=True)
+                        try:
+                            if is_dir_source:
+                                fbx_in = Path(info)
+                                c3d_in = Path(c3d_entry)
+                            else:
+                                assert archive_handle is not None
+                                fbx_in = safe_extract_member(
+                                    archive_handle, info, merge_stage / "src", filename=rel
+                                )
+                                c3d_in = safe_extract_member(
+                                    archive_handle, c3d_entry, merge_stage / "src", filename=c3d_rel
+                                )
+                            merged_out = merge_stage / "out" / stored_name
+                            merge_c3d_into_fbx(fbx_in, c3d_in, merged_out)
+                            result = save_data_file(
+                                source_path=merged_out,
+                                ontology=ontology,
+                                modality=modality,
+                                channel=channel,
+                                fmt="fbx",
+                                batch=batch,
+                                unit_name=row["unit_name"],
+                                original_name=stored_name,
+                                replace=bool(replace and (existing or on_disk)),
+                                update_index=False,
+                                robot_style=str(parsed_annotation.get("robot_style") or ""),
+                                robot_acquire_method=robot_acquire_method,
+                                sub_path=file_sub_path,
+                                file_version=version,
+                                motion_kind="merged",
+                                preserve_tree=True,
+                            )
+                        finally:
+                            shutil.rmtree(merge_stage, ignore_errors=True)
+                    elif is_dir_source:
+                        with Path(info).open("rb") as src_fh:
+                            result = save_data_file(
+                                src_fh,
+                                ontology=ontology,
+                                modality=modality,
+                                channel=channel,
+                                fmt=fmt,
+                                batch=batch,
+                                unit_name=row["unit_name"],
+                                original_name=stored_name,
+                                replace=bool(replace and (existing or on_disk)),
+                                update_index=False,
+                                robot_style=str(parsed_annotation.get("robot_style") or ""),
+                                robot_acquire_method=robot_acquire_method,
+                                sub_path=file_sub_path,
+                                file_version=version,
+                                motion_kind=effective_motion_kind,
+                                preserve_tree=True,
+                            )
+                    else:
+                        assert archive_handle is not None
+                        extracted = safe_extract_member(
+                            archive_handle, info, work_dir, filename=rel
+                        )
+                        result = save_data_file(
+                            source_path=extracted,
+                            ontology=ontology,
+                            modality=modality,
+                            channel=channel,
+                            fmt=fmt,
+                            batch=batch,
+                            unit_name=row["unit_name"],
+                            original_name=stored_name,
+                            replace=bool(replace and (existing or on_disk)),
+                            update_index=False,
+                            robot_style=str(parsed_annotation.get("robot_style") or ""),
+                            robot_acquire_method=robot_acquire_method,
+                            sub_path=file_sub_path,
+                            file_version=version,
+                            motion_kind=effective_motion_kind,
+                            preserve_tree=True,
+                        )
                     result["uploader"] = {"id": user.id, "username": user.username}
                     row.update(
                         {
@@ -2492,9 +2722,15 @@ def _run_zip_import(
                             "file": result,
                         }
                     )
+                    if is_merged_pair:
+                        row["merged_c3d"] = True
+                        merged_saved_paths.append(result["path"])
+                        merged_c3d_count += 1
+                    else:
+                        normal_saved_paths.append(result["path"])
                     saved_paths.append(result["path"])
                     formats.append(str(fmt).lstrip("."))
-                except (ValueError, OSError) as exc:
+                except (ValueError, RuntimeError, OSError) as exc:
                     row.update({"status": "failed", "detail": str(exc)})
                     warnings.append(f"导入失败 {original_name}: {exc}")
                 results.append(row)
@@ -2504,11 +2740,16 @@ def _run_zip_import(
         _touch_zip_job(job_id, detail="正在写入索引")
         if saved_paths:
             set_file_uploaders(saved_paths, user_id=user.id, username=user.username)
-            csv_paths = [path for path in saved_paths if path.lower().endswith(".csv")]
-            if parsed_annotation:
+            if normal_saved_paths and parsed_annotation:
+                csv_paths = [path for path in normal_saved_paths if path.lower().endswith(".csv")]
                 update_files_annotation(
-                    csv_paths if "fps" in parsed_annotation and csv_paths else saved_paths,
+                    csv_paths if "fps" in parsed_annotation and csv_paths else normal_saved_paths,
                     parsed_annotation,
+                )
+            if merged_saved_paths:
+                update_files_annotation(
+                    merged_saved_paths,
+                    {**parsed_annotation, "motion_kind": "merged"},
                 )
             create_batch(batch)
             unit_names = [
@@ -2523,16 +2764,21 @@ def _run_zip_import(
                 batch, unit_names, parsed_tags, file_paths=saved_paths
             )
             unique_formats = list(dict.fromkeys(formats))
+            session_annotation = (
+                {**parsed_annotation, "motion_kind": "merged"}
+                if merged_saved_paths and not normal_saved_paths
+                else parsed_annotation
+            )
             session = record_upload_session(
                 user_id=user.id,
                 username=user.username,
-                source="zip",
+                source="folder" if is_dir_source else "zip",
                 batch=batch,
                 ontology=ontology,
                 modality=modality,
                 channel=channel,
                 fmt=",".join(unique_formats),
-                annotation=parsed_annotation,
+                annotation=session_annotation,
                 taxonomy_tag_ids=parsed_tags,
                 paths=saved_paths,
                 unit_names=unit_names,
@@ -2549,6 +2795,7 @@ def _run_zip_import(
             "replaced": sum(item["status"] == "replaced" for item in results),
             "skipped": sum(item["status"] == "skip" for item in results),
             "failed": sum(item["status"] == "failed" for item in results),
+            "merged_c3d": merged_c3d_count,
             "items": results,
             "warnings": warnings,
             "upload_session_id": session["id"] if session else None,
@@ -2576,13 +2823,67 @@ def _run_zip_import(
     except Exception as exc:
         if db is not None:
             db.rollback()
-        _touch_zip_job(job_id, status="failed", detail=str(exc) or "Zip 导入失败")
+        _touch_zip_job(job_id, status="failed", detail=str(exc) or "导入失败")
     finally:
         if source_fd is not None:
             os.close(source_fd)
         if db is not None:
             db.close()
         shutil.rmtree(staging, ignore_errors=True)
+
+
+@router.get("/data/inspect-import-path")
+def inspect_import_path(
+    local_path: str = Query(...),
+    user: User = Depends(get_current_user),
+):
+    """Inspect a server-side zip or directory for file counts and mergeable C3D+FBX pairs."""
+    del user
+    try:
+        source = resolve_import_source(local_path.strip())
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    is_dir = source.is_dir()
+    mergeable_pairs: list[tuple[str, str]] = []
+    formats: list[str] = []
+    if is_dir:
+        members = iter_dir_human_members(source)
+        entry_by_rel = {rel: path for path, rel in members}
+        for _p, rel in members:
+            fmt = human_format_from_filename(Path(rel).name).lstrip(".")
+            if fmt:
+                formats.append(fmt)
+        for fbx_rel, c3d_rel in pair_fbx_and_c3d_paths(entry_by_rel.keys()):
+            fbx_p = entry_by_rel.get(fbx_rel)
+            if fbx_p is not None and not fbx_file_has_c3d(fbx_p):
+                mergeable_pairs.append((fbx_rel, c3d_rel))
+    else:
+        try:
+            with zipfile.ZipFile(source) as zf:
+                members_zip = iter_zip_human_members(zf)
+                entry_by_rel_zip = {rel: info for info, rel in members_zip}
+                for _info, rel in members_zip:
+                    fmt = human_format_from_filename(Path(rel).name).lstrip(".")
+                    if fmt:
+                        formats.append(fmt)
+                for fbx_rel, c3d_rel in pair_fbx_and_c3d_paths(entry_by_rel_zip.keys()):
+                    info = entry_by_rel_zip.get(fbx_rel)
+                    if info is not None and not fbx_bytes_have_c3d(zf.read(info)):
+                        mergeable_pairs.append((fbx_rel, c3d_rel))
+                members = members_zip  # type: ignore[assignment]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"无法读取 ZIP：{exc}") from exc
+
+    return {
+        "kind": "dir" if is_dir else "zip",
+        "name": source.name,
+        "suggested_batch": folder_name_from_zip_filename(source.name),
+        "file_count": len(members),
+        "formats": sorted(set(formats)),
+        "mergeable_c3d_fbx_count": len(mergeable_pairs),
+        "sample_pairs": [Path(f).stem for f, _ in mergeable_pairs[:5]],
+    }
 
 
 @router.get("/data/upload-zip/active")
@@ -2627,6 +2928,7 @@ async def upload_data_zip(
     replace: bool = Form(False),
     follow_paths: bool = Form(False),
     manage_override: bool = Form(False),
+    merge_c3d: bool = Form(False),
     annotation: str = Form(""),
     taxonomy_tag_ids: str = Form(""),
     robot_acquire_method: str = Form(""),
@@ -2636,12 +2938,17 @@ async def upload_data_zip(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Accept a motion zip and import it after the response, so a slow disk cannot time out the page."""
+    """Accept a motion zip (or server directory) and import it after the response."""
     if manage_override and not user_has_any_capability(db, user, Capability.manage_data):
         raise HTTPException(status_code=403, detail="只有具备管理数据权限的用户可以覆盖其他用户的数据")
-    filename = file.filename if file and file.filename else Path(local_path).name
-    if not str(filename).lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="请上传 .zip 文件")
+    if file is not None and file.filename:
+        if not str(file.filename).lower().endswith(".zip"):
+            raise HTTPException(status_code=400, detail="请上传 .zip 文件")
+        filename = file.filename
+    elif local_path.strip():
+        filename = Path(local_path.strip().rstrip("/")).name
+    else:
+        raise HTTPException(status_code=400, detail="请选择 zip 或填写服务器路径")
     batch = (batch or "").strip() or folder_name_from_zip_filename(filename)
     ontology = ontology.strip().lower()
     modality = modality.strip().lower()
@@ -2654,15 +2961,18 @@ async def upload_data_zip(
     version = _resolve_upload_file_version({"batches": []}, batch, file_version)
 
     _tmp_root = Path("/hub_repo/index/tmp")
-    _tmp_root.mkdir(parents=True, exist_ok=True)
+    if not _tmp_root.parent.exists():
+        _tmp_root = Path(tempfile.gettempdir())
+    else:
+        _tmp_root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix="storage_zip_", dir=_tmp_root))
     source_fd: int | None = None
     archive: Path | None = None
     try:
         if local_path.strip():
             try:
-                archive = resolve_import_zip(local_path.strip())
-            except FileNotFoundError as exc:
+                archive = resolve_import_source(local_path.strip())
+            except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         elif file is not None:
             file.file.seek(0)
@@ -2697,6 +3007,7 @@ async def upload_data_zip(
                 "taxonomy_tag_ids": taxonomy_tag_ids,
                 "robot_acquire_method": robot_acquire_method,
                 "version": version,
+                "merge_c3d": merge_c3d,
             },
             daemon=True,
             name=f"zip-import-{job_id[:8]}",

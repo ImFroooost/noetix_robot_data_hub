@@ -27,11 +27,13 @@ import {
   type MotionKind,
 } from "../types";
 import {
+  detectFolderMergeableC3dPairs,
   filesFromDataTransfer,
   filesFromFileList,
   folderNameFromZip,
   formatFromFileName,
   guessFolderName,
+  inspectZipForImport,
   type RelFile,
 } from "../utils/folderUpload";
 import { planClipUnits, planFollowedPaths } from "../utils/motionUnits";
@@ -111,6 +113,13 @@ function validateFileVersion(
   return "";
 }
 
+type C3dMergePromptState = {
+  sourceLabel: string;
+  pairCount: number;
+  sampleNames: string[];
+  resolve: (choice: boolean | null) => void;
+};
+
 type ZipImportDraft = {
   file: File | null;
   localPath: string;
@@ -133,6 +142,9 @@ type ZipImportDraft = {
   followPaths: boolean;
   repairBatch: string;
   fileVersion: string;
+  mergeC3d: boolean;
+  mergeablePairCount: number;
+  samplePairs: string[];
 };
 
 type FolderImportDraft = {
@@ -158,6 +170,8 @@ type FolderImportDraft = {
   followPaths: boolean;
   repairBatch: string;
   fileVersion: string;
+  mergeC3d: boolean;
+  mergeablePairs: Array<{ fbxRel: string; c3dRel: string }>;
 };
 
 const IGNORED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
@@ -332,9 +346,27 @@ export function FolderBatchImport({
   const [draggingFolder, setDraggingFolder] = useState(false);
   const [robotInstances, setRobotInstances] = useState<ModelInstance[]>([]);
   const [humanInstances, setHumanInstances] = useState<ModelInstance[]>([]);
+  const [c3dMergePrompt, setC3dMergePrompt] = useState<C3dMergePromptState | null>(null);
+  const [inspectingText, setInspectingText] = useState("");
   const folderInputRef = useRef<HTMLInputElement>(null);
   const zipInputRef = useRef<HTMLInputElement>(null);
   const taxonomyPayload = compactTaxonomyTagIds(taxonomyTagIds);
+
+  const askMergeC3dChoice = (params: {
+    sourceLabel: string;
+    pairCount: number;
+    sampleNames: string[];
+  }): Promise<boolean | null> =>
+    new Promise((resolve) => {
+      setC3dMergePrompt({ ...params, resolve });
+    });
+
+  const answerMergeC3dChoice = (choice: boolean | null) => {
+    setC3dMergePrompt((current) => {
+      if (current) current.resolve(choice);
+      return null;
+    });
+  };
 
   const needRobotStyles =
     (!!folderDraft && folderDraft.ontology === "robot") ||
@@ -385,19 +417,57 @@ export function FolderBatchImport({
   };
 
   const openZipImport = async (file: File | null, localPath = "") => {
-    const folderName = folderNameFromZip(file?.name || localPath);
+    const cleanLocal = localPath.trim();
+    const folderName = folderNameFromZip(file?.name || cleanLocal);
     if (!folderName) {
       onError("请选择 zip 或填写服务器路径");
       return;
     }
+    setInspectingText("正在检查文件中的 FBX 与 C3D 数据…");
+    let mergeablePairCount = 0;
+    let samplePairs: string[] = [];
+    try {
+      if (file) {
+        try {
+          const inspected = await inspectZipForImport(file);
+          mergeablePairCount = inspected.mergeablePairs.length;
+          samplePairs = inspected.mergeablePairs
+            .slice(0, 5)
+            .map((p) => (p.fbxRel.split("/").pop() || p.fbxRel).replace(/\.fbx$/i, ""));
+        } catch {
+          // If browser zip inspection cannot read central dir, proceed without blocking
+        }
+      } else if (cleanLocal) {
+        const inspected = await api.storageInspectImportPath(cleanLocal);
+        mergeablePairCount = inspected.mergeable_c3d_fbx_count || 0;
+        samplePairs = inspected.sample_pairs || [];
+      }
+    } catch (e) {
+      setInspectingText("");
+      onError(e instanceof Error ? e.message : "无法读取指定路径");
+      return;
+    }
     const storage = await fetchStorageOverview({}, true);
+    setInspectingText("");
     setOverview(storage);
+
+    let mergeC3d = false;
+    if (mergeablePairCount > 0) {
+      const choice = await askMergeC3dChoice({
+        sourceLabel: file?.name || cleanLocal,
+        pairCount: mergeablePairCount,
+        sampleNames: samplePairs,
+      });
+      if (choice === null) return;
+      mergeC3d = choice;
+    }
+
     const batchExists = storage.batches.some((item) => item.name === folderName);
     setFolderResult(null);
     setFolderError("");
     setZipDraft({
       file,
-      localPath,
+      localPath: cleanLocal,
       folderName,
       batchChoice: batchExists ? "existing" : "new",
       batchName: batchExists ? nextAvailableBatchName(folderName, storage.batches) : folderName,
@@ -417,6 +487,9 @@ export function FolderBatchImport({
       followPaths: false,
       repairBatch: "",
       fileVersion: "",
+      mergeC3d,
+      mergeablePairCount,
+      samplePairs,
     });
   };
 
@@ -435,13 +508,39 @@ export function FolderBatchImport({
       onError("文件夹为空，或仅包含隐藏文件和空文件");
       return;
     }
-    const storage = await fetchStorageOverview({}, true);
-    setOverview(storage);
     const folderName = guessFolderName(rawFiles);
+    setInspectingText("正在检查文件夹中的 FBX 与 C3D 数据…");
+    let mergeablePairs: Array<{ fbxRel: string; c3dRel: string }> = [];
+    let storage: StorageOverview;
+    try {
+      const [detectedPairs, fetchedStorage] = await Promise.all([
+        detectFolderMergeableC3dPairs(
+          files.map((item) => ({ rel: item.path, file: item.file }))
+        ),
+        fetchStorageOverview({}, true),
+      ]);
+      mergeablePairs = detectedPairs;
+      storage = fetchedStorage;
+    } finally {
+      setInspectingText("");
+    }
+    setOverview(storage);
+
+    let mergeC3d = false;
+    if (mergeablePairs.length > 0) {
+      const sampleNames = mergeablePairs
+        .slice(0, 5)
+        .map((p) => (p.fbxRel.split("/").pop() || p.fbxRel).replace(/\.fbx$/i, ""));
+      const choice = await askMergeC3dChoice({
+        sourceLabel: folderName,
+        pairCount: mergeablePairs.length,
+        sampleNames,
+      });
+      if (choice === null) return;
+      mergeC3d = choice;
+    }
+
     const batchExists = storage.batches.some((item) => item.name === folderName);
-    const extensions = Array.from(
-      new Set(files.map(fileExtension).filter(Boolean))
-    );
     setFolderResult(null);
     setFolderError("");
     setFolderDraft({
@@ -467,6 +566,8 @@ export function FolderBatchImport({
       followPaths: false,
       repairBatch: "",
       fileVersion: "",
+      mergeC3d,
+      mergeablePairs,
     });
   };
 
@@ -555,6 +656,10 @@ export function FolderBatchImport({
       form.set("replace", String(zipDraft.replace));
       form.set("follow_paths", zipDraft.followPaths ? "1" : "0");
       form.set(
+        "merge_c3d",
+        zipDraft.mergeC3d && isMotionModality(zipDraft.modality) ? "true" : "false"
+      );
+      form.set(
         "annotation",
         JSON.stringify({
           ...(zipDraft.ontology === "robot"
@@ -603,8 +708,11 @@ export function FolderBatchImport({
         invalidateStorageOverview();
         onImported(targetBatch, sessionId);
         if (!result.failed) {
+          const mergedNote = result.merged_c3d
+            ? `（含 ${result.merged_c3d} 组 C3D→FBX 合并数据）`
+            : "";
           onMessage(
-            `Zip 导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
+            `导入完成：上传 ${result.uploaded}${mergedNote}，替换 ${result.replaced}，跳过 ${result.skipped}`
           );
         }
       };
@@ -655,21 +763,49 @@ export function FolderBatchImport({
       : "原版";
     const existingUnits =
       overview?.batches.find((item) => item.name === targetBatch)?.units || [];
+
+    const effectiveMergeC3d =
+      folderDraft.mergeC3d &&
+      isMotionModality(folderDraft.modality) &&
+      folderDraft.mergeablePairs.length > 0;
+    const byPath = new Map(folderDraft.files.map((item) => [item.path, item]));
+    const c3dByFbxPath = new Map<string, RelFile>();
+    const pairedC3dPaths = new Set<string>();
+    if (effectiveMergeC3d) {
+      for (const pair of folderDraft.mergeablePairs) {
+        const c3dFile = byPath.get(pair.c3dRel);
+        if (c3dFile) {
+          c3dByFbxPath.set(pair.fbxRel, c3dFile);
+          pairedC3dPaths.add(pair.c3dRel);
+        }
+      }
+    }
+
+    const activeFiles = effectiveMergeC3d
+      ? folderDraft.files.filter((item) => !pairedC3dPaths.has(item.path))
+      : folderDraft.files;
+
     const clipPlan = folderDraft.followPaths
       ? planFollowedPaths(
-          folderDraft.files.map((item) => item.path),
+          activeFiles.map((item) => item.path),
           true
         )
-      : planClipUnits(folderDraft.files.map((item) => item.path));
+      : planClipUnits(activeFiles.map((item) => item.path));
     const seenStored = new Set<string>();
-    return folderDraft.files.map((relFile) => {
+    return activeFiles.map((relFile) => {
+      const pairedC3d = c3dByFbxPath.get(relFile.path) || null;
       const planned = clipPlan.get(relFile.path);
       const unitName = planned?.skip
         ? relFile.file.name
         : planned?.unitName || fileUnitName(relFile);
       const storedName = planned?.storedName || relFile.file.name;
-      const duplicate = !planned?.skip && seenStored.has(storedName);
-      if (!planned?.skip) seenStored.add(storedName);
+      const effectiveFormat = pairedC3d ? "fbx" : fileExtension(relFile) || folderDraft.format;
+      const effectiveKind: MotionKind = pairedC3d
+        ? "merged"
+        : resolveMotionKind(folderDraft.motionKind);
+      const duplicateKey = `${effectiveKind}\0${storedName}`;
+      const duplicate = !planned?.skip && seenStored.has(duplicateKey);
+      if (!planned?.skip) seenStored.add(duplicateKey);
       const existingUnit = matchExistingUnit(unitName, existingUnits);
       const newRobotStyle = folderDraft.ontology === "robot" ? folderDraft.robotStyle.trim() : "";
       const existingFile = existingUnit?.files.find(
@@ -678,14 +814,13 @@ export function FolderBatchImport({
           item.modality === folderDraft.modality &&
           (item.channel || "") ===
             (folderDraft.modality === "fpv_video" ? folderDraft.channel : "") &&
-          item.format === (fileExtension(relFile) || folderDraft.format) &&
+          item.format === effectiveFormat &&
           item.name === storedName &&
           (item.file_version || "原版") === expectedVersion &&
           String(item.robot_style || item.annotation?.robot_style || "").trim() ===
             newRobotStyle &&
           (!isMotionModality(folderDraft.modality) ||
-            resolveMotionKind(item.annotation?.motion_kind) ===
-              resolveMotionKind(folderDraft.motionKind))
+            resolveMotionKind(item.annotation?.motion_kind) === effectiveKind)
       );
       const existingRobotStyle = existingFile ? String(existingFile.robot_style || existingFile.annotation?.robot_style || "").trim() : "";
       const styleDiffers =
@@ -698,6 +833,7 @@ export function FolderBatchImport({
         planned?.skip || duplicate || existingConflict ? "skip" : "upload";
       return {
         relFile,
+        pairedC3d,
         unitName,
         duplicate,
         existingConflict,
@@ -710,9 +846,15 @@ export function FolderBatchImport({
   const folderExtensions = useMemo(
     () =>
       folderDraft
-        ? Array.from(new Set(folderDraft.files.map(fileExtension).filter(Boolean)))
+        ? Array.from(
+            new Set(
+              folderRows
+                .map((row) => (row.pairedC3d ? "fbx" : fileExtension(row.relFile)))
+                .filter(Boolean)
+            )
+          )
         : [],
-    [folderDraft]
+    [folderDraft, folderRows]
   );
 
   const updateFolderDraft = (patch: Partial<FolderImportDraft>) => {
@@ -765,6 +907,11 @@ export function FolderBatchImport({
       form.set("batch", targetBatch);
       form.set("file_version", fileVersion);
       form.set("follow_paths", folderDraft.followPaths ? "1" : "0");
+      const effectiveMergeC3d =
+        folderDraft.mergeC3d &&
+        isMotionModality(folderDraft.modality) &&
+        folderDraft.mergeablePairs.length > 0;
+      form.set("merge_c3d", effectiveMergeC3d ? "1" : "0");
       form.set("actions", JSON.stringify(folderRows.map((row) => row.action)));
       form.set(
         "annotation",
@@ -803,9 +950,13 @@ export function FolderBatchImport({
         return dir || "";
       });
       form.set("sub_paths", JSON.stringify(subPaths));
-      folderRows.forEach((row) =>
-        form.append("files", row.relFile.file, row.relFile.file.name)
-      );
+      folderRows.forEach((row, idx) => {
+        form.append("files", row.relFile.file, row.relFile.file.name);
+        if (row.pairedC3d && row.action !== "skip") {
+          form.append("c3d_files", row.pairedC3d.file, row.pairedC3d.file.name);
+          form.append("c3d_target_indices", String(idx));
+        }
+      });
       let sessionId: string | undefined;
       const uploadedPaths: string[] = [];
       await execute({
@@ -822,8 +973,11 @@ export function FolderBatchImport({
           invalidateStorageOverview();
           onImported(targetBatch, sessionId);
           if (!result.failed) {
+            const mergedNote = result.merged_c3d
+              ? `（含 ${result.merged_c3d} 组 C3D→FBX 合并数据）`
+              : "";
             onMessage(
-              `文件夹导入完成：上传 ${result.uploaded}，替换 ${result.replaced}，跳过 ${result.skipped}`
+              `文件夹导入完成：上传 ${result.uploaded}${mergedNote}，替换 ${result.replaced}，跳过 ${result.skipped}`
             );
           }
         },
@@ -915,11 +1069,17 @@ export function FolderBatchImport({
           <button
             type="button"
             className="secondary"
+            disabled={!!inspectingText}
             onClick={() => void openZipImport(null, localZipPath.trim())}
           >
-            从服务器路径导入
+            {inspectingText ? "正在检查…" : "从服务器路径导入"}
           </button>
         </div>
+        {inspectingText && (
+          <div className="muted" style={{ fontSize: "0.8rem", marginTop: 6 }}>
+            {inspectingText}
+          </div>
+        )}
         <input
           ref={folderInputRef}
           type="file"
@@ -1227,6 +1387,31 @@ export function FolderBatchImport({
               </p>
               {taxonomyEditor(folderBusy)}
             </div>
+            {folderDraft.mergeablePairs.length > 0 &&
+              isMotionModality(folderDraft.modality) && (
+                <div className="storage-folder-format-warning">
+                  <label className="row" style={{ gap: 8, fontWeight: 600 }}>
+                    <input
+                      type="checkbox"
+                      checked={folderDraft.mergeC3d}
+                      disabled={folderBusy}
+                      onChange={(event) =>
+                        updateFolderDraft({
+                          mergeC3d: event.target.checked,
+                          actions: {},
+                        })
+                      }
+                    />
+                    将同名 C3D 数据合并入无 C3D 的 FBX（检测到 {folderDraft.mergeablePairs.length} 组）
+                  </label>
+                  <small style={{ display: "block", marginTop: 4 }}>
+                    {folderDraft.mergeC3d
+                      ? `已开启：合并生成的 FBX 将作为「合并数据」上传入库，原有的 ${folderDraft.mergeablePairs.length} 组未合并 FBX 与同名 C3D 文件不再上传（其余格式文件照常上传）。`
+                      : "未开启：原有的 FBX 与 C3D 文件将分别按原样上传。"}
+                  </small>
+                </div>
+              )}
+
             {folderExtensions.length > 0 && (
               <div className="storage-folder-format-warning">
                 {folderDraft.format.trim()
@@ -1298,12 +1483,19 @@ export function FolderBatchImport({
                 <div className={`storage-folder-file-row ${row.action === "skip" ? "is-skipped" : ""}`} key={row.relFile.path}>
                   <div>
                     <strong>{row.unitName}</strong>
+                    {row.pairedC3d && (
+                      <span className="storage-folder-status" style={{ marginLeft: 6 }}>
+                        合并 C3D → FBX（合并数据）
+                      </span>
+                    )}
                     {row.styleDiffers && (
                       <span className="storage-folder-status" style={{ marginLeft: 6 }}>
                         款式不同，同单元新增
                       </span>
                     )}
-                    <small title={row.relFile.path}>{row.relFile.path}</small>
+                    <small title={row.pairedC3d ? `${row.relFile.path} + ${row.pairedC3d.path}` : row.relFile.path}>
+                      {row.pairedC3d ? `${row.relFile.path} ← 合并 ${row.pairedC3d.path}` : row.relFile.path}
+                    </small>
                   </div>
                   {row.duplicate && row.action === "skip" ? (
                     <span className="storage-folder-status warning">
@@ -1352,7 +1544,11 @@ export function FolderBatchImport({
 
             {folderBusy && (
               <div className="stack">
-                <span>正在上传 {folderDraft.files.length} 个文件，请勿关闭…</span>
+                <span>
+                  {folderDraft.mergeC3d && folderDraft.mergeablePairs.length > 0
+                    ? `正在合并 ${folderDraft.mergeablePairs.length} 组 C3D 与 FBX 并上传 ${folderRows.filter((r) => r.action !== "skip").length} 项文件，请勿关闭…`
+                    : `正在上传 ${folderRows.filter((r) => r.action !== "skip").length} 个文件，请勿关闭…`}
+                </span>
                 <progress className="storage-folder-progress" />
               </div>
             )}
@@ -1363,8 +1559,10 @@ export function FolderBatchImport({
                   folderResult.failed ? "error" : "success"
                 }`}
               >
-                上传 {folderResult.uploaded}，替换 {folderResult.replaced}，跳过{" "}
-                {folderResult.skipped}，失败 {folderResult.failed}
+                上传 {folderResult.uploaded}
+                {folderResult.merged_c3d ? `（含 ${folderResult.merged_c3d} 组 C3D→FBX 合并数据）` : ""}
+                ，替换 {folderResult.replaced}，跳过 {folderResult.skipped}，失败{" "}
+                {folderResult.failed}
                 {folderResult.items?.some((item: any) => item.status === "skip") ? (
                   <details>
                     <summary className="muted" style={{ cursor: "pointer", marginTop: 4 }}>
@@ -1614,6 +1812,24 @@ export function FolderBatchImport({
                 </p>
                 {taxonomyEditor(folderBusy)}
               </div>
+              {zipDraft.mergeablePairCount > 0 && isMotionModality(zipDraft.modality) && (
+                <div className="storage-folder-format-warning">
+                  <label className="row" style={{ gap: 8, fontWeight: 600 }}>
+                    <input
+                      type="checkbox"
+                      checked={zipDraft.mergeC3d}
+                      disabled={folderBusy}
+                      onChange={(event) => updateZipDraft({ mergeC3d: event.target.checked })}
+                    />
+                    将同名 C3D 数据合并入无 C3D 的 FBX（检测到 {zipDraft.mergeablePairCount} 组）
+                  </label>
+                  <small style={{ display: "block", marginTop: 4 }}>
+                    {zipDraft.mergeC3d
+                      ? `已开启：合并生成的 FBX 将作为「合并数据」上传入库，原有的 ${zipDraft.mergeablePairCount} 组未合并 FBX 与同名 C3D 文件不再上传（其余格式文件照常上传）。`
+                      : "未开启：原有的 FBX 与 C3D 文件将分别按原样上传。"}
+                  </small>
+                </div>
+              )}
               <label className="row" style={{ gap: 8 }}>
                 <input
                   type="checkbox"
@@ -1626,8 +1842,8 @@ export function FolderBatchImport({
                 <div className="stack">
                   <span>
                     {zipProgress && zipProgress.total > 0
-                      ? `正在导入 zip，已处理 ${zipProgress.processed} / ${zipProgress.total}，请勿关闭…`
-                      : `${zipProgress?.detail || "正在解压并导入 zip"}，请勿关闭…`}
+                      ? `正在导入，已处理 ${zipProgress.processed} / ${zipProgress.total}${zipProgress.detail ? `（${zipProgress.detail}）` : ""}，请勿关闭…`
+                      : `${zipProgress?.detail || "正在解压并导入"}，请勿关闭…`}
                   </span>
                   <progress
                     className="storage-folder-progress"
@@ -1643,8 +1859,10 @@ export function FolderBatchImport({
                     folderResult.failed ? "error" : "success"
                   }`}
                 >
-                  上传 {folderResult.uploaded}，替换 {folderResult.replaced}，跳过{" "}
-                  {folderResult.skipped}，失败 {folderResult.failed}
+                  上传 {folderResult.uploaded}
+                  {folderResult.merged_c3d ? `（含 ${folderResult.merged_c3d} 组 C3D→FBX 合并数据）` : ""}
+                  ，替换 {folderResult.replaced}，跳过 {folderResult.skipped}，失败{" "}
+                  {folderResult.failed}
                   {folderResult.skipped > 0 && !folderResult.uploaded && !folderResult.replaced && !folderResult.failed ? (
                     <div className="muted" style={{ marginTop: 4 }}>
                       这些文件已经在这个批次里，没有重复写入。
@@ -1682,6 +1900,69 @@ export function FolderBatchImport({
                     {folderBusy ? "正在导入…" : "开始导入"}
                   </button>
                 )}
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {c3dMergePrompt &&
+        createPortal(
+          <div
+            className="storage-modal-backdrop"
+            onClick={() => answerMergeC3dChoice(null)}
+          >
+            <div
+              className="storage-modal card stack"
+              style={{ maxWidth: 520 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="storage-folder-import-title">
+                <div>
+                  <h3>检测到可合并的 C3D 与 FBX 文件</h3>
+                  <span className="muted">{c3dMergePrompt.sourceLabel}</span>
+                </div>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => answerMergeC3dChoice(null)}
+                >
+                  取消
+                </button>
+              </div>
+              <div className="stack" style={{ gap: 8, fontSize: "0.92rem", lineHeight: 1.55 }}>
+                <p style={{ margin: 0 }}>
+                  检测到 <strong>{c3dMergePrompt.pairCount}</strong> 组同名的 FBX（不含 C3D 光学点数据）与 C3D 文件
+                  {c3dMergePrompt.sampleNames.length > 0
+                    ? `（如：${c3dMergePrompt.sampleNames.slice(0, 3).join("、")}${
+                        c3dMergePrompt.pairCount > 3 ? " 等" : ""
+                      }）`
+                    : ""}
+                  。是否将 C3D 文件中的 C3D 数据合并入同名的 FBX 中？
+                </p>
+                <div className="storage-folder-format-warning" style={{ margin: 0 }}>
+                  <div>
+                    <strong>选择「是」：</strong>将同名 C3D 数据合并入 FBX 后，生成合并数据 FBX 上传入库；<strong>原来的 C3D 和未合并 FBX 文件不再上传</strong>（包内其他格式文件照常上传）。
+                  </div>
+                  <div style={{ marginTop: 4 }}>
+                    <strong>选择「否」：</strong>不进行合并，将原有的 FBX 和 C3D 文件分别原样上传。
+                  </div>
+                </div>
+              </div>
+              <div className="row storage-folder-actions" style={{ justifyContent: "flex-end", gap: 8 }}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => answerMergeC3dChoice(false)}
+                >
+                  否，原样上传
+                </button>
+                <button
+                  type="button"
+                  onClick={() => answerMergeC3dChoice(true)}
+                >
+                  是，合并入 FBX 后上传
+                </button>
               </div>
             </div>
           </div>,

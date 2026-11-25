@@ -397,6 +397,10 @@ export const api = {
       method: "POST",
       body: form,
     }),
+  storageInspectImportPath: (localPath: string) =>
+    request<import("./types").StorageInspectImportPathResult>(
+      `/api/storage/data/inspect-import-path?local_path=${encodeURIComponent(localPath)}`
+    ),
   storageUploadZipJob: (jobId: string) =>
     request<import("./types").ZipImportJob>(
       `/api/storage/data/upload-zip/${encodeURIComponent(jobId)}`,
@@ -516,19 +520,26 @@ export const api = {
   retargetStorageTree: () =>
     request<import("./types").TaxonomyNode[]>("/api/repo/retarget/storage-tree", { quiet: true }),
   redoRetargetTier: (ruleId: string) =>
-    request<{ ok: boolean; rule_id: string; message: string }>(
+    request<{ ok: boolean; rule_id: string; requested_at?: number; message: string }>(
       `/api/repo/retarget/priority/${encodeURIComponent(ruleId)}/redo`,
       { method: "POST" },
     ),
-  saveRetargetPriority: (rules: import("./pages/RetargetManagePage").PriorityRule[]) =>
+  saveRetargetPriority: (
+    rules: import("./pages/RetargetManagePage").PriorityRule[],
+    layout?: import("./pages/RetargetManagePage").MatrixLayout,
+  ) =>
     request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority", {
       method: "PUT",
-      body: JSON.stringify({ rules }),
+      body: JSON.stringify({ rules, layout }),
     }),
-  saveRetargetPreset: (name: string, rules: import("./pages/RetargetManagePage").PriorityRule[]) =>
+  saveRetargetPreset: (
+    name: string,
+    rules: import("./pages/RetargetManagePage").PriorityRule[],
+    layout?: import("./pages/RetargetManagePage").MatrixLayout,
+  ) =>
     request<import("./pages/RetargetManagePage").RetargetPriority>("/api/repo/retarget/priority/presets", {
       method: "POST",
-      body: JSON.stringify({ name, rules }),
+      body: JSON.stringify({ name, rules, layout }),
     }),
   deleteRetargetPreset: (presetId: string) =>
     request<import("./pages/RetargetManagePage").RetargetPriority>(

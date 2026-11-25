@@ -548,8 +548,19 @@ export interface StorageFolderUploadResult {
   replaced: number;
   skipped: number;
   failed: number;
+  merged_c3d?: number;
   items: StorageFolderUploadItem[];
   upload_session_id?: string | null;
+}
+
+export interface StorageInspectImportPathResult {
+  kind: "zip" | "dir";
+  name: string;
+  suggested_batch: string;
+  file_count: number;
+  formats: string[];
+  mergeable_c3d_fbx_count: number;
+  sample_pairs: string[];
 }
 
 export interface ZipImportJob {

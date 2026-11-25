@@ -23,6 +23,7 @@ function readTheme(): Theme {
 
 const _followDelta = new THREE.Vector3();
 const _fitBox = new THREE.Box3();
+const _meshWorldBox = new THREE.Box3();
 const _fitSize = new THREE.Vector3();
 const _fitCenter = new THREE.Vector3();
 const _fitPt = new THREE.Vector3();
@@ -35,25 +36,41 @@ export function figureScale(maxHeight: number) {
   return Math.min(Math.max(1.7 / maxHeight, 0.001), 200);
 }
 
-function expandVisibleBox(root: THREE.Object3D, box: THREE.Box3) {
-  box.makeEmpty();
-  root.updateWorldMatrix(true, true);
-  root.traverse((obj) => {
-    if ((obj as THREE.Bone).isBone) {
-      obj.getWorldPosition(_fitPt);
+function walkVisibleBox(node: THREE.Object3D, box: THREE.Box3) {
+  // 跳过隐藏子树以及数据原点坐标轴辅助器（避免角色离开原点后包围盒被拉大到原点）。
+  if (!node.visible || node.name === "__data_origin") return;
+  if ((node as THREE.Bone).isBone) {
+    node.getWorldPosition(_fitPt);
+    if (Number.isFinite(_fitPt.x) && Number.isFinite(_fitPt.y) && Number.isFinite(_fitPt.z)) {
       box.expandByPoint(_fitPt);
-      return;
     }
-    const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh && mesh.visible && mesh.geometry) {
+  } else {
+    const mesh = node as THREE.Mesh;
+    if (
+      mesh.isMesh &&
+      mesh.geometry &&
+      mesh.name !== "__joint_dot" &&
+      mesh.name !== "__bvh_joint_dot"
+    ) {
       if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
       const local = mesh.geometry.boundingBox;
-      if (!local || local.isEmpty()) return;
-      box.expandByPoint(_fitPt.copy(local.min).applyMatrix4(mesh.matrixWorld));
-      box.expandByPoint(_fitPt.copy(local.max).applyMatrix4(mesh.matrixWorld));
+      if (local && !local.isEmpty()) {
+        _meshWorldBox.copy(local).applyMatrix4(mesh.matrixWorld);
+        if (!_meshWorldBox.isEmpty()) {
+          box.union(_meshWorldBox);
+        }
+      }
     }
-  });
-  if (box.isEmpty()) box.setFromObject(root);
+  }
+  for (const child of node.children) {
+    walkVisibleBox(child, box);
+  }
+}
+
+export function expandVisibleBox(root: THREE.Object3D, box: THREE.Box3) {
+  box.makeEmpty();
+  root.updateWorldMatrix(true, true);
+  walkVisibleBox(root, box);
 }
 
 /** 按骨骼世界坐标画线。只连接上下两节骨骼，避免从场景原点拉一条线到髋部。 */
@@ -155,14 +172,16 @@ export function shiftCameraWithPoint(
   hasLast.current = true;
 }
 
-/** 模型入场后再对准相机，避免角色在画面外或缩成一个点。nonce 变化时重新取景（复位视角）。 */
+/** 模型入场后再对准相机，避免角色在画面外或缩成一个点。nonce 变化时重新取景（复位视角），与初始视角逻辑完全一致。 */
 export function FrameFigure({
   objectRef,
+  fallbackRef,
   ready,
   resetKey,
   nonce = 0,
 }: {
   objectRef: RefObject<THREE.Object3D | null>;
+  fallbackRef?: RefObject<THREE.Object3D | null>;
   ready: boolean;
   resetKey: string;
   nonce?: number;
@@ -171,32 +190,48 @@ export function FrameFigure({
   const controls = useThree((state) => state.controls) as
     | { target: THREE.Vector3; update: () => void }
     | undefined;
-  const framed = useRef("");
+  const framedToken = useRef("");
+  const lastResetKey = useRef("");
   const waits = useRef(0);
 
+  const token = `${resetKey}::${nonce}`;
+
   useEffect(() => {
-    framed.current = "";
     waits.current = 0;
-  }, [resetKey, ready, nonce]);
+  }, [token, ready]);
 
   useFrame(() => {
-    if (!ready || framed.current === resetKey) return;
-    const obj = objectRef.current;
-    if (!obj) return;
-    expandVisibleBox(obj, _fitBox);
+    if (!ready || framedToken.current === token) return;
+    const primary = objectRef.current;
+    const secondary = fallbackRef?.current ?? null;
+    if (!primary && !secondary) return;
+    if (primary) {
+      expandVisibleBox(primary, _fitBox);
+    } else {
+      _fitBox.makeEmpty();
+    }
+    if (_fitBox.isEmpty() && secondary) {
+      expandVisibleBox(secondary, _fitBox);
+    }
     if (_fitBox.isEmpty()) return;
     _fitBox.getSize(_fitSize);
     if (_fitSize.length() < 1e-4) return;
     waits.current += 1;
+    const isInitialForScene = lastResetKey.current !== resetKey;
     const span = _fitSize.length();
-    // 等缩放/居中生效：厘米骨架未缩时对角线可达数百，这时取景会把相机甩飞。
-    if ((span < 0.25 || span > 12) && waits.current < 45) return;
-    if (waits.current < 4) return;
-    if (!controls && waits.current < 12) return;
+    if (isInitialForScene) {
+      // 首次入场等缩放/偏移矩阵与 OrbitControls 生效（厘米骨架未缩时对角线可达数百）。
+      if ((span < 0.25 || span > 12) && waits.current < 20) return;
+      if (waits.current < 2) return;
+      if (!controls && waits.current < 10) return;
+    } else if (!controls && waits.current < 4) {
+      return;
+    }
     const center = _fitBox.getCenter(_fitCenter);
     const radius = Math.max(_fitSize.length() * 0.5, 0.2);
     const fov = ((camera.fov || 50) * Math.PI) / 180;
     const dist = (radius / Math.max(Math.sin(fov / 2), 1e-4)) * 1.05;
+    camera.up.set(0, 1, 0);
     camera.position.set(center.x + dist * 0.72, center.y + dist * 0.42, center.z + dist * 0.88);
     camera.near = Math.max(dist / 400, 0.01);
     camera.far = Math.max(dist * 80, 80);
@@ -206,7 +241,8 @@ export function FrameFigure({
       controls.target.copy(center);
       controls.update();
     }
-    framed.current = resetKey;
+    lastResetKey.current = resetKey;
+    framedToken.current = token;
   });
 
   return null;

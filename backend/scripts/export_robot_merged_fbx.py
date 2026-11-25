@@ -20,7 +20,7 @@ from pathlib import Path
 
 import fbx
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+HUB = Path(__file__).resolve().parents[2] / "data" / "hub_repo"
 URDF = HUB / "3d_model/robot/standard_description/noetix_e2/urdf/noetix_e2_23dof.urdf"
 STEM = "中障碍物11_侧腿上箱_低速_宽_001"
 BATCH = "260317_parkour"

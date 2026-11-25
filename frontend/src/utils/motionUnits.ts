@@ -220,3 +220,75 @@ export function planClipUnits(relPaths: string[]): Map<string, ClipPlan> {
   }
   return plan;
 }
+
+export function pairFbxAndC3dPaths(
+  relPaths: string[]
+): Array<{ fbxRel: string; c3dRel: string }> {
+  const cleaned = relPaths.map(posix).filter(Boolean);
+  if (!cleaned.length) return [];
+  const wrappers = wrapperPrefixes(cleaned);
+  const fbxByKey = new Map<string, string[]>();
+  const c3dByKey = new Map<string, string[]>();
+
+  for (const rel of cleaned) {
+    const name = partsOf(rel).pop() || "";
+    const ext = extKey(name);
+    if (ext !== "fbx" && ext !== "c3d") continue;
+    const suffix = suffixOf(name);
+    const stemKey = (suffix ? name.slice(0, -suffix.length) : name).trim().toLowerCase();
+    if (!stemKey) continue;
+    const cdir = contentDirs(rel, wrappers).join("/");
+    const key = `${cdir}\0${stemKey}`;
+    if (ext === "fbx") {
+      const list = fbxByKey.get(key) || [];
+      list.push(rel);
+      fbxByKey.set(key, list);
+    } else {
+      const list = c3dByKey.get(key) || [];
+      list.push(rel);
+      c3dByKey.set(key, list);
+    }
+  }
+
+  const pairs: Array<{ fbxRel: string; c3dRel: string }> = [];
+  const matchedFbx = new Set<string>();
+  const matchedC3d = new Set<string>();
+
+  for (const [key, fbxList] of fbxByKey) {
+    const c3dList = c3dByKey.get(key);
+    if (c3dList && fbxList.length === 1 && c3dList.length === 1) {
+      pairs.push({ fbxRel: fbxList[0], c3dRel: c3dList[0] });
+      matchedFbx.add(fbxList[0]);
+      matchedC3d.add(c3dList[0]);
+    }
+  }
+
+  // Fallback: match remaining unique stems across custom folder names
+  const remFbx = new Map<string, string[]>();
+  const remC3d = new Map<string, string[]>();
+  for (const rel of cleaned) {
+    const name = partsOf(rel).pop() || "";
+    const ext = extKey(name);
+    if (ext !== "fbx" && ext !== "c3d") continue;
+    const suffix = suffixOf(name);
+    const stemKey = (suffix ? name.slice(0, -suffix.length) : name).trim().toLowerCase();
+    if (!stemKey) continue;
+    if (ext === "fbx" && !matchedFbx.has(rel)) {
+      const list = remFbx.get(stemKey) || [];
+      list.push(rel);
+      remFbx.set(stemKey, list);
+    } else if (ext === "c3d" && !matchedC3d.has(rel)) {
+      const list = remC3d.get(stemKey) || [];
+      list.push(rel);
+      remC3d.set(stemKey, list);
+    }
+  }
+  for (const [stemKey, fbxList] of remFbx) {
+    const c3dList = remC3d.get(stemKey);
+    if (c3dList && fbxList.length === 1 && c3dList.length === 1) {
+      pairs.push({ fbxRel: fbxList[0], c3dRel: c3dList[0] });
+    }
+  }
+
+  return pairs;
+}

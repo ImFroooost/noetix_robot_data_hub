@@ -131,6 +131,22 @@ def iter_zip_human_members(zf: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, s
     return out
 
 
+def iter_dir_human_members(root_dir: Path) -> list[tuple[Path, str]]:
+    out: list[tuple[Path, str]] = []
+    root_dir = root_dir.resolve()
+    prefix = root_dir.name
+    for path in sorted(root_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel_parts = path.relative_to(root_dir).parts
+        if any(part.startswith(".") or _IGNORE_NAMES.match(part) for part in rel_parts):
+            continue
+        if is_importable_filename(path.name):
+            rel_posix = f"{prefix}/{path.relative_to(root_dir).as_posix()}"
+            out.append((path, rel_posix))
+    return out
+
+
 def safe_extract_member(
     zf: zipfile.ZipFile,
     info: zipfile.ZipInfo,

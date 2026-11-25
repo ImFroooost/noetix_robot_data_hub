@@ -1656,7 +1656,8 @@ export function FbxScene({
           )}
         </group>
         <FrameFigure
-          objectRef={centerRef}
+          objectRef={rootRef}
+          fallbackRef={centerRef}
           ready={status === "ready" && !!object}
           resetKey={`${url}:${scale}:${offset.join(",")}:${rotationX}`}
           nonce={viewNonce}

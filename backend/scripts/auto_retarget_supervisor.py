@@ -12,8 +12,8 @@ import sys
 import time
 from pathlib import Path
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
-ROOT = Path("/media/noetix/my_passport1/noetix_robot_data_hub")
+ROOT = Path(__file__).resolve().parents[2]
+HUB = ROOT / "data" / "hub_repo"
 BACKEND = ROOT / "backend"
 PYTHON = ROOT / ".venv-retarget" / "bin" / "python"
 LOOP = BACKEND / "scripts" / "auto_retarget_loop.py"

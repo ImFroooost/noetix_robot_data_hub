@@ -222,12 +222,14 @@ function RobotCsvScene({
   onError: (message: string) => void;
 }) {
   const robotRef = useRef<URDFRobot | null>(null);
+  const robotSubjectRef = useRef<THREE.Group | null>(null);
   const figureRef = useRef<THREE.Group | null>(null);
   const [labelRoot, setLabelRoot] = useState<THREE.Group | null>(null);
   const framesRef = useRef<RobotCsvFrame[]>([]);
   const namesRef = useRef<string[]>([]);
   const fpsRef = useRef(30);
   const [robot, setRobot] = useState<URDFRobot | null>(null);
+  const [meshesReady, setMeshesReady] = useState(false);
   const [center, setCenter] = useState<[number, number, number]>([0, 0, 0]);
   const [alignPose, setAlignPose] = useState<{
     position: [number, number, number];
@@ -256,6 +258,7 @@ function RobotCsvScene({
     setStatus("loading");
     setError("");
     setRobot(null);
+    setMeshesReady(false);
     setAlignPose(null);
     setRobotTrack([]);
     robotRef.current = null;
@@ -274,11 +277,27 @@ function RobotCsvScene({
         const jointNames = extractActuatedJoints(urdfText);
         if (!jointNames.length) throw new Error("URDF 中没有可驱动关节");
 
+        let pendingMeshes = 0;
+        let parseFinished = false;
+        let modelRefLocal: URDFRobot | null = null;
+        const finalizeMeshes = () => {
+          if (!parseFinished || pendingMeshes > 0 || cancelled || !modelRefLocal) return;
+          modelRefLocal.updateMatrixWorld(true);
+          _robotBox.setFromObject(modelRefLocal);
+          if (!_robotBox.isEmpty()) {
+            _robotBox.getSize(_robotSize);
+            const span = Math.max(_robotSize.x, _robotSize.y, _robotSize.z);
+            setAxisLength(span > 0.05 ? span : 1.2);
+          }
+          setMeshesReady(true);
+        };
+
         const loader = new URDFLoader();
         loader.workingPath = root;
         loader.parseVisual = true;
         loader.parseCollision = false;
         loader.loadMeshCb = (path, manager, done) => {
+          pendingMeshes += 1;
           manager.itemStart(path);
           fetchRepoMesh(path, packageRoot, urdfPath)
             .then(({ path: repoPath, buffer }) => {
@@ -286,21 +305,23 @@ function RobotCsvScene({
                 throw new Error(`不支持的网格格式：${repoPath}`);
               }
               const geometry = new STLLoader().parse(buffer);
+              geometry.computeBoundingBox();
               done(new THREE.Mesh(geometry, new THREE.MeshPhongMaterial()));
             })
             .catch((err) => done(null, err))
-            .finally(() => manager.itemEnd(path));
+            .finally(() => {
+              manager.itemEnd(path);
+              pendingMeshes -= 1;
+              finalizeMeshes();
+            });
         };
 
         const model = loader.parse(urdfText);
+        modelRefLocal = model;
         applyFrame(model, parsed.frames[0], jointNames);
-        model.updateMatrixWorld(true);
-        _robotBox.setFromObject(model);
-        if (!_robotBox.isEmpty()) {
-          _robotBox.getSize(_robotSize);
-          const span = Math.max(_robotSize.x, _robotSize.y, _robotSize.z);
-          setAxisLength(span > 0.05 ? span : 1.2);
-        }
+        parseFinished = true;
+        finalizeMeshes();
+
         const fps = fpsHint || parsed.fps || 30;
         const duration =
           durationHint && durationHint > 0
@@ -387,7 +408,9 @@ function RobotCsvScene({
     >
       <group rotation={[rotationX, 0, 0]}>
         <DataOriginAxes length={axisLength} />
-        {robot && <primitive object={robot} />}
+        <group ref={robotSubjectRef}>
+          {robot && <primitive object={robot} />}
+        </group>
         {objectXmlUrl && objectCsvUrl ? (
           <SceneObjectLayer
             xmlUrl={objectXmlUrl}
@@ -399,10 +422,11 @@ function RobotCsvScene({
         <SceneNameLabels root={labelRoot} names={names} />
       </group>
       <FrameFigure
-        objectRef={figureRef}
-        ready={status === "ready"}
-        resetKey={`${csvUrl}:${rotationX}:${objectXmlUrl}`}
-        nonce={viewNonce + propsNonce}
+        objectRef={robotSubjectRef}
+        fallbackRef={figureRef}
+        ready={status === "ready" && meshesReady}
+        resetKey={`${csvUrl}:${rotationX}`}
+        nonce={viewNonce}
       />
       {status === "loading" && (
         <Html center style={{ pointerEvents: "none" }}>

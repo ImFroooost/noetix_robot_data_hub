@@ -2735,7 +2735,10 @@ def update_upload_session(
     if not session_id:
         raise ValueError("上传记录无效")
 
+    motion_kind_changed = False
+
     def mutate(data):
+        nonlocal motion_kind_changed
         sessions = data.setdefault("upload_sessions", [])
         row = next((item for item in sessions if item.get("id") == session_id), None)
         if row is None:
@@ -2752,6 +2755,10 @@ def update_upload_session(
             row["paths"] = list(dict.fromkeys([*(row.get("paths") or []), *paths]))
         if annotation is not None:
             current = dict(row.get("annotation") or {})
+            prev_kind = str(current.get("motion_kind") or "").strip().lower()
+            new_kind = str(annotation.get("motion_kind") or "").strip().lower()
+            if "motion_kind" in annotation and new_kind and new_kind != prev_kind:
+                motion_kind_changed = True
             current.update(annotation)
             row["annotation"] = current
             row["updated_at"] = _now()
@@ -2771,7 +2778,13 @@ def update_upload_session(
         raise FileNotFoundError(session_id)
     target_paths = [str(path) for path in (row.get("paths") or []) if path]
     if annotation is not None and target_paths:
-        update_files_annotation(target_paths, annotation)
+        file_annotation = dict(annotation)
+        if "motion_kind" in file_annotation and not motion_kind_changed:
+            # Preserve per-file motion_kind (e.g. merged FBX alongside skeleton TAK)
+            # when the user only edited non-motion_kind fields on the session.
+            file_annotation.pop("motion_kind", None)
+        if file_annotation:
+            update_files_annotation(target_paths, file_annotation)
     if taxonomy_tag_ids is not None:
         apply_upload_taxonomy(
             str(row.get("batch") or ""),
@@ -3974,16 +3987,24 @@ def save_model_upload(
     }
 
 
-def resolve_import_zip(path: str) -> Path:
-    """Resolve a server-side zip for import (host Downloads, /import_inbox, data/import)."""
-    raw = Path(str(path or "").strip()).expanduser()
-    if not str(raw):
-        raise ValueError("请填写 zip 路径")
+def _import_source_candidates(path: str) -> list[Path]:
+    raw_str = str(path or "").strip()
+    if not raw_str:
+        raise ValueError("请填写服务器路径")
+    raw = Path(raw_str).expanduser()
     candidates: list[Path] = []
     if raw.is_absolute():
         candidates.append(raw)
-        candidates.append(Path("/import_inbox") / raw.name)
+        for host_prefix in ("/home/noetix/Downloads", "/root/Downloads"):
+            hp = Path(host_prefix)
+            try:
+                rel = raw.relative_to(hp)
+                candidates.append(Path("/import_inbox") / rel)
+                candidates.append(Path("/data/import") / rel)
+            except ValueError:
+                pass
         if raw.name:
+            candidates.append(Path("/import_inbox") / raw.name)
             candidates.append(Path("/data/import") / raw.name)
     else:
         candidates.extend(
@@ -3995,8 +4016,28 @@ def resolve_import_zip(path: str) -> Path:
                 Path("/data") / raw,
             ]
         )
+    return candidates
+
+
+def resolve_import_source(path: str) -> Path:
+    """Resolve a server-side zip file or directory for import."""
     seen: set[str] = set()
-    for candidate in candidates:
+    for candidate in _import_source_candidates(path):
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file() and candidate.suffix.lower() == ".zip":
+            return candidate.resolve()
+        if candidate.is_dir():
+            return candidate.resolve()
+    raise FileNotFoundError(f"找不到 zip 或文件夹：{path}")
+
+
+def resolve_import_zip(path: str) -> Path:
+    """Resolve a server-side zip for import (host Downloads, /import_inbox, data/import)."""
+    seen: set[str] = set()
+    for candidate in _import_source_candidates(path):
         key = str(candidate)
         if key in seen:
             continue

@@ -3,8 +3,8 @@ Description=Start or leave stopped the auto-retarget loop from the web control f
 
 [Service]
 Type=simple
-WorkingDirectory=/media/noetix/my_passport1/noetix_robot_data_hub
-ExecStart=/media/noetix/my_passport1/noetix_robot_data_hub/.venv-retarget/bin/python -u /media/noetix/my_passport1/noetix_robot_data_hub/backend/scripts/auto_retarget_supervisor.py
+WorkingDirectory=/media/noetix/hdd_raid_10_box/important/data/noetix_robot_data_hub
+ExecStart=/media/noetix/hdd_raid_10_box/important/data/noetix_robot_data_hub/.venv-retarget/bin/python -u /media/noetix/hdd_raid_10_box/important/data/noetix_robot_data_hub/backend/scripts/auto_retarget_supervisor.py
 Restart=always
 RestartSec=3
 

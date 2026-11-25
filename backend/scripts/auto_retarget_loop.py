@@ -14,8 +14,7 @@ data/robot/<style>/motion/omniretarget/skeleton/csv/<batch>/...
 
 Run on the host with the holosoma virtualenv:
 
-    /media/noetix/my_passport1/noetix_robot_data_hub/.venv-retarget/bin/python \
-        backend/scripts/auto_retarget_loop.py
+    .venv-retarget/bin/python backend/scripts/auto_retarget_loop.py
 """
 
 from __future__ import annotations
@@ -38,12 +37,13 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+ROOT = Path(__file__).resolve().parents[2]
+HUB = ROOT / "data" / "hub_repo"
 PKG = Path(
     "/home/noetix/Desktop/new_home/learning_based/wbc/open_src/omni_retarget/"
     "holosoma/src/holosoma_retargeting"
 )
-BACKEND = Path("/media/noetix/my_passport1/noetix_robot_data_hub/backend")
+BACKEND = ROOT / "backend"
 STATE_PATH = HUB / "index" / "auto_retarget_state.json"
 LOG_PATH = HUB / "index" / "auto_retarget.log"
 # Rotated to auto_retarget.log.1 … .3 past this size.
@@ -60,9 +60,11 @@ from app.services.file_lock import locked, rotate_if_large, write_text_atomic  #
 from app.services.retarget_control import load_control, wave_plan  # noqa: E402
 from app.services.retarget_priority import (  # noqa: E402
     FOLDER_SCHEME,
+    SKIPPED,
     UNLISTED,
     config_path,
     describe_rule,
+    is_skip_rule,
     rule_rank_label,
     folder_constraints,
     batch_reserved_for,
@@ -247,7 +249,8 @@ def fresh_queues(
                 "active": False,
             }
         )
-    for index, rule in enumerate(rules):
+    positive_rules = [rule for rule in rules if not is_skip_rule(rule)]
+    for index, rule in enumerate(positive_rules):
         rows.append(
             {
                 "key": rule["id"],
@@ -1012,7 +1015,7 @@ def collect_jobs(
     targeted = [
         rule
         for rule in rules
-        if rule.get("enabled") and rule.get("data_mode") == "targets"
+        if rule.get("enabled") and not is_skip_rule(rule) and rule.get("data_mode") == "targets"
     ]
     redo = dict(redo or {})
     compiled = compiled or []
@@ -1095,7 +1098,7 @@ def collect_jobs(
                 until = float(failures.get(key) or 0)
                 redo_after = None
                 scope_queue = ""
-                if compiled and scheduled:
+                if compiled:
                     scope_queue = job_queue(
                         style,
                         set(tag_list),
@@ -1104,8 +1107,13 @@ def collect_jobs(
                         unit=unit,
                         sub_path=str(source.get("sub_path") or ""),
                     )
+                if scope_queue == SKIPPED:
+                    continue
+                if not scheduled:
+                    scope_queue = ""
+                if compiled and scheduled:
                     redo_after = redo.get(scope_queue)
-                    if redo_after is not None and not object_only and not merged_only and not package_only:
+                    if redo_after is not None:
                         needs = needs_official_retarget(dest, files, style, redo_after=redo_after)
                         object_only = (not needs) and needs_objects
                         merged_only = (not needs) and (not needs_objects) and needs_merged
@@ -1116,6 +1124,16 @@ def collect_jobs(
                             and needs_packages
                         )
                         needs_work = needs or needs_objects or needs_merged or needs_packages
+                        key = f"{batch}::{unit}::{style}::{source['path']}"
+                        if method != "omniretarget":
+                            key += f"::{method}"
+                        if object_only:
+                            key += "::object"
+                        elif merged_only:
+                            key += "::merged"
+                        elif package_only:
+                            key += "::package"
+                        until = float(failures.get(key) or 0)
                 if scope_queue:
                     bucket = scope.setdefault(scope_queue, {"total": 0, "done": 0})
                     bucket["total"] += 1
@@ -1984,17 +2002,21 @@ def main() -> None:
             records = iter_motion_files()
             attach_annotations(records)
             grouped = group_units(records)
+            redo_gen = _redo_generation()
+            round_started = _now()
+            redo_snapshot = load_redo(HUB)
             jobs, scope = collect_jobs(
-                grouped, load_state(), compiled, load_redo(HUB), selected_method
+                grouped, load_state(), compiled, redo_snapshot, selected_method
             )
             jobs = sort_jobs(jobs, grouped, compiled)
-            redo_gen = _redo_generation()
             if _stop_if_requested():
                 return
             if not jobs:
                 if pending_paths:
                     index_new_files(pending_paths)
                     pending_paths = []
+                if _redo_generation() != redo_gen:
+                    continue
                 log("没有待重定向的数据单元，60 秒后再检查")
                 publish_status(
                     phase="idle",
@@ -2004,21 +2026,25 @@ def main() -> None:
                     round_total=0,
                     round_done=0,
                     round_failed=0,
+                    round_started_at=round_started,
                     queues=fresh_queues([], rules, scope),
                     message="没有待重定向的数据",
                     recent=recent,
                     **_performance_fields(),
                     **_pace_fields(),
                 )
-                time.sleep(60)
+                for _ in range(12):
+                    if _stop_if_requested() or _redo_generation() != redo_gen or _priority_mtime() != priority_mtime:
+                        break
+                    time.sleep(5)
                 continue
             queues = fresh_queues(jobs, rules, scope)
             done = 0
             failed = 0
-            round_started = _now()
+            first_positive = next((item for item in rules if not is_skip_rule(item)), None)
             log(
                 f"本轮 {len(jobs)} 条（{selected_method}），先做 "
-                f"{describe_rule(rules[0], set()) if rules else '未列入规则'}，最多 {WORKERS} 路并行"
+                f"{describe_rule(first_positive, set()) if first_positive else '未列入规则'}，最多 {WORKERS} 路并行"
             )
 
             def snapshot(phase: str, current: list[dict], message: str) -> None:

@@ -34,11 +34,20 @@ DATA_MODES = ("taxonomy", "rest", "targets")
 FOLDER_SCHEME = "folder"
 _MOTION_EXTS = frozenset({".fbx", ".bvh", ".npz", ".c3d", ".smpl"})
 UNLISTED = "unlisted"
+SKIPPED = "skipped"
+SKIP_RANK = -1
 _SCHEME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
-_MAX_RULES = 160
-_MAX_RANK = 999
+_MAX_RULES = 2000
+_MAX_RANK = 9999
 _MAX_NAMES = 40
+
+
+def is_skip_rule(rule: dict) -> bool:
+    try:
+        return int(rule.get("rank") or 1) == SKIP_RANK
+    except (TypeError, ValueError):
+        return False
 
 
 def config_path(hub: Path) -> Path:
@@ -179,8 +188,8 @@ def batch_reserved_for(compiled: list[tuple], style: str, batch: str) -> bool | 
     """Whether a whole-batch rule assigns this batch.
 
     None means no whole-batch assignment. True means this robot is named.
-    False means the batch is reserved for other robots, so rest rules must
-    not pick it up.
+    False means the batch is reserved for other robots (or explicitly skipped
+    with rank -1 for this robot), so rest rules must not pick it up.
     """
     assigned = False
     named = False
@@ -193,6 +202,10 @@ def batch_reserved_for(compiled: list[tuple], style: str, batch: str) -> bool | 
                 continue
             names = [str(name).strip() for name in (target.get("units") or []) if str(name).strip()]
             if names:
+                continue
+            if is_skip_rule(rule):
+                if style in (rule.get("robots") or []):
+                    return False
                 continue
             assigned = True
             if style in (rule.get("robots") or []):
@@ -337,6 +350,21 @@ def _specific_rule_matches(
     return bool(include_ids or scope_groups or _has_folder_scope(item))
 
 
+def _targets_match_kind(rule: dict, batch: str, unit: str) -> str | None:
+    """Return 'unit' for explicit unit match, 'batch' for whole-batch match, or None."""
+    hit_batch = False
+    for item in rule.get("targets") or []:
+        if str(item.get("batch") or "") != batch:
+            continue
+        names = [str(name) for name in (item.get("units") or []) if str(name).strip()]
+        if names:
+            if unit in names:
+                return "unit"
+        else:
+            hit_batch = True
+    return "batch" if hit_batch else None
+
+
 def job_queue(
     style: str,
     tag_ids: set[int],
@@ -346,40 +374,78 @@ def job_queue(
     unit: str = "",
     sub_path: str = "",
 ) -> str:
-    """First matching rule id, or UNLISTED when no rule covers this job.
+    """First matching rule id, SKIPPED when rank == -1, or UNLISTED when uncovered.
 
-    A taxonomy rule with several schemes matches only when every scheme hits.
-    Rest means every job for that robot that no specific rule, above or below,
-    has named.
+    Specificity order:
+    1. Explicit unit-level targets rules (-1 skips; otherwise first in compiled order)
+    2. Whole-batch targets rules (-1 skips; otherwise first in compiled order)
+    3. Taxonomy / folder rules (-1 skips; otherwise first in compiled order)
+    4. Rest rules (-1 skips; otherwise first in compiled order)
     """
     tags = set(tag_ids)
+    unit_target_pos: str | None = None
+    batch_target_skip = False
+    batch_target_pos: str | None = None
+    taxonomy_skip = False
+    taxonomy_pos: str | None = None
+    rest_skip = False
+    rest_pos: str | None = None
+
     for item in compiled:
         rule = item[0]
+        if not rule.get("enabled"):
+            continue
+        if style not in (rule.get("robots") or []):
+            continue
+        mode = rule.get("data_mode")
+        skip = is_skip_rule(rule)
+        if mode == "targets":
+            kind = _targets_match_kind(rule, batch, unit)
+            if kind == "unit":
+                if skip:
+                    return SKIPPED
+                if unit_target_pos is None:
+                    unit_target_pos = str(rule["id"])
+            elif kind == "batch":
+                if skip:
+                    batch_target_skip = True
+                elif batch_target_pos is None:
+                    batch_target_pos = str(rule["id"])
+            continue
+        if mode == "rest":
+            if skip:
+                rest_skip = True
+            elif rest_pos is None:
+                rest_pos = str(rule["id"])
+            continue
         include_ids = item[1] if len(item) > 1 else set()
         exclude_ids = item[2] if len(item) > 2 else set()
         scopes = item[4] if len(item) > 4 else None
-        if style not in (rule.get("robots") or []):
-            continue
-        if rule.get("data_mode") == "targets":
-            if targets_match(rule, batch, unit):
-                return str(rule["id"])
-            continue
-        if rule.get("data_mode") == "rest":
-            claimed = any(
-                other[0].get("id") != rule.get("id")
-                and _specific_rule_matches(other, style, tags, batch, unit, sub_path)
-                for other in compiled
-            )
-            if claimed:
-                continue
-            return str(rule["id"])
         if exclude_ids and tags & exclude_ids:
             continue
         if not _folder_allows(item, batch, sub_path) or not _taxonomy_allows(item, tags):
             continue
         scope_groups = [group for group in (scopes or []) if group]
         if include_ids or scope_groups or _has_folder_scope(item):
-            return str(rule["id"])
+            if skip:
+                taxonomy_skip = True
+            elif taxonomy_pos is None:
+                taxonomy_pos = str(rule["id"])
+
+    if unit_target_pos is not None:
+        return unit_target_pos
+    if batch_target_skip:
+        return SKIPPED
+    if batch_target_pos is not None:
+        return batch_target_pos
+    if taxonomy_skip:
+        return SKIPPED
+    if taxonomy_pos is not None:
+        return taxonomy_pos
+    if rest_skip:
+        return SKIPPED
+    if rest_pos is not None:
+        return rest_pos
     return UNLISTED
 
 
@@ -487,21 +553,30 @@ def robot_catalog(hub: Path) -> list[str]:
 def scheduled_robots(hub: Path, rules: list[dict] | None = None) -> list[str]:
     """Robots the loop should generate jobs for.
 
-    The original three stay scheduled. A newly added model is scheduled after
-    an enabled priority rule selects it.
+    Any robot with at least one positive-rank enabled rule is scheduled.
+    Historical default robots stay scheduled only when no rule mentions them
+    at all (so setting a robot column or rest rule to -1 disables it).
     """
     catalog = robot_catalog(hub)
     allowed = set(catalog)
     selected: list[str] = []
-    for name in ROBOTS:
-        if name in allowed and name not in selected:
-            selected.append(name)
+    mentioned: set[str] = set()
+    rest_skipped: set[str] = set()
     for rule in rules or []:
         if not rule.get("enabled"):
             continue
-        for name in rule.get("robots") or []:
-            if name in allowed and name not in selected:
+        rlist = [name for name in (rule.get("robots") or []) if name in allowed]
+        mentioned.update(rlist)
+        if is_skip_rule(rule):
+            if rule.get("data_mode") == "rest":
+                rest_skipped.update(rlist)
+            continue
+        for name in rlist:
+            if name not in selected:
                 selected.append(name)
+    for name in ROBOTS:
+        if name in allowed and name not in selected and name not in rest_skipped and name not in mentioned:
+            selected.append(name)
     return selected
 
 
@@ -592,14 +667,93 @@ def _clean_rule(
 
 
 def _clean_rank(value: object) -> int | None:
-    """The number the user typed in the priority table. Several rules may share one."""
+    """The number the user typed in the priority table (-1 means do not execute)."""
     if isinstance(value, bool) or value is None:
         return None
     try:
         rank = int(value)
     except (TypeError, ValueError):
         return None
+    if rank == SKIP_RANK:
+        return SKIP_RANK
     return rank if 1 <= rank <= _MAX_RANK else None
+
+
+def _clean_layout(raw: object, robots: tuple[str, ...] | list[str] | None = None) -> dict | None:
+    """Clean optional matrix axis ordering, axis priorities, and manual cell overrides."""
+    if not isinstance(raw, dict):
+        return None
+    allowed = list(robots) if robots is not None else list(ROBOTS)
+    allowed_set = set(allowed)
+    robot_order: list[str] = []
+    raw_order = raw.get("robot_order")
+    if isinstance(raw_order, list):
+        for item in raw_order:
+            name = str(item or "").strip()
+            if name in allowed_set and name not in robot_order:
+                robot_order.append(name)
+    for name in allowed:
+        if name not in robot_order:
+            robot_order.append(name)
+
+    col_ranks: dict[str, int] = {}
+    raw_cols = raw.get("col_ranks")
+    if isinstance(raw_cols, dict):
+        for key, value in raw_cols.items():
+            name = str(key or "").strip()
+            if name not in allowed_set:
+                continue
+            rank = _clean_rank(value)
+            if rank is not None:
+                col_ranks[name] = rank
+
+    rows_out: list[dict] = []
+    raw_rows = raw.get("rows")
+    if isinstance(raw_rows, list):
+        for item in raw_rows[:_MAX_RULES]:
+            if not isinstance(item, dict):
+                continue
+            mode = str(item.get("kind") or "taxonomy")
+            if mode not in DATA_MODES:
+                continue
+            include = [] if mode != "taxonomy" else _clean_picks(item.get("include"), "", [])
+            exclude = [] if mode != "taxonomy" else _clean_picks(item.get("exclude"), "", [])
+            targets = _clean_targets(item.get("targets"), strict=False) if mode == "targets" else []
+            if mode == "taxonomy" and not include:
+                continue
+            if mode == "targets" and not targets:
+                continue
+            row_rank = _clean_rank(item.get("row_rank"))
+            if row_rank is None:
+                row_rank = len(rows_out) + 1
+            overrides: dict[str, int] = {}
+            raw_ov = item.get("overrides")
+            if isinstance(raw_ov, dict):
+                for rname, rval in raw_ov.items():
+                    rkey = str(rname or "").strip()
+                    if rkey not in allowed_set:
+                        continue
+                    cleaned_val = _clean_rank(rval)
+                    if cleaned_val is not None:
+                        overrides[rkey] = cleaned_val
+            rows_out.append(
+                {
+                    "key": str(item.get("key") or ""),
+                    "kind": mode,
+                    "include": include,
+                    "exclude": exclude,
+                    "targets": targets,
+                    "row_rank": row_rank,
+                    "overrides": overrides,
+                }
+            )
+    if not rows_out and not col_ranks and raw_order is None:
+        return None
+    return {
+        "robot_order": robot_order,
+        "col_ranks": col_ranks,
+        "rows": rows_out,
+    }
 
 
 def rule_rank_label(rule: dict, index: int) -> str:
@@ -654,9 +808,15 @@ def normalize(
     elif not rules:
         rules = default_rules()
     updated = ""
+    raw_layout = None
     if isinstance(data, dict):
         updated = str(data.get("updated_at") or "")
-    return {"version": 1, "rules": rules, "updated_at": updated or None}
+        raw_layout = data.get("layout")
+    layout = _clean_layout(raw_layout, robots=robots)
+    out: dict = {"version": 1, "rules": rules, "updated_at": updated or None}
+    if layout is not None:
+        out["layout"] = layout
+    return out
 
 
 def load_config(hub: Path) -> dict:
@@ -727,6 +887,8 @@ def request_tier_redo(hub: Path, rule_id: str) -> dict:
             raise ValueError("没有这一档")
         if not found.get("enabled"):
             raise ValueError("这一档已停用")
+        if is_skip_rule(found):
+            raise ValueError("这一项设为 -1 不执行，无法安排重做")
     current = _read_redo_file(hub)
     rules = load_redo(hub)
     try:
@@ -818,7 +980,11 @@ def _clean_preset(raw: object, robots: tuple[str, ...] | list[str] | None = None
             rules.append(cleaned)
     if not rules:
         return None
-    return {"id": preset_id, "name": name, "rules": rules}
+    out: dict = {"id": preset_id, "name": name, "rules": rules}
+    layout = _clean_layout(raw.get("layout"), robots=robots)
+    if layout is not None:
+        out["layout"] = layout
+    return out
 
 
 def load_presets(hub: Path) -> list[dict]:
@@ -998,30 +1164,72 @@ def promote_targets(hub: Path, items: list[dict], robots: list[str] | None = Non
     if not targets:
         raise ValueError("没有可优先的数据")
     current = load_config(hub)
-    fresh = _target_rule(targets, _ordered_robots(hub, robots))
-    if any(rule.get("rank") for rule in current["rules"]):
-        # Keep the table numbers in step with the order: the new tier is 1.
+    chosen_robots = _ordered_robots(hub, robots)
+    fresh = _target_rule(targets, chosen_robots)
+    if any((rule.get("rank") or 0) > 0 for rule in current["rules"]):
+        # Keep positive table numbers in step with the order; preserve -1 skip rules.
         fresh["rank"] = 1
         for rule in current["rules"]:
-            if rule.get("rank"):
-                rule["rank"] = min(_MAX_RANK, int(rule["rank"]) + 1)
+            r_val = rule.get("rank")
+            if isinstance(r_val, int) and r_val > 0:
+                rule["rank"] = min(_MAX_RANK, r_val + 1)
     rules = [fresh] + current["rules"]
     if len(rules) > _MAX_RULES:
         raise ValueError(f"最多 {_MAX_RULES} 档优先级")
-    save_config(hub, {"rules": rules})
+    layout = current.get("layout")
+    if isinstance(layout, dict):
+        layout = json.loads(json.dumps(layout))
+        existing_rows = list(layout.get("rows") or [])
+        shift = len(targets)
+        for r_item in existing_rows:
+            rr = r_item.get("row_rank")
+            if isinstance(rr, int) and rr > 0:
+                r_item["row_rank"] = min(_MAX_RANK, rr + shift)
+            ov = r_item.get("overrides")
+            if isinstance(ov, dict):
+                for rk, rv in list(ov.items()):
+                    if isinstance(rv, int) and rv > 0:
+                        ov[rk] = min(_MAX_RANK, rv + 1)
+        catalog = robot_catalog(hub)
+        chosen_set = set(chosen_robots)
+        prepended: list[dict] = []
+        for idx, t_item in enumerate(targets):
+            row_ov: dict[str, int] = {}
+            if robots is not None:
+                for rname in catalog:
+                    row_ov[rname] = 1 if rname in chosen_set else SKIP_RANK
+            prepended.append(
+                {
+                    "key": json.dumps(["targets", [], [], [[t_item["batch"], t_item["units"]]]]),
+                    "kind": "targets",
+                    "include": [],
+                    "exclude": [],
+                    "targets": [t_item],
+                    "row_rank": idx + 1,
+                    "overrides": row_ov,
+                }
+            )
+        layout["rows"] = prepended + existing_rows
+    payload: dict = {"rules": rules}
+    if layout is not None:
+        payload["layout"] = layout
+    save_config(hub, payload)
     return public_config(hub)
 
 
-def save_preset(hub: Path, name: str, rules: list) -> dict:
+def save_preset(hub: Path, name: str, rules: list, layout: dict | None = None) -> dict:
     """Store the given rules as a new named preset. The running priority is unchanged."""
     title = _preset_name(name)
-    cleaned_rules = normalize({"rules": rules}, strict=True, robots=robot_catalog(hub))["rules"]
+    normalized = normalize({"rules": rules, "layout": layout}, strict=True, robots=robot_catalog(hub))
+    cleaned_rules = normalized["rules"]
     presets = load_presets(hub)
     if any(item["name"] == title for item in presets):
         raise ValueError(f"已经有名为「{title}」的预设，请换一个名称")
     if len(presets) >= _MAX_PRESETS:
         raise ValueError(f"最多保存 {_MAX_PRESETS} 套预设")
-    current = {"id": uuid.uuid4().hex[:12], "name": title, "rules": cleaned_rules}
+    current: dict = {"id": uuid.uuid4().hex[:12], "name": title, "rules": cleaned_rules}
+    if normalized.get("layout") is not None:
+        current["layout"] = normalized["layout"]
     presets.append(current)
     _write_presets_file(hub, presets)
     return current
@@ -1037,12 +1245,19 @@ def delete_preset(hub: Path, preset_id: str) -> None:
 
 
 def preset_rules(hub: Path, preset_id: str) -> list[dict]:
+    return preset_payload(hub, preset_id)["rules"]
+
+
+def preset_payload(hub: Path, preset_id: str) -> dict:
     if preset_id == _BUILTIN_PRESET_ID:
-        return default_rules()
+        return {"rules": default_rules()}
     found = next((item for item in load_presets(hub) if item["id"] == preset_id), None)
     if found is None:
         raise ValueError("没有这套预设")
-    return found["rules"]
+    out: dict = {"rules": found["rules"]}
+    if found.get("layout") is not None:
+        out["layout"] = found["layout"]
+    return out
 
 
 def public_presets(hub: Path) -> list[dict]:
@@ -1053,7 +1268,13 @@ def public_presets(hub: Path) -> list[dict]:
         "rules": default_rules(),
     }
     saved = [
-        {"id": item["id"], "name": item["name"], "builtin": False, "rules": item["rules"]}
+        {
+            "id": item["id"],
+            "name": item["name"],
+            "builtin": False,
+            "rules": item["rules"],
+            **({"layout": item["layout"]} if item.get("layout") is not None else {}),
+        }
         for item in load_presets(hub)
     ]
     return [builtin, *saved]
@@ -1062,9 +1283,11 @@ def public_presets(hub: Path) -> list[dict]:
 def public_config(hub: Path) -> dict:
     migrate_pins_into_rules(hub)
     cfg = load_config(hub)
+    redo_map = load_redo(hub)
     cfg["robots"] = robot_catalog(hub)
     cfg["defaults"] = default_rules()
     cfg["presets"] = public_presets(hub)
     cfg["pins"] = load_pins(hub)
-    cfg["redo"] = sorted(load_redo(hub))
+    cfg["redo"] = sorted(redo_map)
+    cfg["redo_stamps"] = redo_map
     return cfg

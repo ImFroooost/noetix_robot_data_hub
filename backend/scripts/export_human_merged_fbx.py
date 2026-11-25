@@ -24,7 +24,7 @@ from pathlib import Path
 import fbx
 import numpy as np
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+HUB = Path(__file__).resolve().parents[2] / "data" / "hub_repo"
 DEFAULT_BATCHES = (
     "261113_PP",
     "261104_pingpong_pm",

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import fbx
 
-HUB = Path("/media/noetix/my_passport1/noetix_robot_data_hub/data/hub_repo")
+HUB = Path(__file__).resolve().parents[2] / "data" / "hub_repo"
 BATCH = "260317_parkour"
 SIZES_CM = {
     ("低", "窄"): (150.0, 50.0, 50.0),

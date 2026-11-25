@@ -226,7 +226,7 @@ function FrameSmpl({
     const positions = positionsRef.current;
     if (!positions?.length) return;
     waits.current += 1;
-    if (waits.current < 3) return;
+    if (nonce === 0 && waits.current < 2) return;
     rot.setFromAxisAngle(_axis.set(1, 0, 0), rotationX);
     box.makeEmpty();
     positions.forEach((p) => box.expandByPoint(tmp.copy(p).applyQuaternion(rot)));
@@ -234,10 +234,11 @@ function FrameSmpl({
     box.getSize(size);
     if (size.length() < 1e-4) return;
     box.getCenter(center);
-    const radius = Math.max(size.length() * 0.5, 0.3);
+    const radius = Math.max(size.length() * 0.5, 0.2);
     const fov = ((camera.fov || 50) * Math.PI) / 180;
-    const dist = (radius / Math.max(Math.sin(fov / 2), 1e-4)) * 1.2;
-    camera.position.set(center.x + dist * 0.7, center.y + dist * 0.4, center.z + dist * 0.9);
+    const dist = (radius / Math.max(Math.sin(fov / 2), 1e-4)) * 1.05;
+    camera.up.set(0, 1, 0);
+    camera.position.set(center.x + dist * 0.72, center.y + dist * 0.42, center.z + dist * 0.88);
     camera.near = Math.max(dist / 400, 0.01);
     camera.far = Math.max(dist * 80, 80);
     camera.lookAt(center);
